@@ -1,0 +1,11 @@
+const router = require('express').Router();
+const returns = require('../controllers/returnController');
+const { protect } = require('../middleware/authMiddleware');
+const { adminOnly } = require('../middleware/adminMiddleware');
+router.post('/', protect, returns.createReturn);
+router.get('/', protect, adminOnly, returns.adminReturns);
+router.get('/my-requests', protect, returns.myReturns);
+router.get('/admin/all', protect, adminOnly, returns.adminReturns);
+router.put('/admin/:id/status', protect, adminOnly, returns.updateReturnStatus);
+router.put('/:id/status', protect, adminOnly, returns.updateReturnStatus);
+module.exports = router;

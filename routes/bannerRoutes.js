@@ -1,0 +1,12 @@
+const router = require('express').Router();
+const banner = require('../controllers/bannerController');
+const { protect } = require('../middleware/authMiddleware');
+const { adminOnly } = require('../middleware/adminMiddleware');
+router.get('/', banner.getBanners);
+router.post('/', protect, adminOnly, banner.createBanner);
+router.put('/:id', protect, adminOnly, banner.updateBanner);
+router.delete('/:id', protect, adminOnly, banner.deleteBanner);
+router.post('/admin/create', protect, adminOnly, banner.createBanner);
+router.put('/admin/:id', protect, adminOnly, banner.updateBanner);
+router.delete('/admin/:id', protect, adminOnly, banner.deleteBanner);
+module.exports = router;

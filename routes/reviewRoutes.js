@@ -1,0 +1,13 @@
+const router = require('express').Router();
+const review = require('../controllers/reviewController');
+const { protect } = require('../middleware/authMiddleware');
+const { adminOnly } = require('../middleware/adminMiddleware');
+router.get('/', protect, adminOnly, review.adminReviews);
+router.get('/admin/all', protect, adminOnly, review.adminReviews);
+router.patch('/admin/:id/visibility', protect, adminOnly, review.toggleVisibility);
+router.delete('/admin/:id', protect, adminOnly, review.deleteReview);
+router.patch('/:id/visibility', protect, adminOnly, review.toggleVisibility);
+router.delete('/:id', protect, adminOnly, review.deleteReview);
+router.post('/:productId', protect, review.createReview);
+router.get('/:productId', review.getReviews);
+module.exports = router;
