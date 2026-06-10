@@ -1,4 +1,8 @@
 function getPublicApiUrl(req) {
+  const host = String(req.get('host') || '').toLowerCase();
+  if (host.includes('localhost') || host.includes('127.0.0.1')) {
+    return `${req.protocol}://${req.get('host')}`.replace(/\/$/, '');
+  }
   return (process.env.PUBLIC_API_URL || `${req.protocol}://${req.get('host')}`).replace(/\/$/, '');
 }
 

@@ -1,9 +1,11 @@
 const router = require('express').Router();
+const fs = require('fs/promises');
 const mongoose = require('mongoose');
 const upload = require('../middleware/uploadMiddleware');
 const { protect } = require('../middleware/authMiddleware');
 const { adminOnly } = require('../middleware/adminMiddleware');
 const { isCloudinaryConfigured, uploadImage } = require('../services/cloudinaryUpload');
+const { isMongoImageStoreAvailable, saveUploadedFile } = require('../services/mongoImageStore');
 const { getPublicApiUrl } = require('../utils/imageUtils');
 
 function canBypassUploadAuth(req) {
@@ -25,17 +27,28 @@ router.post('/', protectUpload, adminOnlyUpload, upload.array('images', 8), asyn
   try {
     if (isCloudinaryConfigured()) {
       const files = await Promise.all((req.files || []).map(uploadImage));
+      await cleanupTempFiles(req.files);
+      return res.status(201).json({ files });
+    }
+
+    const baseUrl = getPublicApiUrl(req);
+
+    if (isMongoImageStoreAvailable()) {
+      const files = await Promise.all((req.files || []).map(async (file) => {
+        const saved = await saveUploadedFile(file);
+        return { ...saved, url: `${baseUrl}/uploads/${file.filename}` };
+      }));
+      await cleanupTempFiles(req.files);
       return res.status(201).json({ files });
     }
 
     if (process.env.NODE_ENV === 'production') {
       return res.status(503).json({
-        message: 'Image uploads need Cloudinary on the deployed server. Add CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET.',
+        message: 'Image upload storage is not ready. Connect MongoDB or configure Cloudinary.',
         code: 'IMAGE_STORAGE_NOT_CONFIGURED',
       });
     }
 
-    const baseUrl = getPublicApiUrl(req);
     const files = (req.files || []).map((file) => ({
       url: `${baseUrl}/uploads/${file.filename}`,
       publicId: file.filename,
@@ -46,5 +59,9 @@ router.post('/', protectUpload, adminOnlyUpload, upload.array('images', 8), asyn
     return next(error);
   }
 });
+
+async function cleanupTempFiles(files = []) {
+  await Promise.all(files.map((file) => fs.unlink(file.path).catch(() => null)));
+}
 
 module.exports = router;
