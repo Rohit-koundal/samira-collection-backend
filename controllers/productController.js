@@ -1,6 +1,7 @@
 const Product = require('../models/Product');
 const slugify = require('../utils/slugify');
 const mongoose = require('mongoose');
+const { normalizeProductImages } = require('../utils/imageUtils');
 
 exports.getProducts = async (req, res) => {
   const query = req.query.admin === 'true' ? {} : { isActive: true };
@@ -36,7 +37,7 @@ exports.getProducts = async (req, res) => {
     rating: '-rating',
   };
   const products = await Product.find(query).populate('category').sort(sortMap[req.query.sort] || '-createdAt');
-  res.json(products);
+  res.json(products.map((product) => normalizeProductImages(product, req)));
 };
 
 exports.getProductBySlug = async (req, res) => {
@@ -44,13 +45,13 @@ exports.getProductBySlug = async (req, res) => {
     ? await Product.findById(req.params.slug).populate('category')
     : await Product.findOne({ slug: req.params.slug }).populate('category');
   if (!product) return res.status(404).json({ message: 'Product not found' });
-  res.json(product);
+  res.json(normalizeProductImages(product, req));
 };
 
 exports.getProductById = async (req, res) => {
   const product = await Product.findById(req.params.id).populate('category');
   if (!product) return res.status(404).json({ message: 'Product not found' });
-  res.json(product);
+  res.json(normalizeProductImages(product, req));
 };
 
 exports.createProduct = async (req, res) => {

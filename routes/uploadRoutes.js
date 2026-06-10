@@ -4,6 +4,7 @@ const upload = require('../middleware/uploadMiddleware');
 const { protect } = require('../middleware/authMiddleware');
 const { adminOnly } = require('../middleware/adminMiddleware');
 const { isCloudinaryConfigured, uploadImage } = require('../services/cloudinaryUpload');
+const { getPublicApiUrl } = require('../utils/imageUtils');
 
 function canBypassUploadAuth(req) {
   const host = String(req.get('host') || req.hostname || '').toLowerCase();
@@ -27,7 +28,14 @@ router.post('/', protectUpload, adminOnlyUpload, upload.array('images', 8), asyn
       return res.status(201).json({ files });
     }
 
-    const baseUrl = (process.env.PUBLIC_API_URL || `${req.protocol}://${req.get('host')}`).replace(/\/$/, '');
+    if (process.env.NODE_ENV === 'production') {
+      return res.status(503).json({
+        message: 'Image uploads need Cloudinary on the deployed server. Add CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET.',
+        code: 'IMAGE_STORAGE_NOT_CONFIGURED',
+      });
+    }
+
+    const baseUrl = getPublicApiUrl(req);
     const files = (req.files || []).map((file) => ({
       url: `${baseUrl}/uploads/${file.filename}`,
       publicId: file.filename,
