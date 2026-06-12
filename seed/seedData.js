@@ -16,12 +16,12 @@ async function seed() {
   await connectDB();
   await Promise.all([User.deleteMany(), Category.deleteMany(), Product.deleteMany(), Coupon.deleteMany(), Banner.deleteMany(), Order.deleteMany(), Review.deleteMany(), Settings.deleteMany()]);
 
-  const users = await User.insertMany([
+  const users = await Promise.all([
     { name: 'Admin', email: 'admin@samiracollection.com', phone: '9999999999', password: 'Admin@123', role: 'admin' },
     { name: 'Demo Customer', email: 'customer@test.com', phone: '9876543210', password: 'Customer@123', role: 'customer' },
     { name: 'Anaya Sharma', email: 'anaya@example.com', phone: '9811122233', password: 'Customer@123', role: 'customer' },
     { name: 'Mira Kapoor', email: 'mira@example.com', phone: '9900011112', password: 'Customer@123', role: 'customer' },
-  ]);
+  ].map((user) => User.create(user)));
 
   const categoryNames = ['Sarees', 'Suits', 'Kurtis', 'Dresses', 'Lehengas', 'Gowns', 'Dupatta Collection', 'Festive Wear'];
   const categories = await Category.insertMany(categoryNames.map((name, index) => ({ name, slug: slugify(name), description: `${name} collection`, displayOrder: index + 1 })));

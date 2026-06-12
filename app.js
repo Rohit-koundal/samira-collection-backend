@@ -7,7 +7,6 @@ const devFallback = require('./middleware/devFallbackMiddleware');
 const { protect } = require('./middleware/authMiddleware');
 const { adminOnly } = require('./middleware/adminMiddleware');
 const { corsOptions, getAllowedOrigins } = require('./config/corsOptions');
-const { findImage } = require('./services/mongoImageStore');
 
 const app = express();
 
@@ -62,16 +61,9 @@ app.use('/api/settings', require('./routes/settingsRoutes'));
 app.use(notFound);
 app.use(errorHandler);
 
-async function sendImagePlaceholder(req, res, next) {
+function sendImagePlaceholder(req, res, next) {
   const filename = String(req.params.filename || 'placeholder.jpg');
   if (!/\.(png|jpe?g|webp|gif|svg)$/i.test(filename)) return next();
-
-  const image = await findImage(filename);
-  if (image?.data) {
-    res.setHeader('Content-Type', image.contentType);
-    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
-    return res.status(200).send(image.data);
-  }
 
   const label = filename.toLowerCase().includes('placeholder') ? 'Samira Collection' : 'Image unavailable';
   const svg = `

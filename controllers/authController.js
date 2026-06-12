@@ -16,9 +16,15 @@ exports.login = async (req, res) => {
   const { email, password } = req.body;
   const user = await User.findOne({ email });
   if (!user || !(await user.matchPassword(password))) return res.status(401).json({ message: 'Invalid credentials' });
+  const shouldUpgradePassword = user.hasLegacyPlainPassword?.();
   if (user.role === 'admin') {
     user.availableModes = ['customer', 'admin'];
     user.activeMode = 'admin';
+  }
+  if (shouldUpgradePassword) {
+    user.markModified('password');
+  }
+  if (user.role === 'admin' || shouldUpgradePassword) {
     await user.save();
   }
   res.json(authPayload(user));

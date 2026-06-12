@@ -1,12 +1,16 @@
 function normalizePhone(phone = '') {
-  const digits = String(phone).replace(/\D/g, '').replace(/^91/, '');
-  return /^[6-9]\d{9}$/.test(digits) ? digits : '';
+  const raw = String(phone).trim();
+  const digits = raw.replace(/\D/g, '');
+  const indianLocal = digits.replace(/^91/, '');
+  if (/^[6-9]\d{9}$/.test(indianLocal)) return indianLocal;
+  if (raw.startsWith('+') && /^[1-9]\d{7,14}$/.test(digits)) return `+${digits}`;
+  return '';
 }
 
 function requireValidPhone(phone) {
   const normalized = normalizePhone(phone);
   if (!normalized) {
-    const error = new Error('Valid 10-digit Indian mobile number is required');
+    const error = new Error('Enter a valid mobile number with country code');
     error.statusCode = 400;
     throw error;
   }

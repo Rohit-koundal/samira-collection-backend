@@ -5,7 +5,6 @@ const upload = require('../middleware/uploadMiddleware');
 const { protect } = require('../middleware/authMiddleware');
 const { adminOnly } = require('../middleware/adminMiddleware');
 const { isCloudinaryConfigured, uploadImage } = require('../services/cloudinaryUpload');
-const { isMongoImageStoreAvailable, saveUploadedFile } = require('../services/mongoImageStore');
 const { getPublicApiUrl } = require('../utils/imageUtils');
 
 function canBypassUploadAuth(req) {
@@ -32,23 +31,6 @@ router.post('/', protectUpload, adminOnlyUpload, upload.array('images', 8), asyn
     }
 
     const baseUrl = getPublicApiUrl(req);
-
-    if (isMongoImageStoreAvailable()) {
-      const files = await Promise.all((req.files || []).map(async (file) => {
-        const saved = await saveUploadedFile(file);
-        return { ...saved, url: `${baseUrl}/uploads/${file.filename}` };
-      }));
-      await cleanupTempFiles(req.files);
-      return res.status(201).json({ files });
-    }
-
-    if (process.env.NODE_ENV === 'production') {
-      return res.status(503).json({
-        message: 'Image upload storage is not ready. Connect MongoDB or configure Cloudinary.',
-        code: 'IMAGE_STORAGE_NOT_CONFIGURED',
-      });
-    }
-
     const files = (req.files || []).map((file) => ({
       url: `${baseUrl}/uploads/${file.filename}`,
       publicId: file.filename,

@@ -12,7 +12,7 @@ function placeholderUrl(req) {
 
 function normalizeImageForResponse(image, req) {
   const url = typeof image === 'string' ? image : image?.url;
-  if (!url || isKnownMissingImage(url) || isRenderLocalUploadUrl(url)) {
+  if (!url || isKnownMissingImage(url)) {
     return { ...(typeof image === 'object' && image ? image : {}), url: placeholderUrl(req), isPlaceholder: true };
   }
   return typeof image === 'string' ? { url } : image;
@@ -28,12 +28,6 @@ function normalizeProductImages(product, req) {
 
 function isKnownMissingImage(url) {
   return /(^|\/)placeholder\.jpe?g($|\?)/i.test(String(url || ''));
-}
-
-function isRenderLocalUploadUrl(url) {
-  return process.env.NODE_ENV === 'production'
-    && String(url || '').includes('.onrender.com/uploads/')
-    && !process.env.ALLOW_RENDER_DISK_UPLOADS;
 }
 
 module.exports = {

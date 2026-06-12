@@ -5,7 +5,7 @@ async function sendOtp(phone, otp) {
   }
 
   const body = new URLSearchParams({
-    To: `+91${phone}`,
+    To: String(phone).startsWith('+') ? String(phone) : `+91${phone}`,
     From: config.from,
     Body: `Your Samira Collection OTP is ${otp}. It is valid for ${process.env.OTP_EXPIRY_MINUTES || 5} minutes. Do not share this OTP with anyone.`,
   });
