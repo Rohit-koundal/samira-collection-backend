@@ -20,7 +20,6 @@ function generateOtp() {
 
 function hashOtp(phoneOrOtp, maybeOtp) {
   const phone = maybeOtp === undefined ? '' : phoneOrOtp;
-  console.log("phone :",phone);
   const otp = maybeOtp === undefined ? phoneOrOtp : maybeOtp;
   return crypto
     .createHmac('sha256', process.env.JWT_SECRET || 'dev_secret_change_me')
