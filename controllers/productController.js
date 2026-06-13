@@ -1,4 +1,5 @@
 const Product = require('../models/Product');
+const Category = require('../models/Category');
 const slugify = require('../utils/slugify');
 const mongoose = require('mongoose');
 const { normalizeProductImages } = require('../utils/imageUtils');
@@ -11,7 +12,20 @@ exports.getProducts = async (req, res) => {
     { fabric: { $regex: req.query.search, $options: 'i' } },
     { occasion: { $regex: req.query.search, $options: 'i' } },
   ];
-  if (req.query.category) query.category = req.query.category;
+  if (req.query.category) {
+    if (mongoose.Types.ObjectId.isValid(req.query.category)) {
+      query.category = req.query.category;
+    } else {
+      const category = await Category.findOne({
+        $or: [
+          { slug: req.query.category },
+          { name: { $regex: `^${escapeRegex(req.query.category)}$`, $options: 'i' } },
+        ],
+      });
+      if (category) query.category = category._id;
+      else query.category = null;
+    }
+  }
   if (req.query.size) query.sizes = req.query.size;
   if (req.query.color) query.colors = req.query.color;
   if (req.query.fabric) query.fabric = req.query.fabric;
@@ -39,6 +53,10 @@ exports.getProducts = async (req, res) => {
   const products = await Product.find(query).populate('category').sort(sortMap[req.query.sort] || '-createdAt');
   res.json(products.map((product) => normalizeProductImages(product, req)));
 };
+
+function escapeRegex(value = '') {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
 
 exports.getProductBySlug = async (req, res) => {
   const product = mongoose.Types.ObjectId.isValid(req.params.slug)

@@ -134,10 +134,24 @@ function devFallback(req, res, next) {
 function filterProducts(query) {
   let items = [...products];
   if (query.category) items = items.filter((item) => item.categoryId === query.category || item.category?.slug === query.category);
+  if (query.size) items = items.filter((item) => item.sizes?.includes(query.size));
+  if (query.color) items = items.filter((item) => item.colors?.includes(query.color));
+  if (query.fabric) items = items.filter((item) => String(item.fabric || '').toLowerCase() === String(query.fabric).toLowerCase());
+  if (query.occasion) items = items.filter((item) => String(item.occasion || '').toLowerCase() === String(query.occasion).toLowerCase());
+  if (query.discount) items = items.filter((item) => Number(item.discountPercentage || 0) >= Number(query.discount));
+  if (query.rating) items = items.filter((item) => Number(item.rating || 0) >= Number(query.rating));
+  if (query.stock === 'in') items = items.filter((item) => Number(item.stock || 0) > 0);
+  if (query.stock === 'out') items = items.filter((item) => Number(item.stock || 0) <= 0);
+  if (query.minPrice) items = items.filter((item) => Number(item.price || 0) >= Number(query.minPrice));
+  if (query.maxPrice) items = items.filter((item) => Number(item.price || 0) <= Number(query.maxPrice));
+  if (query.newArrival === 'true') items = items.filter((item) => item.isNewArrival);
+  if (query.bestSeller === 'true') items = items.filter((item) => item.isBestSeller);
+  if (query.featured === 'true') items = items.filter((item) => item.isFeatured);
   if (query.search) {
     const term = String(query.search).toLowerCase();
     items = items.filter((item) => [item.name, item.brand, item.category?.name, item.fabric, item.occasion].filter(Boolean).join(' ').toLowerCase().includes(term));
   }
+  if (query.sort === 'discount') items.sort((a, b) => Number(b.discountPercentage || 0) - Number(a.discountPercentage || 0));
   if (query.sort === 'priceLowHigh') items.sort((a, b) => a.price - b.price);
   if (query.sort === 'priceHighLow') items.sort((a, b) => b.price - a.price);
   if (query.sort === 'rating') items.sort((a, b) => b.rating - a.rating);
