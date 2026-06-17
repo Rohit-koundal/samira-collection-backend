@@ -21,10 +21,7 @@ function errorHandler(error, req, res, next) {
   if (error.code === 'LIMIT_FILE_COUNT' || error.code === 'LIMIT_UNEXPECTED_FILE') {
     return res.status(400).json({ message: 'Too many images uploaded. Maximum 8 images are allowed.' });
   }
-  if (error.message?.includes('Invalid or unsupported image') || error.message?.includes('Failed to process image') || error.message?.includes('too small')) {
-    return res.status(400).json({ message: error.message });
-  }
-  if (error.message?.includes('R2') || error.message?.includes('Cloudflare')) {
+  if (error.message?.includes('R2')) {
     return res.status(502).json({ message: error.message });
   }
   const statusCode = res.statusCode === 200 ? 500 : res.statusCode;

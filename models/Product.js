@@ -14,12 +14,6 @@ const productSchema = new mongoose.Schema({
   images: [{
     url: String,
     publicId: String,
-    primary: { type: Boolean, default: false },
-    variants: {
-      thumb: String,
-      card: String,
-      full: String,
-    },
   }],
   sizes: [String],
   colors: [String],

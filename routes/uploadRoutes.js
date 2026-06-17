@@ -3,12 +3,12 @@ const fs = require('fs/promises');
 const upload = require('../middleware/uploadMiddleware');
 const { protect } = require('../middleware/authMiddleware');
 const { adminOnly } = require('../middleware/adminMiddleware');
-const { uploadProductImages } = require('../services/imageStorage');
-const { validateImageFile } = require('../services/imageProcessor');
+const { isR2Configured, uploadImageToR2 } = require('../services/r2Upload');
+const { isCloudinaryConfigured, uploadImage: uploadImageToCloudinary } = require('../services/cloudinaryUpload');
+const { buildUploadFileResponse, isLocalRequest } = require('../utils/imageUtils');
 
 function canBypassUploadAuth(req) {
-  const host = String(req.get('host') || req.hostname || '').toLowerCase();
-  return process.env.NODE_ENV !== 'production' || host.includes('localhost') || host.includes('127.0.0.1');
+  return isLocalRequest(req);
 }
 
 function protectUpload(req, res, next) {
@@ -30,19 +30,27 @@ router.post('/', protectUpload, adminOnlyUpload, (req, res, next) => {
         return res.status(400).json({ message: 'No images were uploaded. Please select at least one image file.' });
       }
 
-      for (const file of req.files) {
-        await validateImageFile(file.path);
+      if (isR2Configured()) {
+        const files = await Promise.all(req.files.map((file) => uploadImageToR2(file)));
+        await cleanupTempFiles(req.files);
+        return res.status(201).json({ files });
       }
 
-      const files = await uploadProductImages(req.files, req);
-      const validFiles = files.filter((file) => file?.url);
-
-      if (!validFiles.length) {
-        return res.status(502).json({ message: 'Image upload failed. No files were stored.' });
+      if (isCloudinaryConfigured()) {
+        const files = await Promise.all(req.files.map((file) => uploadImageToCloudinary(file)));
+        await cleanupTempFiles(req.files);
+        return res.status(201).json({ files });
       }
 
-      await cleanupTempFiles(req.files);
-      return res.status(201).json({ files: validFiles });
+      if (!isLocalRequest(req)) {
+        await cleanupTempFiles(req.files);
+        return res.status(503).json({
+          message: 'Image upload is not configured for production. Set R2 or Cloudinary environment variables on Render.',
+        });
+      }
+
+      const files = req.files.map((file) => buildUploadFileResponse(file, req));
+      return res.status(201).json({ files });
     } catch (uploadError) {
       await cleanupTempFiles(req.files);
       return next(uploadError);

@@ -1,18 +1,41 @@
+function isLocalRequest(req) {
+  const host = String(req?.get?.('host') || req?.hostname || '').toLowerCase();
+  return host.includes('localhost') || host.includes('127.0.0.1');
+}
+
 function getPublicApiUrl(req) {
-  const host = String(req.get('host') || '').toLowerCase();
-  if (host.includes('localhost') || host.includes('127.0.0.1')) {
+  if (isLocalRequest(req)) {
     return `${req.protocol}://${req.get('host')}`.replace(/\/$/, '');
   }
-  return (process.env.PUBLIC_API_URL || `${req.protocol}://${req.get('host')}`).replace(/\/$/, '');
+
+  let apiUrl = process.env.PUBLIC_API_URL || `${req.protocol}://${req.get('host')}`;
+  if (/localhost|127\.0\.0\.1/i.test(apiUrl)) {
+    apiUrl = `${req.protocol}://${req.get('host')}`;
+  }
+
+  return apiUrl.replace(/\/$/, '');
 }
 
 function placeholderUrl(req) {
   return `${getPublicApiUrl(req)}/placeholder.jpg`;
 }
 
+function isInaccessibleImageUrl(url) {
+  return process.env.NODE_ENV === 'production'
+    && /https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?\//i.test(String(url || ''));
+}
+
+function buildUploadFileResponse(file, req) {
+  return {
+    url: `${getPublicApiUrl(req)}/uploads/${file.filename}`,
+    publicId: file.filename,
+    originalName: file.originalname,
+  };
+}
+
 function normalizeImageForResponse(image, req) {
   const url = typeof image === 'string' ? image : image?.url;
-  if (!url || isKnownMissingImage(url)) {
+  if (!url || isKnownMissingImage(url) || isInaccessibleImageUrl(url)) {
     return { ...(typeof image === 'object' && image ? image : {}), url: placeholderUrl(req), isPlaceholder: true };
   }
   return typeof image === 'string' ? { url } : image;
@@ -31,7 +54,9 @@ function isKnownMissingImage(url) {
 }
 
 module.exports = {
+  buildUploadFileResponse,
   getPublicApiUrl,
+  isLocalRequest,
   normalizeProductImages,
   placeholderUrl,
 };
