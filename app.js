@@ -7,6 +7,7 @@ const devFallback = require('./middleware/devFallbackMiddleware');
 const { protect } = require('./middleware/authMiddleware');
 const { adminOnly } = require('./middleware/adminMiddleware');
 const { corsOptions, getAllowedOrigins } = require('./config/corsOptions');
+const { getStorageProvider } = require('./services/imageStorage');
 
 const app = express();
 
@@ -25,6 +26,7 @@ app.get('/health', (req, res) => {
     status: 'ok',
     database: dbStates[mongoose.connection.readyState] || 'unknown',
     environment: process.env.NODE_ENV || 'development',
+    imageStorage: getStorageProvider(),
     allowedOrigins: getAllowedOrigins(),
   });
 });
