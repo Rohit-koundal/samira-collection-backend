@@ -1,11 +1,10 @@
 const router = require('express').Router();
 const fs = require('fs/promises');
-const mongoose = require('mongoose');
 const upload = require('../middleware/uploadMiddleware');
 const { protect } = require('../middleware/authMiddleware');
 const { adminOnly } = require('../middleware/adminMiddleware');
-const { isCloudinaryConfigured, uploadImage } = require('../services/cloudinaryUpload');
-const { getPublicApiUrl } = require('../utils/imageUtils');
+const { uploadProductImages } = require('../services/imageStorage');
+const { validateImageFile } = require('../services/imageProcessor');
 
 function canBypassUploadAuth(req) {
   const host = String(req.get('host') || req.hostname || '').toLowerCase();
@@ -22,24 +21,33 @@ function adminOnlyUpload(req, res, next) {
   return adminOnly(req, res, next);
 }
 
-router.post('/', protectUpload, adminOnlyUpload, upload.array('images', 8), async (req, res, next) => {
-  try {
-    if (isCloudinaryConfigured()) {
-      const files = await Promise.all((req.files || []).map(uploadImage));
-      await cleanupTempFiles(req.files);
-      return res.status(201).json({ files });
-    }
+router.post('/', protectUpload, adminOnlyUpload, (req, res, next) => {
+  upload.array('images', 8)(req, res, async (error) => {
+    if (error) return next(error);
 
-    const baseUrl = getPublicApiUrl(req);
-    const files = (req.files || []).map((file) => ({
-      url: `${baseUrl}/uploads/${file.filename}`,
-      publicId: file.filename,
-      originalName: file.originalname,
-    }));
-    return res.status(201).json({ files });
-  } catch (error) {
-    return next(error);
-  }
+    try {
+      if (!req.files?.length) {
+        return res.status(400).json({ message: 'No images were uploaded. Please select at least one image file.' });
+      }
+
+      for (const file of req.files) {
+        await validateImageFile(file.path);
+      }
+
+      const files = await uploadProductImages(req.files, req);
+      const validFiles = files.filter((file) => file?.url);
+
+      if (!validFiles.length) {
+        return res.status(502).json({ message: 'Image upload failed. No files were stored.' });
+      }
+
+      await cleanupTempFiles(req.files);
+      return res.status(201).json({ files: validFiles });
+    } catch (uploadError) {
+      await cleanupTempFiles(req.files);
+      return next(uploadError);
+    }
+  });
 });
 
 async function cleanupTempFiles(files = []) {
