@@ -9,11 +9,7 @@
   "scripts": {
     "start": "node server.js",
     "server": "node server.js",
-    "check": "node --check server.js && node --check app.js",
-    "migrate:r2": "node scripts/migrate-local-uploads-to-r2.js",
-    "migrate:r2:db": "node scripts/migrate-local-uploads-to-r2.js --update-db",
-    "check:images": "node scripts/check-image-pipeline.js",
-    "test:endpoints": "node scripts/test-all-endpoints.js"
+    "check": "node --check server.js && node --check app.js"
   },
   "keywords": [],
   "author": "",
@@ -28,7 +24,6 @@
     "jsonwebtoken": "^9.0.2",
     "mongoose": "^8.9.5",
     "multer": "^1.4.5-lts.1",
-    "sharp": "^0.34.3",
     "twilio": "^6.0.2"
   }
 }

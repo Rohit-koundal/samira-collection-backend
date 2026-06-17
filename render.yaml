@@ -23,7 +23,7 @@ services:
       - key: JWT_REFRESH_EXPIRES_IN
         value: 30d
       - key: PUBLIC_API_URL
-        sync: false
+        value: https://samira-collection-backend-1.onrender.com
       - key: CLIENT_ORIGINS
         sync: false
       - key: FRONTEND_URL

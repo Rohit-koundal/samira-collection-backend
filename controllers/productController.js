@@ -75,17 +75,15 @@ exports.getProductById = async (req, res) => {
 exports.createProduct = async (req, res) => {
   const error = validateProduct(req.body);
   if (error) return res.status(400).json({ message: error });
-  const payload = prepareProductPayload(req.body);
-  const product = await Product.create({ ...payload, slug: payload.slug || slugify(payload.name) });
-  res.status(201).json(product);
+  const product = await Product.create({ ...req.body, slug: req.body.slug || slugify(req.body.name) });
+  res.status(201).json(normalizeProductImages(product, req));
 };
 
 exports.updateProduct = async (req, res) => {
   const error = validateProduct(req.body, false);
   if (error) return res.status(400).json({ message: error });
-  const payload = prepareProductPayload(req.body);
-  const product = await Product.findByIdAndUpdate(req.params.id, payload, { new: true, runValidators: true });
-  res.json(product);
+  const product = await Product.findByIdAndUpdate(req.params.id, req.body, { new: true, runValidators: true });
+  res.json(normalizeProductImages(product, req));
 };
 
 exports.deleteProduct = async (req, res) => {
@@ -117,36 +115,12 @@ function validateProduct(data, creating = true) {
   if (Array.isArray(data.images) && data.images.some((image) => image?.url && !image.url.startsWith('http') && !image.url.startsWith('/uploads/'))) {
     return 'Each image must be a valid uploaded URL';
   }
+  if (process.env.NODE_ENV === 'production' && Array.isArray(data.images) && data.images.some((image) => isInaccessibleImageUrl(image?.url))) {
+    return 'Image URLs must be publicly accessible. Please re-upload images before saving.';
+  }
   return '';
 }
 
-function prepareProductPayload(data = {}) {
-  const payload = { ...data };
-  if (!Array.isArray(payload.images)) return payload;
-
-  const images = payload.images
-    .filter((image) => image?.url)
-    .map((image) => ({
-      url: image.url,
-      publicId: image.publicId || '',
-      primary: Boolean(image.primary),
-      variants: image.variants ? {
-        thumb: image.variants.thumb || '',
-        card: image.variants.card || '',
-        full: image.variants.full || image.url,
-      } : undefined,
-    }));
-
-  const primaryIndex = images.findIndex((image) => image.primary);
-  const resolvedPrimaryIndex = primaryIndex >= 0 ? primaryIndex : 0;
-
-  payload.images = images.map((image, index) => ({
-    ...image,
-    primary: index === resolvedPrimaryIndex,
-  }));
-
-  const primaryImage = payload.images[resolvedPrimaryIndex];
-  payload.primaryImage = primaryImage?.variants?.card || primaryImage?.url || '';
-
-  return payload;
+function isInaccessibleImageUrl(url = '') {
+  return /https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?\//i.test(String(url));
 }
