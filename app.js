@@ -23,11 +23,14 @@ app.get('/placeholder.jpg', sendImagePlaceholder);
 app.get('/', (req, res) => res.json({ message: 'Samira Collection API is running' }));
 app.get('/health', (req, res) => {
   const dbStates = ['disconnected', 'connected', 'connecting', 'disconnecting'];
+  const imageStorage = isR2Configured() ? 'r2' : isCloudinaryConfigured() ? 'cloudinary' : 'local';
+  const persistentImageStorageConfigured = imageStorage !== 'local';
   res.json({
-    status: 'ok',
+    status: process.env.NODE_ENV === 'production' && !persistentImageStorageConfigured ? 'degraded' : 'ok',
     database: dbStates[mongoose.connection.readyState] || 'unknown',
     environment: process.env.NODE_ENV || 'development',
-    imageStorage: isR2Configured() ? 'r2' : isCloudinaryConfigured() ? 'cloudinary' : 'local',
+    imageStorage,
+    persistentImageStorageConfigured,
     allowedOrigins: getAllowedOrigins(),
   });
 });

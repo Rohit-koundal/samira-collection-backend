@@ -42,6 +42,14 @@ router.post('/', protectUpload, adminOnlyUpload, (req, res, next) => {
         return res.status(201).json({ files });
       }
 
+      if (process.env.NODE_ENV === 'production') {
+        await cleanupTempFiles(req.files);
+        return res.status(503).json({
+          message: 'Persistent image storage is not configured. Please connect Cloudinary or R2 before uploading images in production.',
+          code: 'PERSISTENT_UPLOAD_STORAGE_REQUIRED',
+        });
+      }
+
       const files = req.files.map((file) => buildUploadFileResponse(file, req));
       return res.status(201).json({ files });
     } catch (uploadError) {
