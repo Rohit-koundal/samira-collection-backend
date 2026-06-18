@@ -30,8 +30,9 @@ router.post('/', protectUpload, adminOnlyUpload, (req, res, next) => {
         return res.status(400).json({ message: 'No images were uploaded. Please select at least one image file.' });
       }
 
+      const uploadFolder = req.query.folder;
       if (isR2Configured()) {
-        const files = await Promise.all(req.files.map((file) => uploadImageToR2(file)));
+        const files = await Promise.all(req.files.map((file) => uploadImageToR2(file, { folder: uploadFolder })));
         await cleanupTempFiles(req.files);
         return res.status(201).json({ files });
       }

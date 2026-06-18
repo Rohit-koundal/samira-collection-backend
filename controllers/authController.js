@@ -2,10 +2,13 @@ const User = require('../models/User');
 const mongoose = require('mongoose');
 const jwt = require('jsonwebtoken');
 const { generateRefreshToken, generateToken } = require('../utils/generateToken');
-const { normalizePhone, createOtp, invalidateOtp, verifyOtp: verifyOtpRecord } = require('../services/otpService');
+const { normalizePhone, normalizeEmail, createOtp, createEmailOtp, invalidateOtp, verifyOtp: verifyOtpRecord, verifyEmailOtp: verifyEmailOtpRecord } = require('../services/otpService');
 const { sendOtp } = require('../services/smsService');
+const { sendOtpEmail } = require('../services/emailService');
 
 const otpRateLimit = new Map();
+const offlineProfiles = new Map();
+const PROFILE_VERIFICATION_TOKEN_TTL = process.env.PROFILE_VERIFICATION_TOKEN_TTL || '15m';
 
 exports.register = async (req, res) => {
   const user = await User.create(req.body);
@@ -33,10 +36,167 @@ exports.login = async (req, res) => {
 exports.profile = async (req, res) => res.json(req.user);
 
 exports.updateProfile = async (req, res) => {
-  const { role, availableModes, activeMode, isBlocked, phone, ...safeBody } = req.body;
-  Object.assign(req.user, safeBody);
-  await req.user.save();
-  res.json(sanitize(req.user));
+  try {
+    const { role, availableModes, activeMode, isBlocked, ...safeBody } = req.body || {};
+    const nextName = normalizeTrimmed(safeBody.name);
+    const nextEmail = normalizeProfileEmail(safeBody.email);
+    const nextPhone = normalizeProfilePhone(safeBody.phone);
+    const nextAlternatePhone = normalizeProfilePhone(safeBody.alternatePhone, { allowEmpty: true });
+    const nextHintName = normalizeTrimmed(safeBody.hintName);
+    const nextGender = normalizeGender(safeBody.gender);
+    const nextBirthDate = normalizeBirthDate(safeBody.birthDate);
+
+    if (nextEmail && req.user.offlineSession !== true) {
+      const existingEmailUser = await User.findOne({ email: nextEmail, _id: { $ne: req.user._id } }).select('_id');
+      if (existingEmailUser) return res.status(400).json({ message: 'Email is already in use' });
+    }
+
+    if (nextPhone && req.user.offlineSession !== true) {
+      const existingPhoneUser = await User.findOne({ phone: nextPhone, _id: { $ne: req.user._id } }).select('_id');
+      if (existingPhoneUser) return res.status(400).json({ message: 'Mobile number is already in use' });
+    }
+
+    const previousPhone = String(req.user.phone || '');
+    const previousEmail = String(req.user.email || '').toLowerCase();
+    const phoneChanged = nextPhone && nextPhone !== previousPhone;
+    const emailChanged = nextEmail !== previousEmail;
+    const verifiedPhone = phoneChanged ? verifyProfileChangeToken(req.body.phoneVerificationToken, {
+      userId: req.user._id || req.user.id,
+      targetType: 'phone',
+      target: nextPhone,
+    }) : false;
+    const verifiedEmail = nextEmail ? (
+      emailChanged
+        ? verifyProfileChangeToken(req.body.emailVerificationToken, {
+          userId: req.user._id || req.user.id,
+          targetType: 'email',
+          target: nextEmail,
+        })
+        : Boolean(req.user.isEmailVerified)
+    ) : false;
+
+    if (phoneChanged && !verifiedPhone) {
+      return res.status(400).json({ message: 'Please verify your new mobile number with OTP before saving' });
+    }
+
+    if (nextEmail && emailChanged && !verifiedEmail) {
+      return res.status(400).json({ message: 'Please verify your email with OTP before saving' });
+    }
+
+    const nextProfile = {
+      name: nextName || req.user.name || '',
+      email: nextEmail || undefined,
+      phone: nextPhone || previousPhone,
+      gender: nextGender,
+      birthDate: nextBirthDate,
+      alternatePhone: nextAlternatePhone,
+      hintName: nextHintName,
+      isEmailVerified: nextEmail ? verifiedEmail : false,
+    };
+
+    if (req.user.offlineSession) {
+      if (phoneChanged) removeOfflineProfile({ phone: previousPhone });
+      Object.assign(req.user, nextProfile);
+      if (phoneChanged) req.user.isPhoneVerified = true;
+      storeOfflineProfile(req.user);
+      return res.json(sanitize(req.user));
+    }
+
+    Object.assign(req.user, nextProfile);
+    if (phoneChanged) req.user.isPhoneVerified = true;
+    await req.user.save();
+    res.json(sanitize(req.user));
+  } catch (error) {
+    res.status(400).json({ message: error.message });
+  }
+};
+
+exports.sendProfilePhoneChangeOtp = async (req, res) => {
+  try {
+    const phone = normalizePhone(req.body.phone);
+    if (!phone) return res.status(400).json({ message: 'Valid 10-digit Indian mobile number is required' });
+    if (phone === String(req.user.phone || '')) return res.status(400).json({ message: 'This mobile number is already on your account' });
+
+    const existingUser = req.user.offlineSession
+      ? null
+      : await User.findOne({ phone, _id: { $ne: req.user._id } }).select('_id');
+    if (existingUser) return res.status(400).json({ message: 'Mobile number is already in use' });
+
+    const { otp } = await createOtp(phone, 'profile_phone_change', req);
+    const delivery = await sendOtp(phone, otp);
+    return res.json({
+      success: true,
+      message: 'OTP sent successfully',
+      ...(delivery.devOtp ? { devOtp: delivery.devOtp } : {}),
+    });
+  } catch (error) {
+    res.status(error.statusCode || 400).json({ message: error.message });
+  }
+};
+
+exports.verifyProfilePhoneChangeOtp = async (req, res) => {
+  try {
+    const { phone } = await verifyOtpRecord(req.body.phone, req.body.otp);
+    const verificationToken = createProfileChangeToken({
+      userId: req.user._id || req.user.id,
+      targetType: 'phone',
+      target: phone,
+    });
+    res.json({ success: true, verified: true, verificationToken });
+  } catch (error) {
+    res.status(error.statusCode || 400).json({ message: error.message });
+  }
+};
+
+exports.sendProfileEmailChangeOtp = async (req, res) => {
+  try {
+    const email = normalizeEmail(req.body.email);
+    if (!email) return res.status(400).json({ message: 'Please enter a valid email address' });
+    if (email === String(req.user.email || '').toLowerCase()) return res.status(400).json({ message: 'This email is already on your account' });
+
+    const existingUser = req.user.offlineSession
+      ? null
+      : await User.findOne({ email, _id: { $ne: req.user._id } }).select('_id');
+    if (existingUser) return res.status(400).json({ message: 'Email is already in use' });
+
+    const { otp } = await createEmailOtp(email, 'profile_email_change', req);
+    const delivery = await sendOtpEmail(email, otp);
+    return res.json({
+      success: true,
+      message: 'OTP sent successfully',
+      ...(delivery.devOtp ? { devOtp: delivery.devOtp } : {}),
+    });
+  } catch (error) {
+    res.status(error.statusCode || 400).json({ message: error.message });
+  }
+};
+
+exports.verifyProfileEmailChangeOtp = async (req, res) => {
+  try {
+    const { email } = await verifyEmailOtpRecord(req.body.email, req.body.otp);
+    const verificationToken = createProfileChangeToken({
+      userId: req.user._id || req.user.id,
+      targetType: 'email',
+      target: email,
+    });
+    res.json({ success: true, verified: true, verificationToken });
+  } catch (error) {
+    res.status(error.statusCode || 400).json({ message: error.message });
+  }
+};
+
+exports.deleteProfile = async (req, res) => {
+  try {
+    if (req.user.offlineSession) {
+      removeOfflineProfile(req.user);
+      return res.json({ success: true, message: 'Account deleted successfully' });
+    }
+
+    await User.findByIdAndDelete(req.user._id);
+    res.json({ success: true, message: 'Account deleted successfully' });
+  } catch (error) {
+    res.status(400).json({ message: error.message });
+  }
 };
 
 exports.sendOtp = async (req, res) => {
@@ -180,12 +340,19 @@ function buildOfflineLoginUser(phone, { activeMode = 'customer' } = {}) {
     throw error;
   }
   const isAdminPhone = getAdminPhones().includes(phone);
+  const savedProfile = offlineProfiles.get(phone) || {};
   const user = {
     _id: `offline-${phone}`,
     id: `offline-${phone}`,
-    name: `Samira User ${phone.slice(-4)}`,
+    name: savedProfile.name || `Samira User ${phone.slice(-4)}`,
+    email: savedProfile.email,
     phone,
-    isPhoneVerified: true,
+    gender: savedProfile.gender || '',
+    birthDate: savedProfile.birthDate,
+    alternatePhone: savedProfile.alternatePhone || '',
+    hintName: savedProfile.hintName || '',
+    isPhoneVerified: savedProfile.isPhoneVerified ?? true,
+    isEmailVerified: savedProfile.isEmailVerified ?? false,
     role: isAdminPhone ? 'admin' : 'customer',
     availableModes: isAdminPhone ? ['customer', 'admin'] : ['customer'],
     activeMode,
@@ -212,4 +379,89 @@ function allowOtpRequest(phone, ip) {
   hits.push(now);
   otpRateLimit.set(key, hits);
   return hits.length <= limit;
+}
+
+function storeOfflineProfile(user) {
+  const phone = String(user.phone || '');
+  if (!phone) return;
+  offlineProfiles.set(phone, {
+    name: user.name || '',
+    email: user.email || '',
+    isEmailVerified: Boolean(user.isEmailVerified),
+    gender: user.gender || '',
+    birthDate: user.birthDate || undefined,
+    alternatePhone: user.alternatePhone || '',
+    hintName: user.hintName || '',
+    isPhoneVerified: Boolean(user.isPhoneVerified),
+  });
+}
+
+function removeOfflineProfile(user) {
+  const phone = String(user.phone || '');
+  if (!phone) return;
+  offlineProfiles.delete(phone);
+}
+
+function normalizeTrimmed(value) {
+  return String(value || '').trim();
+}
+
+function normalizeProfileEmail(value) {
+  const email = String(value || '').trim().toLowerCase();
+  if (!email) return '';
+  const validEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!validEmail.test(email)) throw new Error('Please enter a valid email address');
+  return email;
+}
+
+function normalizeProfilePhone(value, { allowEmpty = false } = {}) {
+  const raw = String(value || '').replace(/\D/g, '');
+  if (!raw) {
+    if (allowEmpty) return '';
+    return '';
+  }
+
+  const local = raw.replace(/^91/, '');
+  if (!/^[6-9]\d{9}$/.test(local)) throw new Error('Please enter a valid 10-digit mobile number');
+  return local;
+}
+
+function normalizeGender(value) {
+  const gender = String(value || '').trim().toLowerCase();
+  if (!gender) return '';
+  if (!['male', 'female', 'other'].includes(gender)) throw new Error('Please select a valid gender');
+  return gender;
+}
+
+function normalizeBirthDate(value) {
+  if (!value) return undefined;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) throw new Error('Please enter a valid birth date');
+  return date;
+}
+
+function createProfileChangeToken({ userId, targetType, target }) {
+  return jwt.sign(
+    {
+      tokenType: 'profile_verification',
+      userId: String(userId),
+      targetType,
+      target,
+    },
+    process.env.JWT_SECRET || 'dev_secret_change_me',
+    { expiresIn: PROFILE_VERIFICATION_TOKEN_TTL },
+  );
+}
+
+function verifyProfileChangeToken(token, { userId, targetType, target }) {
+  if (!token) return false;
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'dev_secret_change_me');
+    return decoded?.tokenType === 'profile_verification'
+      && String(decoded.userId) === String(userId)
+      && decoded.targetType === targetType
+      && String(decoded.target) === String(target);
+  } catch {
+    return false;
+  }
 }

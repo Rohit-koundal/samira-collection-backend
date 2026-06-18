@@ -1,5 +1,6 @@
 const Category = require('../models/Category');
 const slugify = require('../utils/slugify');
+const { deleteImageFromR2, isR2Configured } = require('../services/r2Upload');
 
 exports.getCategories = async (req, res) => {
   const query = req.query.admin === 'true' ? {} : { isActive: true };
@@ -26,6 +27,24 @@ exports.updateCategory = async (req, res) => {
   if (payload.image === undefined || payload.image === '') {
     payload.image = existingCategory.image || '';
   }
-  res.json(await Category.findByIdAndUpdate(req.params.id, payload, { new: true, runValidators: true }));
+  const updatedCategory = await Category.findByIdAndUpdate(req.params.id, payload, { new: true, runValidators: true });
+  if (existingCategory.image && existingCategory.image !== updatedCategory.image) {
+    await safeDeleteCategoryImage(existingCategory.image);
+  }
+  res.json(updatedCategory);
 };
-exports.deleteCategory = async (req, res) => { await Category.findByIdAndDelete(req.params.id); res.json({ message: 'Category deleted' }); };
+exports.deleteCategory = async (req, res) => {
+  const category = await Category.findById(req.params.id);
+  if (category?.image) await safeDeleteCategoryImage(category.image);
+  await Category.findByIdAndDelete(req.params.id);
+  res.json({ message: 'Category deleted' });
+};
+
+async function safeDeleteCategoryImage(image) {
+  if (!isR2Configured()) return;
+  try {
+    await deleteImageFromR2(image);
+  } catch {
+    // Ignore cleanup failures so category updates stay safe.
+  }
+}

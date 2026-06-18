@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const jwt = require('jsonwebtoken');
 
 const categories = [
   { _id: 'cat-sarees', id: 'cat-sarees', name: 'Sarees', slug: 'sarees', count: 128, description: 'Silk and festive drapes', isActive: true, displayOrder: 1 },
@@ -332,17 +333,33 @@ function handleAddresses(req, res) {
 }
 
 function handleOrders(req, res, admin = false) {
+  const currentUser = resolveDevRequestUser(req);
+  const currentUserId = String(currentUser?._id || currentUser?.id || '');
+
   if (req.method === 'GET') {
-    if (req.path.endsWith('/receipt')) return res.json(buildReceipt(findItem(orders, routeId(req.path, admin ? '/admin/orders' : '/orders'))));
-    if (req.path === '/orders/my-orders' || req.path === '/admin/orders' || req.path === '/admin/orders/admin/all' || req.path === '/orders') return res.json(orders);
+    if (req.path.endsWith('/receipt')) {
+      const order = findItem(orders, routeId(req.path, admin ? '/admin/orders' : '/orders'));
+      if (!order) return res.status(404).json({ message: 'Order not found' });
+      if (!admin && String(order.user || '') !== currentUserId) return res.status(403).json({ message: 'Not allowed to view this receipt' });
+      return res.json(buildReceipt(order));
+    }
+    if (req.path === '/orders/my-orders') {
+      if (!currentUserId) return res.status(401).json({ message: 'Not authorized' });
+      return res.json(orders.filter((order) => String(order.user || '') === currentUserId));
+    }
+    if (req.path === '/admin/orders' || req.path === '/admin/orders/admin/all') return res.json(orders);
+    if (req.path === '/orders') return res.status(403).json({ message: 'Not allowed to view all orders' });
     const order = findItem(orders, routeId(req.path, admin ? '/admin/orders' : '/orders'));
+    if (!order) return res.status(404).json({ message: 'Order not found' });
+    if (!admin && String(order.user || '') !== currentUserId) return res.status(403).json({ message: 'Not allowed to view this order' });
     return order ? res.json(order) : res.status(404).json({ message: 'Order not found' });
   }
   if (req.method === 'POST' && (req.path === '/orders' || req.path === '/orders/cod')) {
-    const order = createOrder(req.body);
+    if (!currentUserId) return res.status(401).json({ message: 'Not authorized' });
+    const order = createOrder(req.body, currentUser);
     return res.status(201).json(order);
   }
-  if (req.method === 'POST' && req.path.endsWith('/cancel')) return updateOrder(req, res, 'Cancelled');
+  if (req.method === 'POST' && req.path.endsWith('/cancel')) return updateOrder(req, res, 'Cancelled', { currentUserId, admin });
   if (req.method === 'PUT' && req.path.endsWith('/status')) return updateOrder(req, res, req.body.orderStatus || req.body.status || 'Pending');
   if (req.method === 'PUT' && req.path.endsWith('/payment-status')) {
     const order = findItem(orders, routeId(req.path, admin ? '/admin/orders' : '/orders'));
@@ -374,13 +391,14 @@ function handleReturns(req, res, admin = false) {
   return res.status(405).json({ message: 'Method not allowed' });
 }
 
-function createOrder(body) {
+function createOrder(body, user) {
   const orderItems = Array.isArray(body.orderItems) ? body.orderItems : [];
   const totalMRP = orderItems.reduce((sum, item) => sum + Number(item.originalPrice || item.price || 0) * Number(item.quantity || 1), 0);
   const sellingTotal = orderItems.reduce((sum, item) => sum + Number(item.price || 0) * Number(item.quantity || 1), 0);
   const deliveryCharge = sellingTotal >= Number(settings.freeShippingMinAmount || 999) ? 0 : Number(settings.deliveryCharge || 99);
   return createItem(orders, {
     ...body,
+    user: user?._id || user?.id,
     orderItems,
     paymentMethod: body.paymentMethod || 'COD',
     paymentProvider: body.paymentProvider || 'COD',
@@ -396,9 +414,10 @@ function createOrder(body) {
   }, 'dev-order');
 }
 
-function updateOrder(req, res, status) {
+function updateOrder(req, res, status, { currentUserId = '', admin = false } = {}) {
   const order = findItem(orders, routeId(req.path, req.path.startsWith('/admin/orders') ? '/admin/orders' : '/orders'));
   if (!order) return res.status(404).json({ message: 'Order not found' });
+  if (!admin && String(order.user || '') !== String(currentUserId)) return res.status(403).json({ message: 'Not allowed' });
   order.orderStatus = status;
   order.statusTimeline = [...(order.statusTimeline || []), { status, date: new Date().toISOString(), note: req.body.note || 'Updated in dev fallback' }];
   return res.json(order);
@@ -494,6 +513,31 @@ function devUser(role = 'customer') {
     availableModes: role === 'admin' ? ['customer', 'admin'] : ['customer'],
     isPhoneVerified: true,
   };
+}
+
+function resolveDevRequestUser(req) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : '';
+  if (!token) return null;
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'dev_secret_change_me');
+    const id = decoded.userId || decoded.id;
+    if (!id) return null;
+
+    return {
+      _id: String(id),
+      id: String(id),
+      name: decoded.name || 'Samira User',
+      phone: decoded.phone || '',
+      role: decoded.role || 'customer',
+      activeMode: decoded.activeMode || 'customer',
+      availableModes: decoded.role === 'admin' ? ['customer', 'admin'] : ['customer'],
+      isPhoneVerified: true,
+    };
+  } catch {
+    return null;
+  }
 }
 
 module.exports = devFallback;

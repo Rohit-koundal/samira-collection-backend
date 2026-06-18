@@ -36,10 +36,39 @@ function verifyOtpHash(phone, otp, otpHash) {
   return compareOtp(phone, otp, otpHash);
 }
 
+function buildMemoryKey(targetType, target) {
+  return `${targetType}:${target}`;
+}
+
+function normalizeEmail(email = '') {
+  const normalized = String(email || '').trim().toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalized)) return '';
+  return normalized;
+}
+
+function requireValidEmail(email) {
+  const normalized = normalizeEmail(email);
+  if (!normalized) {
+    const error = new Error('Enter a valid email address');
+    error.statusCode = 400;
+    throw error;
+  }
+  return normalized;
+}
+
+function normalizeTarget(target, targetType) {
+  return targetType === 'email' ? requireValidEmail(target) : requireValidPhone(target);
+}
+
 async function canResendOtp(phone) {
   const normalizedPhone = requireValidPhone(phone);
+  return canResendTargetOtp(normalizedPhone, 'phone');
+}
+
+async function canResendTargetOtp(target, targetType = 'phone') {
+  const normalizedTarget = normalizeTarget(target, targetType);
   if (useMemoryOtpStore()) {
-    const latest = memoryOtps.get(normalizedPhone);
+    const latest = memoryOtps.get(buildMemoryKey(targetType, normalizedTarget));
     const cooldownSeconds = Number(process.env.OTP_RESEND_COOLDOWN_SECONDS || 60);
     if (!latest || latest.isUsed) return { allowed: true, latest: null, retryAfter: 0 };
     const elapsedSeconds = Math.floor((Date.now() - latest.createdAt.getTime()) / 1000);
@@ -49,7 +78,7 @@ async function canResendOtp(phone) {
       retryAfter: Math.max(0, cooldownSeconds - elapsedSeconds),
     };
   }
-  const latest = await Otp.findOne({ phone: normalizedPhone, isUsed: false }).sort('-createdAt');
+  const latest = await Otp.findOne({ target: normalizedTarget, targetType, isUsed: false }).sort('-createdAt');
   const cooldownSeconds = Number(process.env.OTP_RESEND_COOLDOWN_SECONDS || 60);
   if (!latest) return { allowed: true, latest: null, retryAfter: 0 };
   const elapsedSeconds = Math.floor((Date.now() - latest.createdAt.getTime()) / 1000);
@@ -61,8 +90,16 @@ async function canResendOtp(phone) {
 }
 
 async function createOtp(phone, purpose = 'login', req) {
-  const normalizedPhone = requireValidPhone(phone);
-  const resend = await canResendOtp(normalizedPhone);
+  return createTargetOtp(phone, { purpose, req, targetType: 'phone' });
+}
+
+async function createEmailOtp(email, purpose = 'profile_email_change', req) {
+  return createTargetOtp(email, { purpose, req, targetType: 'email' });
+}
+
+async function createTargetOtp(target, { purpose = 'login', req, targetType = 'phone' } = {}) {
+  const normalizedTarget = normalizeTarget(target, targetType);
+  const resend = await canResendTargetOtp(normalizedTarget, targetType);
   if (!resend.allowed) {
     const error = new Error(`Please wait ${resend.retryAfter}s before requesting another OTP`);
     error.statusCode = 429;
@@ -72,8 +109,11 @@ async function createOtp(phone, purpose = 'login', req) {
   const otp = generateOtp();
   if (useMemoryOtpStore()) {
     const record = {
-      phone: normalizedPhone,
-      otpHash: hashOtp(normalizedPhone, otp),
+      phone: targetType === 'phone' ? normalizedTarget : undefined,
+      email: targetType === 'email' ? normalizedTarget : undefined,
+      target: normalizedTarget,
+      targetType,
+      otpHash: hashOtp(normalizedTarget, otp),
       purpose,
       provider: process.env.OTP_PROVIDER || process.env.SMS_PROVIDER || 'mock',
       expiresAt: new Date(Date.now() + getExpiryMinutes() * 60 * 1000),
@@ -85,18 +125,21 @@ async function createOtp(phone, purpose = 'login', req) {
       userAgent: req?.headers?.['user-agent'],
       createdAt: new Date(),
       async save() {
-        memoryOtps.set(normalizedPhone, this);
+        memoryOtps.set(buildMemoryKey(targetType, normalizedTarget), this);
         return this;
       },
     };
-    memoryOtps.set(normalizedPhone, record);
-    return { record, otp, phone: normalizedPhone };
+    memoryOtps.set(buildMemoryKey(targetType, normalizedTarget), record);
+    return { record, otp, target: normalizedTarget, [targetType]: normalizedTarget };
   }
 
-  await Otp.updateMany({ phone: normalizedPhone, isUsed: false }, { isUsed: true });
+  await Otp.updateMany({ target: normalizedTarget, targetType, isUsed: false }, { isUsed: true });
   const record = await Otp.create({
-    phone: normalizedPhone,
-    otpHash: hashOtp(normalizedPhone, otp),
+    phone: targetType === 'phone' ? normalizedTarget : undefined,
+    email: targetType === 'email' ? normalizedTarget : undefined,
+    target: normalizedTarget,
+    targetType,
+    otpHash: hashOtp(normalizedTarget, otp),
     purpose,
     provider: process.env.OTP_PROVIDER || process.env.SMS_PROVIDER || 'mock',
     expiresAt: new Date(Date.now() + getExpiryMinutes() * 60 * 1000),
@@ -106,21 +149,29 @@ async function createOtp(phone, purpose = 'login', req) {
     userAgent: req?.headers?.['user-agent'],
   });
 
-  return { record, otp, phone: normalizedPhone };
+  return { record, otp, target: normalizedTarget, [targetType]: normalizedTarget };
 }
 
 async function verifyOtp(phone, otp) {
-  const normalizedPhone = requireValidPhone(phone);
+  return verifyTargetOtp(phone, otp, { targetType: 'phone' });
+}
+
+async function verifyEmailOtp(email, otp) {
+  return verifyTargetOtp(email, otp, { targetType: 'email' });
+}
+
+async function verifyTargetOtp(target, otp, { targetType = 'phone' } = {}) {
+  const normalizedTarget = normalizeTarget(target, targetType);
   const code = String(otp || '');
   if (!/^\d{6}$/.test(code)) {
-    const error = new Error('Valid phone and OTP are required');
+    const error = new Error(`Valid ${targetType === 'email' ? 'email' : 'mobile number'} and OTP are required`);
     error.statusCode = 400;
     throw error;
   }
 
   const record = useMemoryOtpStore()
-    ? getMemoryOtp(normalizedPhone)
-    : await Otp.findOne({ phone: normalizedPhone, isUsed: false }).sort('-createdAt');
+    ? getMemoryOtp(normalizedTarget, targetType)
+    : await Otp.findOne({ target: normalizedTarget, targetType, isUsed: false }).sort('-createdAt');
   if (!record) {
     const error = new Error('OTP not found or expired');
     error.statusCode = 400;
@@ -138,7 +189,7 @@ async function verifyOtp(phone, otp) {
     error.statusCode = 429;
     throw error;
   }
-  const matches = compareOtp(normalizedPhone, code, record.otpHash);
+  const matches = compareOtp(normalizedTarget, code, record.otpHash);
 
   if (!matches) {
     record.attempts += 1;
@@ -150,7 +201,7 @@ async function verifyOtp(phone, otp) {
 
   record.isUsed = true;
   await record.save();
-  return { phone: normalizedPhone, record };
+  return { target: normalizedTarget, targetType, [targetType]: normalizedTarget, record };
 }
 
 async function markOtpUsed(record) {
@@ -168,21 +219,28 @@ function useMemoryOtpStore() {
   return process.env.NODE_ENV !== 'production' && mongoose.connection.readyState !== 1;
 }
 
-function getMemoryOtp(phone) {
-  const record = memoryOtps.get(phone);
+function getMemoryOtp(target, targetType = 'phone') {
+  const record = memoryOtps.get(buildMemoryKey(targetType, target));
   if (!record || record.isUsed) return null;
   return record;
 }
 
 module.exports = {
   normalizePhone,
+  normalizeEmail,
   generateOtp,
   hashOtp,
   compareOtp,
   verifyOtpHash,
   createOtp,
+  createEmailOtp,
   verifyOtp,
+  verifyEmailOtp,
+  createTargetOtp,
+  verifyTargetOtp,
   markOtpUsed,
   invalidateOtp,
   canResendOtp,
+  canResendTargetOtp,
+  requireValidEmail,
 };

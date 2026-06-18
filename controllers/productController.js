@@ -3,6 +3,7 @@ const Category = require('../models/Category');
 const slugify = require('../utils/slugify');
 const mongoose = require('mongoose');
 const { normalizeProductImages, normalizeProductPayload, sanitizeProductImages } = require('../utils/imageUtils');
+const { deleteImageFromR2, isR2Configured } = require('../services/r2Upload');
 
 exports.getProducts = async (req, res) => {
   const query = req.query.admin === 'true' ? {} : { isActive: true };
@@ -92,10 +93,15 @@ exports.updateProduct = async (req, res) => {
     normalizeProductPayload({ ...payload, images: nextImages }),
     { new: true, runValidators: true },
   );
+  await cleanupRemovedProductImages(existingProduct.images || [], product.images || []);
   res.json(normalizeProductImages(product, req));
 };
 
 exports.deleteProduct = async (req, res) => {
+  const product = await Product.findById(req.params.id);
+  if (product?.images?.length) {
+    await Promise.all(product.images.map((image) => safeDeleteImage(image)));
+  }
   await Product.findByIdAndDelete(req.params.id);
   res.json({ message: 'Product deleted' });
 };
@@ -132,4 +138,21 @@ function validateProduct(data, creating = true) {
 
 function isInaccessibleImageUrl(url = '') {
   return /https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?\//i.test(String(url));
+}
+
+async function cleanupRemovedProductImages(existingImages = [], nextImages = []) {
+  const retainedKeys = new Set(
+    nextImages.map((image) => String(image.publicId || image.url || '')).filter(Boolean),
+  );
+  const removedImages = existingImages.filter((image) => !retainedKeys.has(String(image.publicId || image.url || '')));
+  await Promise.all(removedImages.map((image) => safeDeleteImage(image)));
+}
+
+async function safeDeleteImage(image) {
+  if (!isR2Configured()) return;
+  try {
+    await deleteImageFromR2(image);
+  } catch {
+    // Ignore storage cleanup failures so product save/delete doesn't break.
+  }
 }
