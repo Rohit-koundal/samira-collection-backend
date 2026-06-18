@@ -8,6 +8,7 @@ router.get('/', protect, adminOnly, order.adminOrders);
 router.get('/:id/receipt', protect, order.receipt);
 router.put('/:id/status', protect, adminOnly, order.updateOrderStatus);
 router.put('/:id/payment-status', protect, adminOnly, order.updatePaymentStatus);
+router.delete('/:id', protect, adminOnly, order.deleteOrder);
 router.post('/:id/cancel', protect, order.cancelOrder);
 router.get('/my-orders', protect, order.myOrders);
 router.get('/admin/all', protect, adminOnly, order.adminOrders);

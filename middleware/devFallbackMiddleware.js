@@ -350,6 +350,10 @@ function handleOrders(req, res, admin = false) {
     order.paymentStatus = req.body.paymentStatus || 'Pending';
     return res.json(order);
   }
+  if (req.method === 'DELETE') {
+    const orderId = routeId(req.path, admin ? '/admin/orders' : '/orders');
+    return deleteItem(orders, orderId, res, 'Order');
+  }
   return res.status(405).json({ message: 'Method not allowed' });
 }
 

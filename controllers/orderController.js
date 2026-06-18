@@ -2,6 +2,7 @@ const Order = require('../models/Order');
 const Product = require('../models/Product');
 const Settings = require('../models/Settings');
 const Coupon = require('../models/Coupon');
+const { getPrimaryImageUrl } = require('../utils/imageUtils');
 
 exports.createOrder = async (req, res) => {
   try {
@@ -48,6 +49,12 @@ exports.updateOrderStatus = async (req, res) => {
   res.json(order);
 };
 exports.updatePaymentStatus = async (req, res) => res.json(await Order.findByIdAndUpdate(req.params.id, { paymentStatus: req.body.paymentStatus }, { new: true }));
+exports.deleteOrder = async (req, res) => {
+  const order = await Order.findById(req.params.id);
+  if (!order) return res.status(404).json({ message: 'Order not found' });
+  await Order.findByIdAndDelete(req.params.id);
+  res.json({ message: 'Order deleted' });
+};
 exports.cancelOrder = async (req, res) => {
   const order = await Order.findById(req.params.id);
   if (!order) return res.status(404).json({ message: 'Order not found' });
@@ -82,7 +89,7 @@ async function prepareOrder(orderItems = [], couponCode) {
     items.push({
       product: product._id,
       name: product.name,
-      image: product.images?.[0]?.url,
+      image: getPrimaryImageUrl(product.images),
       size: item.size,
       color: item.color,
       quantity,

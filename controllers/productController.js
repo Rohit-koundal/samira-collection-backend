@@ -2,7 +2,7 @@ const Product = require('../models/Product');
 const Category = require('../models/Category');
 const slugify = require('../utils/slugify');
 const mongoose = require('mongoose');
-const { normalizeProductImages } = require('../utils/imageUtils');
+const { normalizeProductImages, normalizeProductPayload } = require('../utils/imageUtils');
 
 exports.getProducts = async (req, res) => {
   const query = req.query.admin === 'true' ? {} : { isActive: true };
@@ -75,14 +75,14 @@ exports.getProductById = async (req, res) => {
 exports.createProduct = async (req, res) => {
   const error = validateProduct(req.body);
   if (error) return res.status(400).json({ message: error });
-  const product = await Product.create({ ...req.body, slug: req.body.slug || slugify(req.body.name) });
+  const product = await Product.create(normalizeProductPayload({ ...req.body, slug: req.body.slug || slugify(req.body.name) }));
   res.status(201).json(product);
 };
 
 exports.updateProduct = async (req, res) => {
   const error = validateProduct(req.body, false);
   if (error) return res.status(400).json({ message: error });
-  const product = await Product.findByIdAndUpdate(req.params.id, req.body, { new: true, runValidators: true });
+  const product = await Product.findByIdAndUpdate(req.params.id, normalizeProductPayload(req.body), { new: true, runValidators: true });
   res.json(product);
 };
 
