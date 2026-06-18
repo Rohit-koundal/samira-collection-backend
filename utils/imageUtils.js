@@ -21,8 +21,44 @@ function placeholderUrl(req) {
 }
 
 function isInaccessibleImageUrl(url) {
-  return process.env.NODE_ENV === 'production'
-    && /https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?\//i.test(String(url || ''));
+  return /https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?\//i.test(String(url || ''));
+}
+
+function extractUploadsPath(url = '') {
+  const match = String(url).match(/\/uploads\/[^?#\s]+/i);
+  return match ? match[0] : '';
+}
+
+function rewriteImageUrl(url, req) {
+  if (!url || isKnownMissingImage(url)) return '';
+
+  const uploadsPath = extractUploadsPath(url);
+  if (uploadsPath && isInaccessibleImageUrl(url)) {
+    return `${getPublicApiUrl(req)}${uploadsPath}`;
+  }
+
+  if (url.startsWith('/uploads/')) {
+    return `${getPublicApiUrl(req)}${url}`;
+  }
+
+  return url;
+}
+
+function sanitizeStoredImageUrl(url = '') {
+  if (!url) return url;
+  if (isInaccessibleImageUrl(url)) {
+    const uploadsPath = extractUploadsPath(url);
+    return uploadsPath || url;
+  }
+  return url;
+}
+
+function sanitizeProductImages(images = []) {
+  if (!Array.isArray(images)) return images;
+  return images.map((image) => {
+    if (!image || typeof image !== 'object') return image;
+    return { ...image, url: sanitizeStoredImageUrl(image.url) };
+  });
 }
 
 function buildUploadFileResponse(file, req) {
@@ -35,10 +71,11 @@ function buildUploadFileResponse(file, req) {
 
 function normalizeImageForResponse(image, req) {
   const url = typeof image === 'string' ? image : image?.url;
-  if (!url || isKnownMissingImage(url) || isInaccessibleImageUrl(url)) {
+  const rewritten = rewriteImageUrl(url, req);
+  if (!rewritten) {
     return { ...(typeof image === 'object' && image ? image : {}), url: placeholderUrl(req), isPlaceholder: true };
   }
-  return typeof image === 'string' ? { url } : image;
+  return typeof image === 'string' ? { url: rewritten } : { ...image, url: rewritten };
 }
 
 function normalizeProductImages(product, req) {
@@ -59,4 +96,5 @@ module.exports = {
   isLocalRequest,
   normalizeProductImages,
   placeholderUrl,
+  sanitizeProductImages,
 };

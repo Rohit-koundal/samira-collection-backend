@@ -42,13 +42,6 @@ router.post('/', protectUpload, adminOnlyUpload, (req, res, next) => {
         return res.status(201).json({ files });
       }
 
-      if (!isLocalRequest(req)) {
-        await cleanupTempFiles(req.files);
-        return res.status(503).json({
-          message: 'Image upload is not configured for production. Set R2 or Cloudinary environment variables on Render.',
-        });
-      }
-
       const files = req.files.map((file) => buildUploadFileResponse(file, req));
       return res.status(201).json({ files });
     } catch (uploadError) {
