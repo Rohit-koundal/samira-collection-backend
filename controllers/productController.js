@@ -2,7 +2,6 @@ const Product = require('../models/Product');
 const Category = require('../models/Category');
 const slugify = require('../utils/slugify');
 const mongoose = require('mongoose');
-const { normalizeProductImages, normalizeProductPayload } = require('../utils/imageUtils');
 const { normalizeProductImages, normalizeProductPayload, sanitizeProductImages } = require('../utils/imageUtils');
 
 exports.getProducts = async (req, res) => {
