@@ -4,6 +4,7 @@ const { protect } = require('../middleware/authMiddleware');
 const { adminOnly } = require('../middleware/adminMiddleware');
 
 router.get('/', category.getCategories);
+router.get('/:id', protect, adminOnly, category.getCategoryById);
 router.post('/', protect, adminOnly, category.createCategory);
 router.put('/:id', protect, adminOnly, category.updateCategory);
 router.delete('/:id', protect, adminOnly, category.deleteCategory);

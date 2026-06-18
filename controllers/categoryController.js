@@ -5,6 +5,11 @@ exports.getCategories = async (req, res) => {
   const query = req.query.admin === 'true' ? {} : { isActive: true };
   res.json(await Category.find(query).sort('displayOrder name'));
 };
+exports.getCategoryById = async (req, res) => {
+  const category = await Category.findById(req.params.id);
+  if (!category) return res.status(404).json({ message: 'Category not found' });
+  res.json(category);
+};
 exports.createCategory = async (req, res) => {
   if (!req.body.name || req.body.name.trim().length < 2) return res.status(400).json({ message: 'Category name is required' });
   if (req.body.image?.startsWith('data:')) return res.status(400).json({ message: 'Category image must be an uploaded file URL' });
