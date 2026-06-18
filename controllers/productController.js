@@ -2,11 +2,8 @@ const Product = require('../models/Product');
 const Category = require('../models/Category');
 const slugify = require('../utils/slugify');
 const mongoose = require('mongoose');
-<<<<<<< HEAD
 const { normalizeProductImages, normalizeProductPayload } = require('../utils/imageUtils');
-=======
-const { normalizeProductImages, sanitizeProductImages } = require('../utils/imageUtils');
->>>>>>> 4509b61740897cfdd0411da4b7e6430f7ce333fd
+const { normalizeProductImages, normalizeProductPayload, sanitizeProductImages } = require('../utils/imageUtils');
 
 exports.getProducts = async (req, res) => {
   const query = req.query.admin === 'true' ? {} : { isActive: true };
@@ -80,26 +77,16 @@ exports.createProduct = async (req, res) => {
   const payload = { ...req.body, images: sanitizeProductImages(req.body.images) };
   const error = validateProduct(payload);
   if (error) return res.status(400).json({ message: error });
-<<<<<<< HEAD
   const product = await Product.create(normalizeProductPayload({ ...req.body, slug: req.body.slug || slugify(req.body.name) }));
-  res.status(201).json(product);
-=======
-  const product = await Product.create({ ...payload, slug: payload.slug || slugify(payload.name) });
   res.status(201).json(normalizeProductImages(product, req));
->>>>>>> 4509b61740897cfdd0411da4b7e6430f7ce333fd
 };
 
 exports.updateProduct = async (req, res) => {
   const payload = { ...req.body, images: sanitizeProductImages(req.body.images) };
   const error = validateProduct(payload, false);
   if (error) return res.status(400).json({ message: error });
-<<<<<<< HEAD
   const product = await Product.findByIdAndUpdate(req.params.id, normalizeProductPayload(req.body), { new: true, runValidators: true });
-  res.json(product);
-=======
-  const product = await Product.findByIdAndUpdate(req.params.id, payload, { new: true, runValidators: true });
   res.json(normalizeProductImages(product, req));
->>>>>>> 4509b61740897cfdd0411da4b7e6430f7ce333fd
 };
 
 exports.deleteProduct = async (req, res) => {

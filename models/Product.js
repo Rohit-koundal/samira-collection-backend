@@ -11,14 +11,7 @@ const productSchema = new mongoose.Schema({
   price: { type: Number, required: true },
   originalPrice: Number,
   discountPercentage: Number,
-<<<<<<< HEAD
   images: [{ url: String, publicId: String, primary: { type: Boolean, default: false } }],
-=======
-  images: [{
-    url: String,
-    publicId: String,
-  }],
->>>>>>> 4509b61740897cfdd0411da4b7e6430f7ce333fd
   sizes: [String],
   colors: [String],
   fabric: String,

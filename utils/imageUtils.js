@@ -20,7 +20,6 @@ function placeholderUrl(req) {
   return `${getPublicApiUrl(req)}/placeholder.jpg`;
 }
 
-<<<<<<< HEAD
 function normalizeImageEntry(image) {
   if (!image) return null;
   if (typeof image === 'string') {
@@ -53,7 +52,8 @@ function normalizeImageForResponse(image, req) {
     return { ...(normalized || {}), url: placeholderUrl(req), isPlaceholder: true, primary: Boolean(normalized?.primary) };
   }
   return normalized;
-=======
+}
+
 function isInaccessibleImageUrl(url) {
   return /https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?\//i.test(String(url || ''));
 }
@@ -107,10 +107,9 @@ function normalizeImageForResponse(image, req) {
   const url = typeof image === 'string' ? image : image?.url;
   const rewritten = rewriteImageUrl(url, req);
   if (!rewritten) {
-    return { ...(typeof image === 'object' && image ? image : {}), url: placeholderUrl(req), isPlaceholder: true };
+    return { ...(typeof image === 'object' && image ? image : {}), url: placeholderUrl(req), isPlaceholder: true, primary: Boolean(image?.primary) };
   }
   return typeof image === 'string' ? { url: rewritten } : { ...image, url: rewritten };
->>>>>>> 4509b61740897cfdd0411da4b7e6430f7ce333fd
 }
 
 function normalizeProductImages(product, req) {
@@ -151,12 +150,9 @@ function isKnownMissingImage(url) {
 module.exports = {
   buildUploadFileResponse,
   getPublicApiUrl,
-<<<<<<< HEAD
   getPrimaryImageUrl,
   normalizeImageEntries,
-=======
   isLocalRequest,
->>>>>>> 4509b61740897cfdd0411da4b7e6430f7ce333fd
   normalizeProductImages,
   normalizeProductPayload,
   placeholderUrl,
