@@ -1,15 +1,26 @@
+function isLocalRequest(req) {
+  const host = String(req?.get?.('host') || req?.hostname || '').toLowerCase();
+  return host.includes('localhost') || host.includes('127.0.0.1');
+}
+
 function getPublicApiUrl(req) {
-  const host = String(req.get('host') || '').toLowerCase();
-  if (host.includes('localhost') || host.includes('127.0.0.1')) {
+  if (isLocalRequest(req)) {
     return `${req.protocol}://${req.get('host')}`.replace(/\/$/, '');
   }
-  return (process.env.PUBLIC_API_URL || `${req.protocol}://${req.get('host')}`).replace(/\/$/, '');
+
+  let apiUrl = process.env.PUBLIC_API_URL || `${req.protocol}://${req.get('host')}`;
+  if (/localhost|127\.0\.0\.1/i.test(apiUrl)) {
+    apiUrl = `${req.protocol}://${req.get('host')}`;
+  }
+
+  return apiUrl.replace(/\/$/, '');
 }
 
 function placeholderUrl(req) {
   return `${getPublicApiUrl(req)}/placeholder.jpg`;
 }
 
+<<<<<<< HEAD
 function normalizeImageEntry(image) {
   if (!image) return null;
   if (typeof image === 'string') {
@@ -42,6 +53,64 @@ function normalizeImageForResponse(image, req) {
     return { ...(normalized || {}), url: placeholderUrl(req), isPlaceholder: true, primary: Boolean(normalized?.primary) };
   }
   return normalized;
+=======
+function isInaccessibleImageUrl(url) {
+  return /https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?\//i.test(String(url || ''));
+}
+
+function extractUploadsPath(url = '') {
+  const match = String(url).match(/\/uploads\/[^?#\s]+/i);
+  return match ? match[0] : '';
+}
+
+function rewriteImageUrl(url, req) {
+  if (!url || isKnownMissingImage(url)) return '';
+
+  const uploadsPath = extractUploadsPath(url);
+  if (uploadsPath && isInaccessibleImageUrl(url)) {
+    return `${getPublicApiUrl(req)}${uploadsPath}`;
+  }
+
+  if (url.startsWith('/uploads/')) {
+    return `${getPublicApiUrl(req)}${url}`;
+  }
+
+  return url;
+}
+
+function sanitizeStoredImageUrl(url = '') {
+  if (!url) return url;
+  if (isInaccessibleImageUrl(url)) {
+    const uploadsPath = extractUploadsPath(url);
+    return uploadsPath || url;
+  }
+  return url;
+}
+
+function sanitizeProductImages(images = []) {
+  if (!Array.isArray(images)) return images;
+  return images.map((image) => {
+    if (!image || typeof image !== 'object') return image;
+    return { ...image, url: sanitizeStoredImageUrl(image.url) };
+  });
+}
+
+function buildUploadFileResponse(file, req) {
+  return {
+    url: `${getPublicApiUrl(req)}/uploads/${file.filename}`,
+    publicId: file.filename,
+    originalName: file.originalname,
+  };
+}
+
+function normalizeImageForResponse(image, req) {
+  const url = typeof image === 'string' ? image : image?.url;
+  const rewritten = rewriteImageUrl(url, req);
+  if (!rewritten) {
+    return { ...(typeof image === 'object' && image ? image : {}), url: placeholderUrl(req), isPlaceholder: true };
+  }
+  return typeof image === 'string' ? { url: rewritten } : { ...image, url: rewritten };
+>>>>>>> 4509b61740897cfdd0411da4b7e6430f7ce333fd
 }
 
 function normalizeProductImages(product, req) {
@@ -80,10 +149,16 @@ function isKnownMissingImage(url) {
 }
 
 module.exports = {
+  buildUploadFileResponse,
   getPublicApiUrl,
+<<<<<<< HEAD
   getPrimaryImageUrl,
   normalizeImageEntries,
+=======
+  isLocalRequest,
+>>>>>>> 4509b61740897cfdd0411da4b7e6430f7ce333fd
   normalizeProductImages,
   normalizeProductPayload,
   placeholderUrl,
+  sanitizeProductImages,
 };

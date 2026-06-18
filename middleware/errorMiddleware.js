@@ -18,6 +18,12 @@ function errorHandler(error, req, res, next) {
   if (error.code === 'LIMIT_FILE_SIZE') {
     return res.status(400).json({ message: 'Image size is too large' });
   }
+  if (error.code === 'LIMIT_FILE_COUNT' || error.code === 'LIMIT_UNEXPECTED_FILE') {
+    return res.status(400).json({ message: 'Too many images uploaded. Maximum 8 images are allowed.' });
+  }
+  if (error.message?.includes('R2')) {
+    return res.status(502).json({ message: error.message });
+  }
   const statusCode = res.statusCode === 200 ? 500 : res.statusCode;
   res.status(statusCode).json({ message: error.message, stack: process.env.NODE_ENV === 'production' ? undefined : error.stack });
 }

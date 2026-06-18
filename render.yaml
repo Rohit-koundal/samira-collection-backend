@@ -23,7 +23,7 @@ services:
       - key: JWT_REFRESH_EXPIRES_IN
         value: 30d
       - key: PUBLIC_API_URL
-        sync: false
+        value: https://samira-collection-backend-1.onrender.com
       - key: CLIENT_ORIGINS
         sync: false
       - key: FRONTEND_URL
@@ -56,6 +56,18 @@ services:
         sync: false
       - key: RAZORPAY_KEY_SECRET
         sync: false
+      - key: R2_ACCOUNT_ID
+        sync: false
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_ACCESS_KEY
+        sync: false
+      - key: R2_BUCKET_NAME
+        value: samira-products
+      - key: R2_PUBLIC_URL
+        sync: false
+      - key: R2_FOLDER
+        value: products
       - key: CLOUDINARY_CLOUD_NAME
         sync: false
       - key: CLOUDINARY_API_KEY

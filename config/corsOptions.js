@@ -26,11 +26,26 @@ function isAllowedRenderOrigin(origin) {
   }
 }
 
+function isLocalhostOrigin(origin) {
+  try {
+    const url = new URL(origin);
+    return url.protocol === 'http:' && ['localhost', '127.0.0.1'].includes(url.hostname);
+  } catch (error) {
+    return false;
+  }
+}
+
 function corsOptions(req, callback) {
   const origin = req.header('Origin');
   const allowedOrigins = getAllowedOrigins();
+  const isProduction = process.env.NODE_ENV === 'production';
 
-  if (!origin || allowedOrigins.includes(origin) || isAllowedRenderOrigin(origin)) {
+  if (
+    !origin
+    || allowedOrigins.includes(origin)
+    || isAllowedRenderOrigin(origin)
+    || (!isProduction && isLocalhostOrigin(origin))
+  ) {
     return callback(null, {
       origin: true,
       methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],

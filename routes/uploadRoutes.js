@@ -1,15 +1,14 @@
 const router = require('express').Router();
 const fs = require('fs/promises');
-const mongoose = require('mongoose');
 const upload = require('../middleware/uploadMiddleware');
 const { protect } = require('../middleware/authMiddleware');
 const { adminOnly } = require('../middleware/adminMiddleware');
-const { isCloudinaryConfigured, uploadImage } = require('../services/cloudinaryUpload');
-const { getPublicApiUrl } = require('../utils/imageUtils');
+const { isR2Configured, uploadImageToR2 } = require('../services/r2Upload');
+const { isCloudinaryConfigured, uploadImage: uploadImageToCloudinary } = require('../services/cloudinaryUpload');
+const { buildUploadFileResponse, isLocalRequest } = require('../utils/imageUtils');
 
 function canBypassUploadAuth(req) {
-  const host = String(req.get('host') || req.hostname || '').toLowerCase();
-  return process.env.NODE_ENV !== 'production' || host.includes('localhost') || host.includes('127.0.0.1');
+  return isLocalRequest(req);
 }
 
 function protectUpload(req, res, next) {
@@ -22,24 +21,34 @@ function adminOnlyUpload(req, res, next) {
   return adminOnly(req, res, next);
 }
 
-router.post('/', protectUpload, adminOnlyUpload, upload.array('images', 8), async (req, res, next) => {
-  try {
-    if (isCloudinaryConfigured()) {
-      const files = await Promise.all((req.files || []).map(uploadImage));
-      await cleanupTempFiles(req.files);
-      return res.status(201).json({ files });
-    }
+router.post('/', protectUpload, adminOnlyUpload, (req, res, next) => {
+  upload.array('images', 8)(req, res, async (error) => {
+    if (error) return next(error);
 
-    const baseUrl = getPublicApiUrl(req);
-    const files = (req.files || []).map((file) => ({
-      url: `${baseUrl}/uploads/${file.filename}`,
-      publicId: file.filename,
-      originalName: file.originalname,
-    }));
-    return res.status(201).json({ files });
-  } catch (error) {
-    return next(error);
-  }
+    try {
+      if (!req.files?.length) {
+        return res.status(400).json({ message: 'No images were uploaded. Please select at least one image file.' });
+      }
+
+      if (isR2Configured()) {
+        const files = await Promise.all(req.files.map((file) => uploadImageToR2(file)));
+        await cleanupTempFiles(req.files);
+        return res.status(201).json({ files });
+      }
+
+      if (isCloudinaryConfigured()) {
+        const files = await Promise.all(req.files.map((file) => uploadImageToCloudinary(file)));
+        await cleanupTempFiles(req.files);
+        return res.status(201).json({ files });
+      }
+
+      const files = req.files.map((file) => buildUploadFileResponse(file, req));
+      return res.status(201).json({ files });
+    } catch (uploadError) {
+      await cleanupTempFiles(req.files);
+      return next(uploadError);
+    }
+  });
 });
 
 async function cleanupTempFiles(files = []) {

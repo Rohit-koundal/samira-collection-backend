@@ -2,7 +2,11 @@ const Product = require('../models/Product');
 const Category = require('../models/Category');
 const slugify = require('../utils/slugify');
 const mongoose = require('mongoose');
+<<<<<<< HEAD
 const { normalizeProductImages, normalizeProductPayload } = require('../utils/imageUtils');
+=======
+const { normalizeProductImages, sanitizeProductImages } = require('../utils/imageUtils');
+>>>>>>> 4509b61740897cfdd0411da4b7e6430f7ce333fd
 
 exports.getProducts = async (req, res) => {
   const query = req.query.admin === 'true' ? {} : { isActive: true };
@@ -73,17 +77,29 @@ exports.getProductById = async (req, res) => {
 };
 
 exports.createProduct = async (req, res) => {
-  const error = validateProduct(req.body);
+  const payload = { ...req.body, images: sanitizeProductImages(req.body.images) };
+  const error = validateProduct(payload);
   if (error) return res.status(400).json({ message: error });
+<<<<<<< HEAD
   const product = await Product.create(normalizeProductPayload({ ...req.body, slug: req.body.slug || slugify(req.body.name) }));
   res.status(201).json(product);
+=======
+  const product = await Product.create({ ...payload, slug: payload.slug || slugify(payload.name) });
+  res.status(201).json(normalizeProductImages(product, req));
+>>>>>>> 4509b61740897cfdd0411da4b7e6430f7ce333fd
 };
 
 exports.updateProduct = async (req, res) => {
-  const error = validateProduct(req.body, false);
+  const payload = { ...req.body, images: sanitizeProductImages(req.body.images) };
+  const error = validateProduct(payload, false);
   if (error) return res.status(400).json({ message: error });
+<<<<<<< HEAD
   const product = await Product.findByIdAndUpdate(req.params.id, normalizeProductPayload(req.body), { new: true, runValidators: true });
   res.json(product);
+=======
+  const product = await Product.findByIdAndUpdate(req.params.id, payload, { new: true, runValidators: true });
+  res.json(normalizeProductImages(product, req));
+>>>>>>> 4509b61740897cfdd0411da4b7e6430f7ce333fd
 };
 
 exports.deleteProduct = async (req, res) => {
@@ -112,5 +128,15 @@ function validateProduct(data, creating = true) {
   if (Number(data.stock) < 0) return 'Stock cannot be negative';
   if (creating && (!Array.isArray(data.images) || !data.images.length)) return 'At least one product image is required';
   if (Array.isArray(data.images) && data.images.some((image) => image.url?.startsWith('data:'))) return 'Images must be uploaded files or valid URLs, not base64 data';
+  if (Array.isArray(data.images) && data.images.some((image) => image?.url && !image.url.startsWith('http') && !image.url.startsWith('/uploads/'))) {
+    return 'Each image must be a valid uploaded URL';
+  }
+  if (process.env.NODE_ENV === 'production' && Array.isArray(data.images) && data.images.some((image) => isInaccessibleImageUrl(image?.url))) {
+    return 'Image URLs must be publicly accessible. Please re-upload images before saving.';
+  }
   return '';
+}
+
+function isInaccessibleImageUrl(url = '') {
+  return /https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?\//i.test(String(url));
 }

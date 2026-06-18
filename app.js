@@ -7,6 +7,8 @@ const devFallback = require('./middleware/devFallbackMiddleware');
 const { protect } = require('./middleware/authMiddleware');
 const { adminOnly } = require('./middleware/adminMiddleware');
 const { corsOptions, getAllowedOrigins } = require('./config/corsOptions');
+const { isR2Configured } = require('./services/r2Upload');
+const { isCloudinaryConfigured } = require('./services/cloudinaryUpload');
 
 const app = express();
 
@@ -25,6 +27,7 @@ app.get('/health', (req, res) => {
     status: 'ok',
     database: dbStates[mongoose.connection.readyState] || 'unknown',
     environment: process.env.NODE_ENV || 'development',
+    imageStorage: isR2Configured() ? 'r2' : isCloudinaryConfigured() ? 'cloudinary' : 'local',
     allowedOrigins: getAllowedOrigins(),
   });
 });
