@@ -17,10 +17,15 @@ exports.createCategory = async (req, res) => {
   res.status(201).json(await Category.create({ ...req.body, name: req.body.name.trim(), slug }));
 };
 exports.updateCategory = async (req, res) => {
+  const existingCategory = await Category.findById(req.params.id);
+  if (!existingCategory) return res.status(404).json({ message: 'Category not found' });
   if (req.body.image?.startsWith('data:')) return res.status(400).json({ message: 'Category image must be an uploaded file URL' });
   const payload = { ...req.body };
   if (payload.name) payload.name = payload.name.trim();
   if (payload.slug) payload.slug = payload.slug.trim() || slugify(payload.name);
+  if (payload.image === undefined || payload.image === '') {
+    payload.image = existingCategory.image || '';
+  }
   res.json(await Category.findByIdAndUpdate(req.params.id, payload, { new: true, runValidators: true }));
 };
 exports.deleteCategory = async (req, res) => { await Category.findByIdAndDelete(req.params.id); res.json({ message: 'Category deleted' }); };

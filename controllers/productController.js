@@ -76,15 +76,22 @@ exports.createProduct = async (req, res) => {
   const payload = { ...req.body, images: sanitizeProductImages(req.body.images) };
   const error = validateProduct(payload);
   if (error) return res.status(400).json({ message: error });
-  const product = await Product.create(normalizeProductPayload({ ...req.body, slug: req.body.slug || slugify(req.body.name) }));
+  const product = await Product.create(normalizeProductPayload({ ...payload, slug: payload.slug || slugify(payload.name) }));
   res.status(201).json(normalizeProductImages(product, req));
 };
 
 exports.updateProduct = async (req, res) => {
+  const existingProduct = await Product.findById(req.params.id);
+  if (!existingProduct) return res.status(404).json({ message: 'Product not found' });
   const payload = { ...req.body, images: sanitizeProductImages(req.body.images) };
   const error = validateProduct(payload, false);
   if (error) return res.status(400).json({ message: error });
-  const product = await Product.findByIdAndUpdate(req.params.id, normalizeProductPayload(req.body), { new: true, runValidators: true });
+  const nextImages = Array.isArray(payload.images) && payload.images.length ? payload.images : existingProduct.images || [];
+  const product = await Product.findByIdAndUpdate(
+    req.params.id,
+    normalizeProductPayload({ ...payload, images: nextImages }),
+    { new: true, runValidators: true },
+  );
   res.json(normalizeProductImages(product, req));
 };
 
