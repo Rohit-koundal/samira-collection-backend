@@ -8,6 +8,7 @@ const { adminOnly } = require('../middleware/adminMiddleware');
 router.post('/login', auth.login);
 router.get('/profile', protect, adminOnly, auth.profile);
 router.get('/dashboard/stats', protect, adminOnly, dashboard.stats);
+router.get('/dashboard/overview', protect, adminOnly, dashboard.overview);
 router.get('/dashboard/recent-orders', protect, adminOnly, dashboard.recentOrders);
 router.get('/dashboard/low-stock', protect, adminOnly, dashboard.lowStock);
 router.get('/reports/sales', protect, adminOnly, dashboard.salesReport);

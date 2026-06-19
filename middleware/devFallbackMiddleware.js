@@ -61,7 +61,56 @@ const settings = {
   returnPolicy: 'Return/exchange as per store policy.',
 };
 
-const banners = [];
+const banners = [
+  {
+    _id: 'banner-summer-sale',
+    id: 'banner-summer-sale',
+    title: 'Summer Sale 50% Off',
+    subtitle: 'Big summer sale is live now!',
+    image: '',
+    buttonText: 'Shop Now',
+    link: '/collections/sale',
+    type: 'Hero',
+    position: 'Home - Top',
+    isActive: true,
+    displayOrder: 1,
+    views: 2450,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  },
+  {
+    _id: 'banner-new-arrivals',
+    id: 'banner-new-arrivals',
+    title: 'New Arrivals',
+    subtitle: 'Check out our latest collection',
+    image: '',
+    buttonText: 'Explore',
+    link: '/collection/new-arrivals',
+    type: 'Category',
+    position: 'Home - Middle',
+    isActive: true,
+    displayOrder: 2,
+    views: 1980,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  },
+  {
+    _id: 'banner-extra-off',
+    id: 'banner-extra-off',
+    title: 'Extra 20% Off',
+    subtitle: 'On all prepaid orders',
+    image: '',
+    buttonText: 'View Offers',
+    link: '/offers/prepaid',
+    type: 'Offer',
+    position: 'Cart - Bottom',
+    isActive: false,
+    displayOrder: 3,
+    views: 850,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  },
+];
 const customers = [];
 const orders = [];
 const returns = [];
@@ -99,6 +148,7 @@ function devFallback(req, res, next) {
   if (method === 'GET' && path === '/admin/dashboard/stats') {
     return res.json({ products: products.length, orders: orders.length, customers: customers.length, coupons: coupons.length, returns: returns.length, revenue: orders.reduce((sum, order) => sum + Number(order.finalAmount || 0), 0) });
   }
+  if (method === 'GET' && path === '/admin/dashboard/overview') return res.json(buildDashboardOverview());
   if (method === 'GET' && path === '/admin/dashboard/recent-orders') return res.json(orders.slice(0, 8));
   if (method === 'GET' && path === '/admin/dashboard/low-stock') return res.json(products.filter((item) => item.stock <= 10).slice(0, 5));
   if (method === 'GET' && path === '/admin/reports/sales') return res.json({ labels: [], revenue: [], orders: [], totalRevenue: 0, totalOrders: orders.length });
@@ -112,6 +162,10 @@ function devFallback(req, res, next) {
   if (method === 'GET' && path === '/admin/coupons') return res.json(coupons);
   if (path.startsWith('/admin/coupons')) return handleCoupons(req, res);
   if (method === 'GET' && path === '/admin/banners') return res.json(banners);
+  if (method === 'GET' && path.startsWith('/admin/banners/')) {
+    const banner = findItem(banners, routeId(req.path, '/admin/banners'));
+    return banner ? res.json(banner) : res.status(404).json({ message: 'Banner not found' });
+  }
   if (path.startsWith('/admin/banners')) return handleBanners(req, res);
   if (path.startsWith('/admin/orders')) return handleOrders(req, res, true);
   if (path.startsWith('/admin/reviews')) return handleReviews(req, res);
@@ -444,6 +498,106 @@ function buildReceipt(order) {
     finalAmount: order.finalAmount,
     storeDetails: settings,
   };
+}
+
+function buildDashboardOverview() {
+  const now = new Date();
+  const currentMonthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+  const previousMonthStart = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+  const sixMonthsAgo = new Date(now.getFullYear(), now.getMonth() - 5, 1);
+  const orderStatuses = ['Pending', 'Confirmed', 'Packed', 'Shipped', 'Out for Delivery', 'Delivered', 'Cancelled', 'Return Requested', 'Exchange Requested', 'Returned', 'Refunded'];
+
+  const currentMonthOrders = orders.filter((order) => new Date(order.createdAt) >= currentMonthStart).length;
+  const previousMonthOrders = orders.filter((order) => {
+    const createdAt = new Date(order.createdAt);
+    return createdAt >= previousMonthStart && createdAt < currentMonthStart;
+  }).length;
+
+  const currentMonthRevenue = monthlyRevenue(orders, currentMonthStart);
+  const previousMonthRevenue = monthlyRevenue(orders, previousMonthStart, currentMonthStart);
+  const lifetimeRevenue = orders.reduce((sum, order) => sum + Number(order.finalAmount || 0), 0);
+  const currentMonthCustomers = customers.filter((customer) => new Date(customer.createdAt || now) >= currentMonthStart).length;
+  const previousMonthCustomers = customers.filter((customer) => {
+    const createdAt = new Date(customer.createdAt || now);
+    return createdAt >= previousMonthStart && createdAt < currentMonthStart;
+  }).length;
+  const currentMonthProducts = products.filter((product) => new Date(product.createdAt || now) >= currentMonthStart).length;
+  const previousMonthProducts = products.filter((product) => {
+    const createdAt = new Date(product.createdAt || now);
+    return createdAt >= previousMonthStart && createdAt < currentMonthStart;
+  }).length;
+
+  const revenueSeries = [];
+  for (let index = 0; index < 6; index += 1) {
+    const monthDate = new Date(sixMonthsAgo.getFullYear(), sixMonthsAgo.getMonth() + index, 1);
+    const nextMonth = new Date(monthDate.getFullYear(), monthDate.getMonth() + 1, 1);
+    revenueSeries.push({
+      label: monthDate.toLocaleDateString('en-US', { month: 'short' }),
+      value: monthlyRevenue(orders, monthDate, nextMonth),
+    });
+  }
+
+  const statusMap = new Map(orderStatuses.map((status) => [status, 0]));
+  orders.forEach((order) => {
+    const key = orderStatuses.includes(order.orderStatus) ? order.orderStatus : 'Pending';
+    statusMap.set(key, (statusMap.get(key) || 0) + 1);
+  });
+
+  const topProductsMap = new Map();
+  orders.forEach((order) => {
+    (order.orderItems || []).forEach((item) => {
+      const key = item.product || item.name;
+      const existing = topProductsMap.get(key) || {
+        id: String(key),
+        name: item.name || 'Product',
+        image: item.image || '',
+        sold: 0,
+        revenue: 0,
+        price: Number(item.price || 0),
+        originalPrice: Number(item.originalPrice || 0),
+      };
+      existing.sold += Number(item.quantity || 1);
+      existing.revenue += Number(item.price || 0) * Number(item.quantity || 1);
+      if (!existing.image && item.image) existing.image = item.image;
+      topProductsMap.set(key, existing);
+    });
+  });
+
+  return {
+    stats: {
+      sales: metricSummaryWithValue(currentMonthRevenue, currentMonthRevenue, previousMonthRevenue, 'vs last month'),
+      orders: metricSummaryWithValue(orders.length, currentMonthOrders, previousMonthOrders, 'vs last month'),
+      customers: metricSummaryWithValue(customers.length, currentMonthCustomers, previousMonthCustomers, 'vs last month'),
+      products: metricSummaryWithValue(products.length, currentMonthProducts, previousMonthProducts, 'vs last month'),
+      revenue: metricSummaryWithValue(lifetimeRevenue, currentMonthRevenue, previousMonthRevenue, 'vs last month'),
+      coupons: coupons.length,
+      totalOrders: orders.length,
+    },
+    salesOverview: revenueSeries,
+    orderOverview: orderStatuses
+      .map((status) => ({ label: status, value: statusMap.get(status) || 0 }))
+      .filter((item) => item.value > 0),
+    recentOrders: orders.slice(0, 5).map((order) => ({
+      ...order,
+      itemsCount: Array.isArray(order.orderItems) ? order.orderItems.reduce((sum, item) => sum + Number(item.quantity || 1), 0) : 0,
+    })),
+    topProducts: Array.from(topProductsMap.values()).sort((a, b) => b.sold - a.sold).slice(0, 5),
+  };
+}
+
+function monthlyRevenue(sourceOrders, start, end = null) {
+  return sourceOrders.reduce((sum, order) => {
+    const createdAt = new Date(order.createdAt);
+    if (createdAt < start) return sum;
+    if (end && createdAt >= end) return sum;
+    if (String(order.paymentStatus) !== 'Paid') return sum;
+    return sum + Number(order.finalAmount || 0);
+  }, 0);
+}
+
+function metricSummaryWithValue(value, current, previous, note) {
+  const delta = previous > 0 ? Math.round((((current - previous) / previous) * 100) * 10) / 10 : (current > 0 ? 100 : 0);
+  return { value, delta, note };
 }
 
 function pushAddress(body) {
