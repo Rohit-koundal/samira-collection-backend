@@ -3,6 +3,8 @@ const Product = require('../models/Product');
 const Settings = require('../models/Settings');
 const Coupon = require('../models/Coupon');
 const { getPrimaryImageUrl } = require('../utils/imageUtils');
+const { incrementCouponUsage } = require('../utils/couponUtils');
+const { syncPaidOnlineOrderStatus } = require('../utils/orderStatusUtils');
 
 exports.createOrder = async (req, res) => {
   try {
@@ -21,6 +23,7 @@ exports.createOrder = async (req, res) => {
       statusTimeline: [{ status: 'Pending', date: new Date(), note: 'Order placed' }],
     });
     await reduceStock(items);
+    await incrementCouponUsage(totals.coupon?.code);
     res.status(201).json(order);
   } catch (error) {
     res.status(400).json({ message: error.message });
@@ -31,13 +34,18 @@ exports.createCodOrder = async (req, res) => {
   req.body.paymentProvider = 'COD';
   return exports.createOrder(req, res);
 };
-exports.myOrders = async (req, res) => res.json(await Order.find({ user: req.user._id }).sort('-createdAt'));
+exports.myOrders = async (req, res) => {
+  const orders = await Order.find({ user: req.user._id }).sort('-createdAt');
+  await Promise.all(orders.map((order) => syncPaidOnlineOrderStatus(order)));
+  res.json(orders);
+};
 exports.getOrder = async (req, res) => {
   const order = await Order.findById(req.params.id).populate('user', 'name email phone');
   if (!order) return res.status(404).json({ message: 'Order not found' });
   if (req.user.role !== 'admin' && String(order.user._id || order.user) !== String(req.user._id)) {
     return res.status(403).json({ message: 'Not allowed to view this order' });
   }
+  await syncPaidOnlineOrderStatus(order);
   res.json(order);
 };
 exports.adminOrders = async (req, res) => res.json(await Order.find().populate('user', 'name email phone').sort('-createdAt'));
@@ -66,10 +74,11 @@ exports.cancelOrder = async (req, res) => {
   res.json(order);
 };
 exports.receipt = async (req, res) => {
-  const order = await Order.findById(req.params.id).populate('user', 'name email phone').lean();
+  let order = await Order.findById(req.params.id).populate('user', 'name email phone');
   if (!order) return res.status(404).json({ message: 'Order not found' });
   if (req.user.role !== 'admin' && String(order.user._id || order.user) !== String(req.user._id)) return res.status(403).json({ message: 'Not allowed to view this receipt' });
-  res.json(await buildReceipt(order));
+  await syncPaidOnlineOrderStatus(order);
+  res.json(await buildReceipt(order.toObject ? order.toObject() : order));
 };
 
 async function prepareOrder(orderItems = [], couponCode) {
