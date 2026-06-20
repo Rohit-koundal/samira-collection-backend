@@ -1,6 +1,12 @@
 const defaultOrigins = [
   'http://localhost:3000',
   'http://127.0.0.1:3000',
+  'http://localhost:3001',
+  'http://127.0.0.1:3001',
+  'http://localhost:3002',
+  'http://127.0.0.1:3002',
+  'http://localhost:3003',
+  'http://127.0.0.1:3003',
   'http://localhost:5173',
   'http://127.0.0.1:5173',
   'https://samira-collection.onrender.com',
@@ -35,16 +41,20 @@ function isLocalhostOrigin(origin) {
   }
 }
 
+function isRunningOnRender() {
+  return Boolean(process.env.RENDER);
+}
+
 function corsOptions(req, callback) {
   const origin = req.header('Origin');
   const allowedOrigins = getAllowedOrigins();
-  const isProduction = process.env.NODE_ENV === 'production';
+  const allowLocalhost = !isRunningOnRender() && isLocalhostOrigin(origin);
 
   if (
     !origin
     || allowedOrigins.includes(origin)
     || isAllowedRenderOrigin(origin)
-    || (!isProduction && isLocalhostOrigin(origin))
+    || allowLocalhost
   ) {
     return callback(null, {
       origin: true,
