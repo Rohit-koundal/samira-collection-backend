@@ -5,7 +5,7 @@ const { DeleteObjectCommand, S3Client, PutObjectCommand } = require('@aws-sdk/cl
 
 let r2Client;
 
-const allowedFolders = new Set(['products', 'categories', 'banners']);
+const allowedFolders = new Set(['products', 'categories', 'banners', 'product-videos']);
 
 function isR2Configured() {
   return Boolean(
@@ -46,7 +46,7 @@ function resolveUploadFolder(folder = '') {
   return getR2Folder();
 }
 
-function buildObjectKey(file, { folder = 'products' } = {}) {
+function buildObjectKey(file, { folder = 'products', extension = 'webp' } = {}) {
   const safeFolder = resolveUploadFolder(folder);
   const safeBaseName = String(file.originalname || 'image')
     .replace(/\.[^.]+$/, '')
@@ -54,11 +54,12 @@ function buildObjectKey(file, { folder = 'products' } = {}) {
     .replace(/^-+|-+$/g, '')
     .toLowerCase() || 'image';
   const suffix = crypto.randomBytes(5).toString('hex');
-  return `${safeFolder}/${Date.now()}-${suffix}-${safeBaseName}.webp`;
+  const safeExtension = String(extension || 'webp').replace(/[^a-z0-9]/gi, '').toLowerCase() || 'webp';
+  return `${safeFolder}/${Date.now()}-${suffix}-${safeBaseName}.${safeExtension}`;
 }
 
 async function uploadImageToR2(file, options = {}) {
-  const objectKey = buildObjectKey(file, options);
+  const objectKey = buildObjectKey(file, { ...options, extension: 'webp' });
   const buffer = await fs.readFile(file.path);
 
   await getR2Client().send(new PutObjectCommand({
@@ -66,6 +67,26 @@ async function uploadImageToR2(file, options = {}) {
     Key: objectKey,
     Body: buffer,
     ContentType: file.mimetype || 'image/webp',
+    CacheControl: 'public, max-age=31536000, immutable',
+  }));
+
+  return {
+    url: buildPublicUrl(objectKey),
+    publicId: objectKey,
+    originalName: file.originalname,
+  };
+}
+
+async function uploadFileToR2(file, options = {}) {
+  const extension = resolveFileExtension(file);
+  const objectKey = buildObjectKey(file, { ...options, extension });
+  const buffer = await fs.readFile(file.path);
+
+  await getR2Client().send(new PutObjectCommand({
+    Bucket: process.env.R2_BUCKET_NAME,
+    Key: objectKey,
+    Body: buffer,
+    ContentType: file.mimetype || 'application/octet-stream',
     CacheControl: 'public, max-age=31536000, immutable',
   }));
 
@@ -110,9 +131,20 @@ function resolveObjectKey(identifier) {
   }
 }
 
+function resolveFileExtension(file = {}) {
+  const mime = String(file.mimetype || '').toLowerCase();
+  if (mime.includes('webm')) return 'webm';
+  if (mime.includes('quicktime') || mime.includes('mov')) return 'mov';
+  if (mime.includes('mp4')) return 'mp4';
+  const original = String(file.originalname || '').split('.').pop().toLowerCase();
+  if (['mp4', 'webm', 'mov'].includes(original)) return original;
+  return 'mp4';
+}
+
 module.exports = {
   isR2Configured,
   uploadImageToR2,
+  uploadFileToR2,
   deleteImageFromR2,
   resolveObjectKey,
   resolveUploadFolder,

@@ -266,7 +266,14 @@ exports.refresh = async (req, res) => {
 };
 
 exports.switchMode = async (req, res) => {
-  const mode = req.body.mode;
+  let mode = String(req.body.mode || req.body.activeMode || req.query.mode || '').trim();
+  if (!['customer', 'admin'].includes(mode)) {
+    if (req.user.role === 'admin' && req.user.availableModes?.includes('admin') && req.user.activeMode !== 'admin') {
+      mode = 'admin';
+    } else if (req.user.role === 'admin' && req.user.availableModes?.includes('customer') && req.user.activeMode === 'admin') {
+      mode = 'customer';
+    }
+  }
   if (!['customer', 'admin'].includes(mode)) return res.status(400).json({ message: 'Invalid mode' });
   if (mode === 'admin' && (req.user.role !== 'admin' || !req.user.availableModes?.includes('admin'))) {
     return res.status(403).json({ message: 'Admin mode is not allowed' });

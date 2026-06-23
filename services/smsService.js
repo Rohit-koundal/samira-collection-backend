@@ -4,6 +4,7 @@ const fast2smsProvider = require('./providers/fast2smsProvider');
 const twilioSmsProvider = require('./providers/twilioSmsProvider');
 
 function getProvider() {
+  if (process.env.NODE_ENV !== 'production') return 'mock';
   if ((process.env.OTP_PROVIDER || 'mock') === 'mock') return 'mock';
   return String(process.env.SMS_PROVIDER || 'mock').toLowerCase();
 }
