@@ -62,6 +62,12 @@ app.use('/api/user/addresses', require('./routes/addressRoutes'));
 app.use('/api/wishlist', require('./routes/wishlistRoutes'));
 app.use('/api/orders', require('./routes/orderRoutes'));
 app.use('/api/payments', require('./routes/paymentRoutes'));
+
+const paymentController = require('./controllers/paymentController');
+const { wrapPaymentHandler } = require('./utils/paymentRouteHandler');
+app.post('/api/create-order', protect, wrapPaymentHandler(paymentController.createPaymentOrder));
+app.post('/api/verify-payment', protect, wrapPaymentHandler(paymentController.verifyPayment));
+
 app.use('/api/coupons', require('./routes/couponRoutes'));
 app.use('/api/banners', require('./routes/bannerRoutes'));
 app.use('/api/reviews', require('./routes/reviewRoutes'));

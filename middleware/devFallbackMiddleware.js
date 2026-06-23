@@ -431,10 +431,43 @@ function handleOrders(req, res, admin = false) {
 function handlePayments(req, res) {
   if (req.method === 'POST' && req.path === '/payments/create-order') {
     const amount = Number(req.body.amount || req.body.total || req.body.finalAmount || 0);
-    return res.json({ razorpayOrderId: `rzp_dev_${Date.now()}`, amount: Math.round(amount * 100), currency: 'INR', keyId: process.env.RAZORPAY_KEY_ID || 'rzp_test_dev', mode: 'test' });
+    const razorpayOrderId = `rzp_dev_${Date.now()}`;
+    const pendingOrder = createOrder({
+      ...req.body,
+      paymentMethod: req.body.paymentMethod || 'UPI',
+      paymentProvider: 'Razorpay',
+      paymentStatus: 'Pending',
+      orderStatus: 'Pending',
+      razorpayOrderId,
+      statusTimeline: [{ status: 'Pending', date: new Date().toISOString(), note: 'Awaiting Razorpay payment (dev)' }],
+    });
+    return res.json({
+      orderId: pendingOrder._id,
+      razorpayOrderId,
+      amount: Math.round(amount * 100),
+      currency: 'INR',
+      keyId: process.env.RAZORPAY_KEY_ID || 'rzp_test_dev',
+      mode: 'test',
+    });
   }
   if (req.method === 'POST' && req.path === '/payments/verify') return res.json({ success: true, order: createOrder(req.body.orderPayload || req.body) });
-  if (req.method === 'POST' && req.path === '/payments/failure') return res.status(202).json({ success: false, message: req.body.reason || 'Payment failed. Please retry or choose COD.' });
+  if (req.method === 'POST' && req.path === '/payments/failure') {
+    const reason = req.body.reason || 'Payment failed. Please retry or choose COD.';
+    const order = createOrder({
+      ...(req.body.orderPayload || req.body),
+      paymentMethod: req.body.orderPayload?.paymentMethod || 'UPI',
+      paymentProvider: 'Razorpay',
+      paymentStatus: 'Failed',
+      orderStatus: 'Cancelled',
+      paymentFailureReason: reason,
+      razorpayOrderId: req.body.razorpayOrderId || req.body.razorpay_order_id,
+      statusTimeline: [
+        { status: 'Pending', date: new Date().toISOString(), note: 'Checkout started (dev)' },
+        { status: 'Cancelled', date: new Date().toISOString(), note: reason },
+      ],
+    });
+    return res.status(202).json({ success: false, message: reason, order });
+  }
   return res.status(405).json({ message: 'Method not allowed' });
 }
 

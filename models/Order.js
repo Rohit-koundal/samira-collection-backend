@@ -32,4 +32,7 @@ const orderSchema = new mongoose.Schema({
   adminNotes: String,
 }, { timestamps: true });
 
+orderSchema.index({ razorpayOrderId: 1 }, { sparse: true });
+orderSchema.index({ user: 1, paymentStatus: 1, createdAt: -1 });
+
 module.exports = mongoose.model('Order', orderSchema);
