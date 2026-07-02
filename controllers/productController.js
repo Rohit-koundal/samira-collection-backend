@@ -6,7 +6,9 @@ const { normalizeProductImages, normalizeProductPayload, sanitizeProductImages }
 const { deleteImageFromR2, isR2Configured } = require('../services/r2Upload');
 
 exports.getProducts = async (req, res) => {
-  const query = req.query.admin === 'true' ? {} : { isActive: true };
+  const isAdminRequest = req.query.admin === 'true'
+    || String(req.baseUrl || '').startsWith('/api/admin/products');
+  const query = isAdminRequest ? {} : { isActive: true };
   if (req.query.search) query.$or = [
     { name: { $regex: req.query.search, $options: 'i' } },
     { sku: { $regex: req.query.search, $options: 'i' } },
@@ -99,8 +101,8 @@ exports.updateProduct = async (req, res) => {
 
 exports.deleteProduct = async (req, res) => {
   const product = await Product.findById(req.params.id);
-  if (product?.images?.length) {
-    await Promise.all(product.images.map((image) => safeDeleteImage(image)));
+  if (product) {
+    await cleanupProductAssets(product);
   }
   await Product.findByIdAndDelete(req.params.id);
   res.json({ message: 'Product deleted' });
@@ -114,6 +116,16 @@ exports.updateStatus = async (req, res) => {
 exports.updateStock = async (req, res) => {
   if (Number(req.body.stock) < 0) return res.status(400).json({ message: 'Stock cannot be negative' });
   const product = await Product.findByIdAndUpdate(req.params.id, { stock: req.body.stock }, { new: true });
+  res.json(product);
+};
+
+exports.markOutOfStock = async (req, res) => {
+  const product = await Product.findByIdAndUpdate(req.params.id, { stock: 0 }, { new: true });
+  res.json(product);
+};
+
+exports.hideProduct = async (req, res) => {
+  const product = await Product.findByIdAndUpdate(req.params.id, { isActive: false }, { new: true });
   res.json(product);
 };
 
@@ -155,4 +167,18 @@ async function safeDeleteImage(image) {
   } catch {
     // Ignore storage cleanup failures so product save/delete doesn't break.
   }
+}
+
+async function cleanupProductAssets(product) {
+  const deletions = [];
+  if (Array.isArray(product.images)) {
+    deletions.push(...product.images.map((image) => safeDeleteImage(image)));
+  }
+  if (Array.isArray(product.videos)) {
+    for (const video of product.videos) {
+      deletions.push(safeDeleteImage(video));
+      if (video?.thumbnail) deletions.push(safeDeleteImage(video.thumbnail));
+    }
+  }
+  await Promise.all(deletions);
 }

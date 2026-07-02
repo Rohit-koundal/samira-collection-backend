@@ -6,6 +6,10 @@ function isCloudinaryConfigured() {
 }
 
 async function uploadImage(file) {
+  return uploadFile(file, 'image');
+}
+
+async function uploadFile(file, resourceType = 'image') {
   if (!isCloudinaryConfigured()) return null;
 
   const cloudName = process.env.CLOUDINARY_CLOUD_NAME;
@@ -26,7 +30,7 @@ async function uploadImage(file) {
   form.append('folder', folder);
   form.append('signature', signature);
 
-  const response = await fetch(`https://api.cloudinary.com/v1_1/${cloudName}/image/upload`, {
+  const response = await fetch(`https://api.cloudinary.com/v1_1/${cloudName}/${resourceType}/upload`, {
     method: 'POST',
     body: form,
   });
@@ -40,4 +44,8 @@ async function uploadImage(file) {
   };
 }
 
-module.exports = { isCloudinaryConfigured, uploadImage };
+async function uploadVideo(file) {
+  return uploadFile(file, 'video');
+}
+
+module.exports = { isCloudinaryConfigured, uploadImage, uploadVideo };

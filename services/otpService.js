@@ -14,7 +14,10 @@ function getExpiryMinutes() {
 }
 
 function generateOtp() {
-  if ((process.env.OTP_PROVIDER || 'mock') === 'mock') return process.env.OTP_DEV_CODE || '123456';
+  const provider = String(process.env.OTP_PROVIDER || 'mock').toLowerCase();
+  const devOtp = String(process.env.OTP_DEV_CODE || '123456').trim() || '123456';
+  if (process.env.NODE_ENV !== 'production' && (provider === 'mock' || provider === 'sms' || provider === 'twilio')) return devOtp;
+  if (provider === 'mock') return devOtp;
   return String(crypto.randomInt(100000, 1000000));
 }
 

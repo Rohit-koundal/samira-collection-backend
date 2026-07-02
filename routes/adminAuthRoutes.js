@@ -11,6 +11,7 @@ router.get('/dashboard/stats', protect, adminOnly, dashboard.stats);
 router.get('/dashboard/overview', protect, adminOnly, dashboard.overview);
 router.get('/dashboard/recent-orders', protect, adminOnly, dashboard.recentOrders);
 router.get('/dashboard/low-stock', protect, adminOnly, dashboard.lowStock);
+router.get('/inventory/low-stock', protect, adminOnly, dashboard.lowStock);
 router.get('/reports/sales', protect, adminOnly, dashboard.salesReport);
 router.get('/reports/products', protect, adminOnly, dashboard.productReport);
 router.get('/customers', protect, adminOnly, async (req, res) => {
