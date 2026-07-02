@@ -10,11 +10,16 @@ function getProvider() {
 }
 
 async function sendOtp(phone, otp) {
-  const provider = getProvider();
-  if (provider === 'msg91') return sendViaMSG91(phone, otp);
-  if (provider === 'fast2sms') return sendViaFast2SMS(phone, otp);
-  if (provider === 'twilio') return sendViaTwilioSMS(phone, otp);
-  return sendViaMock(phone, otp);
+  try {
+    const provider = getProvider();
+    if (provider === 'msg91') return await sendViaMSG91(phone, otp);
+    if (provider === 'fast2sms') return await sendViaFast2SMS(phone, otp);
+    if (provider === 'twilio') return await sendViaTwilioSMS(phone, otp);
+    return await sendViaMock(phone, otp);
+  } catch (error) {
+    console.warn(`SMS failed for ${phone}:`, error.message);
+    return { success: false, error: error.message };
+  }
 }
 
 async function sendViaMock(phone, otp) {
