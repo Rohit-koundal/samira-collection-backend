@@ -61,7 +61,14 @@ exports.updateCartItem = async (req, res) => {
   await cart.save();
   res.json(cart);
 };
-exports.removeCartItem = async (req, res) => res.json(await Cart.findOneAndUpdate({ user: req.user._id }, { $pull: { items: { _id: req.params.itemId } } }, { new: true }));
+exports.removeCartItem = async (req, res) => {
+  const cart = await Cart.findOneAndUpdate(
+    { user: req.user._id },
+    { $pull: { items: { _id: req.params.itemId } } },
+    { new: true },
+  ).populate('items.product');
+  res.json(cart);
+};
 exports.clearCart = async (req, res) => { await Cart.findOneAndDelete({ user: req.user._id }); res.json({ message: 'Cart cleared' }); };
 
 function sameCartLine(item, productId, size, color, variantId) {
