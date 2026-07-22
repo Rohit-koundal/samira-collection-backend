@@ -3,41 +3,69 @@ services:
     name: samira-collection-backend
     runtime: node
     plan: free
-    buildCommand: npm install
+    buildCommand: npm ci --omit=dev
     startCommand: npm start
-    healthCheckPath: /health
+    healthCheckPath: /health/ready
     autoDeploy: true
     envVars:
+      - key: NODE_VERSION
+        value: 24.16.0
       - key: NODE_ENV
         value: production
       - key: REQUIRE_DATABASE
-        value: "false"
+        value: "true"
+      - key: REQUIRE_MEDIA_STORAGE
+        value: "true"
+      - key: TRUST_PROXY
+        value: "1"
       - key: MONGO_URI
         sync: false
       - key: JWT_SECRET
         generateValue: true
       - key: JWT_REFRESH_SECRET
         generateValue: true
+      - key: OTP_HASH_SECRET
+        generateValue: true
       - key: JWT_EXPIRES_IN
         value: 15m
       - key: JWT_REFRESH_EXPIRES_IN
         value: 30d
+      - key: JWT_ISSUER
+        value: samira-collection-api
+      - key: JWT_AUDIENCE
+        value: samira-collection-web
+      - key: BCRYPT_ROUNDS
+        value: "12"
+      - key: JSON_BODY_LIMIT
+        value: 1mb
+      - key: AUTH_COOKIE_SAME_SITE
+        value: lax
+      - key: AUTH_COOKIE_DOMAIN
+        sync: false
+      - key: ALLOW_REFRESH_TOKEN_BODY
+        value: "false"
+      - key: RETURN_REFRESH_TOKEN_IN_BODY
+        value: "false"
       - key: PUBLIC_API_URL
         value: https://samira-collection-backend-1.onrender.com
       - key: CLIENT_ORIGINS
         sync: false
       - key: FRONTEND_URL
         sync: false
-      - key: ADMIN_PHONE_NUMBERS
-        sync: false
-      - key: OTP_PROVIDER
-        value: sms
+      - key: ALLOW_DEV_OTP
+        value: "false"
+      - key: ALLOW_OFFLINE_AUTH
+        value: "false"
+      - key: ALLOW_DEV_DATA_FALLBACK
+        value: "false"
       - key: OTP_EXPIRY_MINUTES
         value: "5"
       - key: OTP_MAX_ATTEMPTS
         value: "5"
       - key: OTP_RESEND_COOLDOWN_SECONDS
         value: "60"
+      - key: OTP_MAX_RESENDS
+        value: "3"
       - key: SMS_PROVIDER
         value: twilio
       - key: SMS_ACCOUNT_SID
@@ -46,16 +74,30 @@ services:
         sync: false
       - key: SMS_SENDER_ID
         sync: false
-      - key: SMS_9999133567_ACCOUNT_SID
+      - key: EMAIL_OTP_PROVIDER
+        value: brevo
+      - key: BREVO_API_KEY
         sync: false
-      - key: SMS_9999133567_AUTH_TOKEN
+      - key: BREVO_SENDER_EMAIL
         sync: false
-      - key: SMS_9999133567_SENDER_ID
+      - key: BREVO_SENDER_NAME
+        value: Samira Collection
+      - key: REDIS_REST_URL
+        sync: false
+      - key: REDIS_REST_TOKEN
         sync: false
       - key: RAZORPAY_KEY_ID
         sync: false
       - key: RAZORPAY_KEY_SECRET
         sync: false
+      - key: RAZORPAY_WEBHOOK_SECRET
+        sync: false
+      - key: PAYMENTS_ENABLED
+        value: "true"
+      - key: INVENTORY_RESERVATION_MINUTES
+        value: "15"
+      - key: INVENTORY_CLEANUP_INTERVAL_MS
+        value: "60000"
       - key: R2_ACCOUNT_ID
         sync: false
       - key: R2_ACCESS_KEY_ID
@@ -76,3 +118,9 @@ services:
         sync: false
       - key: CLOUDINARY_FOLDER
         value: samira-products
+      - key: SUPPORT_NOTIFICATION_EMAIL
+        sync: false
+      - key: SHIPPING_PROVIDER
+        value: disabled
+      - key: INVOICE_PREFIX
+        value: SC

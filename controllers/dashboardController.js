@@ -160,8 +160,414 @@ exports.overview = async (req, res) => {
     })),
   });
 };
-exports.salesReport = async (req, res) => res.json({ months: [], revenue: [] });
-exports.productReport = async (req, res) => res.json({ bestSellers: [], lowStock: [] });
+exports.reportSummary = async (req, res) => {
+  const report = await buildReport(req.query);
+  return res.json(report);
+};
+
+exports.salesReport = async (req, res) => {
+  const report = await buildReport(req.query);
+  return res.json({
+    ...report,
+    months: report.timeSeries.map((entry) => entry.period),
+    revenue: report.timeSeries.map((entry) => entry.netRevenue),
+    orders: report.timeSeries.map((entry) => entry.orders),
+  });
+};
+
+exports.productReport = async (req, res) => {
+  const report = await buildReport(req.query);
+  return res.json({
+    bestSellers: report.topProducts,
+    topCategories: report.topCategories,
+    topVariants: report.topVariants,
+    lowStock: report.inventory.lowStock,
+    outOfStock: report.inventory.outOfStock,
+  });
+};
+
+exports.reportCsv = async (req, res) => {
+  const report = await buildReport(req.query);
+  const rows = [
+    ['period', 'gross_revenue', 'net_revenue', 'refunds', 'orders'],
+    ...report.timeSeries.map((entry) => [
+      entry.period, entry.grossRevenue, entry.netRevenue, entry.refunds, entry.orders,
+    ]),
+  ];
+  const csv = rows.map((row) => row.map(csvCell).join(',')).join('\r\n');
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="samira-report-${report.range.from.slice(0, 10)}-${report.range.to.slice(0, 10)}.csv"`);
+  return res.send(`\ufeff${csv}`);
+};
+
+async function buildReport(query = {}) {
+  const { from, to } = parseDateRange(query);
+  const dateMatch = { createdAt: { $gte: from, $lt: to } };
+  const completedPaymentStatuses = ['Paid', 'Refunded', 'Partially Refunded'];
+  const periodFormat = to.getTime() - from.getTime() <= 93 * 24 * 60 * 60 * 1000 ? '%Y-%m-%d' : '%Y-%m';
+  const orderFilter = { ...dateMatch, orderStatus: { $ne: 'Cancelled' } };
+
+  const [
+    financialRows,
+    timeSeries,
+    statusRows,
+    topProducts,
+    topCategories,
+    topVariants,
+    couponPerformance,
+    paymentMethods,
+    newCustomers,
+    repeatCustomers,
+    deliveredOrders,
+    returnCount,
+    inventoryProducts,
+  ] = await Promise.all([
+    Order.aggregate([
+      { $match: dateMatch },
+      { $set: { processedRefundAmount: processedRefundAmountExpression() } },
+      {
+        $group: {
+          _id: null,
+          grossRevenue: {
+            $sum: {
+              $cond: [
+                { $in: ['$paymentStatus', completedPaymentStatuses] },
+                { $ifNull: ['$totalMRP', '$finalAmount'] },
+                0,
+              ],
+            },
+          },
+          collectedRevenue: {
+            $sum: {
+              $cond: [
+                { $in: ['$paymentStatus', completedPaymentStatuses] },
+                { $ifNull: ['$finalAmount', 0] },
+                0,
+              ],
+            },
+          },
+          discounts: {
+            $sum: {
+              $cond: [
+                { $in: ['$paymentStatus', completedPaymentStatuses] },
+                {
+                  $add: [
+                    { $ifNull: ['$productDiscount', 0] },
+                    { $ifNull: ['$couponDiscount', 0] },
+                  ],
+                },
+                0,
+              ],
+            },
+          },
+          refunds: { $sum: '$processedRefundAmount' },
+          orderCount: { $sum: 1 },
+        },
+      },
+    ]),
+    Order.aggregate([
+      { $match: dateMatch },
+      { $set: { processedRefundAmount: processedRefundAmountExpression() } },
+      {
+        $group: {
+          _id: { $dateToString: { format: periodFormat, date: '$createdAt', timezone: 'UTC' } },
+          grossRevenue: {
+            $sum: {
+              $cond: [
+                { $in: ['$paymentStatus', completedPaymentStatuses] },
+                { $ifNull: ['$totalMRP', '$finalAmount'] },
+                0,
+              ],
+            },
+          },
+          collectedRevenue: {
+            $sum: {
+              $cond: [
+                { $in: ['$paymentStatus', completedPaymentStatuses] },
+                { $ifNull: ['$finalAmount', 0] },
+                0,
+              ],
+            },
+          },
+          refunds: { $sum: '$processedRefundAmount' },
+          orders: { $sum: 1 },
+        },
+      },
+      { $sort: { _id: 1 } },
+    ]),
+    Order.aggregate([
+      { $match: dateMatch },
+      { $group: { _id: '$orderStatus', count: { $sum: 1 } } },
+      { $sort: { count: -1, _id: 1 } },
+    ]),
+    Order.aggregate([
+      { $match: orderFilter },
+      { $unwind: '$orderItems' },
+      {
+        $group: {
+          _id: '$orderItems.product',
+          name: { $first: '$orderItems.name' },
+          quantity: { $sum: { $ifNull: ['$orderItems.quantity', 1] } },
+          revenue: {
+            $sum: {
+              $multiply: [
+                { $ifNull: ['$orderItems.price', 0] },
+                { $ifNull: ['$orderItems.quantity', 1] },
+              ],
+            },
+          },
+        },
+      },
+      { $sort: { quantity: -1, revenue: -1 } },
+      { $limit: 20 },
+    ]),
+    Order.aggregate([
+      { $match: orderFilter },
+      { $unwind: '$orderItems' },
+      { $lookup: { from: 'products', localField: 'orderItems.product', foreignField: '_id', as: 'product' } },
+      { $unwind: { path: '$product', preserveNullAndEmptyArrays: true } },
+      {
+        $group: {
+          _id: { $ifNull: ['$product.category', '$orderItems.category'] },
+          name: { $first: { $ifNull: ['$orderItems.categoryName', 'Uncategorised'] } },
+          quantity: { $sum: { $ifNull: ['$orderItems.quantity', 1] } },
+          revenue: {
+            $sum: {
+              $multiply: [
+                { $ifNull: ['$orderItems.price', 0] },
+                { $ifNull: ['$orderItems.quantity', 1] },
+              ],
+            },
+          },
+        },
+      },
+      { $sort: { revenue: -1, quantity: -1 } },
+      { $limit: 20 },
+    ]),
+    Order.aggregate([
+      { $match: orderFilter },
+      { $unwind: '$orderItems' },
+      {
+        $group: {
+          _id: {
+            product: '$orderItems.product',
+            variantId: { $ifNull: ['$orderItems.variantId', 'legacy'] },
+            sku: { $ifNull: ['$orderItems.sku', ''] },
+            size: { $ifNull: ['$orderItems.size', ''] },
+            color: { $ifNull: ['$orderItems.color', ''] },
+          },
+          name: { $first: '$orderItems.name' },
+          quantity: { $sum: { $ifNull: ['$orderItems.quantity', 1] } },
+          revenue: {
+            $sum: {
+              $multiply: [
+                { $ifNull: ['$orderItems.price', 0] },
+                { $ifNull: ['$orderItems.quantity', 1] },
+              ],
+            },
+          },
+        },
+      },
+      { $sort: { quantity: -1, revenue: -1 } },
+      { $limit: 20 },
+    ]),
+    Order.aggregate([
+      { $match: { ...dateMatch, 'coupon.code': { $exists: true, $ne: null } } },
+      {
+        $group: {
+          _id: '$coupon.code',
+          orders: { $sum: 1 },
+          discounts: { $sum: { $ifNull: ['$couponDiscount', 0] } },
+          revenue: {
+            $sum: {
+              $cond: [
+                { $in: ['$paymentStatus', completedPaymentStatuses] },
+                { $ifNull: ['$finalAmount', 0] },
+                0,
+              ],
+            },
+          },
+        },
+      },
+      { $sort: { revenue: -1 } },
+    ]),
+    Order.aggregate([
+      { $match: dateMatch },
+      {
+        $group: {
+          _id: { $cond: [{ $eq: ['$paymentMethod', 'COD'] }, 'COD', 'Online'] },
+          orders: { $sum: 1 },
+          revenue: {
+            $sum: {
+              $cond: [
+                { $in: ['$paymentStatus', completedPaymentStatuses] },
+                { $ifNull: ['$finalAmount', 0] },
+                0,
+              ],
+            },
+          },
+        },
+      },
+      { $sort: { _id: 1 } },
+    ]),
+    User.countDocuments({ role: 'customer', createdAt: { $gte: from, $lt: to } }),
+    Order.aggregate([
+      { $match: dateMatch },
+      { $group: { _id: '$user', orders: { $sum: 1 } } },
+      { $match: { orders: { $gte: 2 } } },
+      { $count: 'count' },
+    ]),
+    Order.countDocuments({ ...dateMatch, orderStatus: 'Delivered' }),
+    ReturnExchange.countDocuments({ createdAt: { $gte: from, $lt: to } }),
+    Product.find({ isActive: true }).select('name sku stock lowStockAlert variants').lean(),
+  ]);
+
+  const financial = financialRows[0] || {};
+  const refunds = money(financial.refunds);
+  const collectedRevenue = money(financial.collectedRevenue);
+  const orderCount = Number(financial.orderCount || 0);
+  const inventory = buildInventorySummary(inventoryProducts);
+  return {
+    range: { from: from.toISOString(), to: to.toISOString() },
+    metrics: {
+      grossRevenue: money(financial.grossRevenue),
+      netRevenue: money(collectedRevenue - refunds),
+      discounts: money(financial.discounts),
+      refunds,
+      orderCount,
+      averageOrderValue: orderCount ? money((collectedRevenue - refunds) / orderCount) : 0,
+      returnRate: deliveredOrders ? Math.round((returnCount / deliveredOrders) * 10000) / 100 : 0,
+      newCustomers,
+      repeatCustomers: Number(repeatCustomers[0]?.count || 0),
+    },
+    timeSeries: timeSeries.map((entry) => ({
+      period: entry._id,
+      grossRevenue: money(entry.grossRevenue),
+      refunds: money(entry.refunds),
+      netRevenue: money(Number(entry.collectedRevenue || 0) - Number(entry.refunds || 0)),
+      orders: Number(entry.orders || 0),
+    })),
+    ordersByStatus: statusRows.map((entry) => ({ status: entry._id || 'Unknown', count: entry.count })),
+    topProducts: topProducts.map((entry) => ({
+      productId: entry._id,
+      name: entry.name || 'Product',
+      quantity: entry.quantity,
+      revenue: money(entry.revenue),
+    })),
+    topCategories: topCategories.map((entry) => ({
+      categoryId: entry._id,
+      name: entry.name || 'Category',
+      quantity: entry.quantity,
+      revenue: money(entry.revenue),
+    })),
+    topVariants: topVariants.map((entry) => ({
+      productId: entry._id.product,
+      variantId: entry._id.variantId,
+      sku: entry._id.sku,
+      size: entry._id.size,
+      color: entry._id.color,
+      name: entry.name || 'Variant',
+      quantity: entry.quantity,
+      revenue: money(entry.revenue),
+    })),
+    inventory,
+    couponPerformance: couponPerformance.map((entry) => ({
+      code: entry._id,
+      orders: entry.orders,
+      discounts: money(entry.discounts),
+      revenue: money(entry.revenue),
+    })),
+    payments: paymentMethods.map((entry) => ({
+      method: entry._id,
+      orders: entry.orders,
+      revenue: money(entry.revenue),
+    })),
+  };
+}
+
+function buildInventorySummary(products) {
+  const lowStock = [];
+  const outOfStock = [];
+  for (const product of products) {
+    const variants = Array.isArray(product.variants) && product.variants.length
+      ? product.variants.map((variant) => ({
+        productId: product._id,
+        variantId: variant._id,
+        name: product.name,
+        sku: variant.sku || product.sku,
+        stock: Math.max(0, Number(variant.stock || 0)),
+        reservedStock: Math.max(0, Number(variant.reservedStock || 0)),
+        threshold: Number(product.lowStockAlert || 5),
+      }))
+      : [{
+        productId: product._id,
+        name: product.name,
+        sku: product.sku,
+        stock: Math.max(0, Number(product.stock || 0)),
+        reservedStock: Math.max(0, Number(product.reservedStock || 0)),
+        threshold: Number(product.lowStockAlert || 5),
+      }];
+    for (const item of variants) {
+      if (item.stock <= 0) outOfStock.push(item);
+      else if (item.stock <= item.threshold) lowStock.push(item);
+    }
+  }
+  return {
+    lowStock: lowStock.sort((a, b) => a.stock - b.stock).slice(0, 100),
+    outOfStock: outOfStock.slice(0, 100),
+  };
+}
+
+function parseDateRange(query) {
+  const now = new Date();
+  const defaultFrom = new Date(now.getFullYear(), now.getMonth() - 5, 1);
+  const from = query.from ? new Date(query.from) : defaultFrom;
+  const requestedTo = query.to ? new Date(query.to) : now;
+  if (Number.isNaN(from.getTime()) || Number.isNaN(requestedTo.getTime())) throw reportValidationError('Invalid report date range');
+  const to = query.to ? new Date(requestedTo.getTime() + 24 * 60 * 60 * 1000) : requestedTo;
+  if (from >= to) throw reportValidationError('Report start date must be before end date');
+  if (to.getTime() - from.getTime() > 2 * 366 * 24 * 60 * 60 * 1000) throw reportValidationError('Report range cannot exceed two years');
+  return { from, to };
+}
+
+function reportValidationError(message) {
+  const error = new Error(message);
+  error.statusCode = 400;
+  error.code = 'VALIDATION_ERROR';
+  return error;
+}
+
+function processedRefundAmountExpression() {
+  return {
+    $divide: [
+      {
+        $sum: {
+          $map: {
+            input: { $ifNull: ['$refunds', []] },
+            as: 'refund',
+            in: {
+              $cond: [
+                { $eq: ['$$refund.status', 'Processed'] },
+                { $ifNull: ['$$refund.amount', 0] },
+                0,
+              ],
+            },
+          },
+        },
+      },
+      100,
+    ],
+  };
+}
+
+function money(value) {
+  return Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
+}
+
+function csvCell(value) {
+  const text = String(value ?? '');
+  return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
 
 function startOfMonth(date) {
   return new Date(date.getFullYear(), date.getMonth(), 1);

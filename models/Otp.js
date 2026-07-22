@@ -12,11 +12,15 @@ const otpSchema = new mongoose.Schema({
   attempts: { type: Number, default: 0 },
   maxAttempts: { type: Number, default: 5 },
   isUsed: { type: Boolean, default: false },
+  usedAt: Date,
+  invalidatedAt: Date,
+  invalidationReason: String,
   resendCount: { type: Number, default: 0 },
   ipAddress: String,
   userAgent: String,
 }, { timestamps: true });
 
 otpSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+otpSchema.index({ target: 1, targetType: 1, purpose: 1, isUsed: 1, createdAt: -1 });
 
 module.exports = mongoose.model('Otp', otpSchema);

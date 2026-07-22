@@ -1,5 +1,5 @@
 function getProvider() {
-  return String(process.env.EMAIL_OTP_PROVIDER || 'mock').toLowerCase();
+  return String(process.env.EMAIL_OTP_PROVIDER || '').trim().toLowerCase();
 }
 
 async function sendOtpEmail(email, otp) {
@@ -13,12 +13,15 @@ async function sendOtpEmail(email, otp) {
 }
 
 async function sendViaMock(email, otp) {
+  if (process.env.NODE_ENV === 'production' || process.env.ALLOW_DEV_OTP !== 'true') {
+    const error = new Error('Mock email provider is disabled');
+    error.statusCode = 503;
+    throw error;
+  }
   return {
     success: true,
     provider: 'mock',
-    messageId: `mock-email-${Date.now()}`,
     devOtp: otp,
-    recipient: email,
   };
 }
 
@@ -50,9 +53,9 @@ async function sendViaBrevo(email, otp) {
   });
 
   if (!response.ok) {
-    const details = await safeJson(response);
-    const error = new Error(details?.message || 'Unable to send email OTP');
-    error.statusCode = response.status || 500;
+    await safeJson(response);
+    const error = new Error('Unable to deliver OTP email');
+    error.statusCode = 503;
     throw error;
   }
 

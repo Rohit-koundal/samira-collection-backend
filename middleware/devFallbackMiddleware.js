@@ -1,5 +1,5 @@
 const mongoose = require('mongoose');
-const jwt = require('jsonwebtoken');
+const { verifyAccessToken } = require('../utils/generateToken');
 
 const categories = [
   { _id: 'cat-sarees', id: 'cat-sarees', name: 'Sarees', slug: 'sarees', count: 128, description: 'Silk and festive drapes', isActive: true, displayOrder: 1 },
@@ -120,7 +120,11 @@ const wishlist = [];
 const cart = { _id: 'dev-cart', items: [] };
 
 function devFallback(req, res, next) {
-  if (process.env.NODE_ENV === 'production' || mongoose.connection.readyState === 1) return next();
+  if (
+    process.env.NODE_ENV === 'production'
+    || process.env.ALLOW_DEV_DATA_FALLBACK !== 'true'
+    || mongoose.connection.readyState === 1
+  ) return next();
 
   const path = req.path;
   const method = req.method;
@@ -135,7 +139,22 @@ function devFallback(req, res, next) {
   if (method === 'GET' && path === '/coupons') return res.json(coupons);
   if (method === 'POST' && path === '/coupons/apply') return applyCoupon(req, res);
   if (method === 'GET' && path.startsWith('/reviews/')) return res.json([]);
-  if (path.startsWith('/reviews/')) return handlePublicReviews(req, res);
+  if (path.startsWith('/reviews/')) {
+    if (!resolveDevRequestUser(req)) return res.status(401).json({ message: 'Not authorized' });
+    return handlePublicReviews(req, res);
+  }
+
+  const devRequestUser = resolveDevRequestUser(req);
+  if (
+    path.startsWith('/cart')
+    || path.startsWith('/wishlist')
+    || path.startsWith('/user/addresses')
+    || path.startsWith('/orders')
+    || path.startsWith('/payments')
+    || path.startsWith('/returns')
+  ) {
+    if (!devRequestUser) return res.status(401).json({ message: 'Not authorized' });
+  }
 
   if (path.startsWith('/cart')) return handleCart(req, res);
   if (path.startsWith('/wishlist')) return handleWishlist(req, res);
@@ -144,7 +163,14 @@ function devFallback(req, res, next) {
   if (path.startsWith('/payments')) return handlePayments(req, res);
   if (path.startsWith('/returns')) return handleReturns(req, res);
 
-  if (method === 'GET' && path === '/admin/profile') return res.json(devUser('admin'));
+  if (path.startsWith('/admin/')) {
+    if (!devRequestUser) return res.status(401).json({ message: 'Not authorized' });
+    if (!['admin', 'owner'].includes(devRequestUser.role) || devRequestUser.activeMode !== 'admin') {
+      return res.status(403).json({ message: 'Admin access required' });
+    }
+  }
+
+  if (method === 'GET' && path === '/admin/profile') return res.json(devRequestUser);
   if (method === 'GET' && path === '/admin/dashboard/stats') {
     return res.json({ products: products.length, orders: orders.length, customers: customers.length, coupons: coupons.length, returns: returns.length, revenue: orders.reduce((sum, order) => sum + Number(order.finalAmount || 0), 0) });
   }
@@ -292,17 +318,15 @@ function handleSettings(req, res) {
 
 function handleCustomers(req, res) {
   if (req.method === 'GET') return res.json(customers);
+  if (req.path.endsWith('/promote-admin') || req.path.endsWith('/demote-admin')) {
+    return res.status(503).json({
+      message: 'Role changes require a connected database.',
+      code: 'DATABASE_UNAVAILABLE',
+    });
+  }
   const id = routeId(req.path, req.path.startsWith('/admin/users') ? '/admin/users' : '/admin/customers');
   const customer = findItem(customers, id) || createItem(customers, { name: 'Dev Customer', phone: '9816978086', role: 'customer' }, 'dev-customer');
   if (req.path.endsWith('/block')) customer.isBlocked = Boolean(req.body.isBlocked);
-  if (req.path.endsWith('/promote-admin')) {
-    customer.role = 'admin';
-    customer.availableModes = ['customer', 'admin'];
-  }
-  if (req.path.endsWith('/demote-admin')) {
-    customer.role = 'customer';
-    customer.availableModes = ['customer'];
-  }
   return res.json(customer);
 }
 
@@ -694,7 +718,7 @@ function devUser(role = 'customer') {
     _id: `offline-${role}`,
     id: `offline-${role}`,
     name: role === 'admin' ? 'Samira Admin' : 'Samira User',
-    phone: '9816978086',
+    phone: '',
     role,
     activeMode: role,
     availableModes: role === 'admin' ? ['customer', 'admin'] : ['customer'],
@@ -708,7 +732,7 @@ function resolveDevRequestUser(req) {
   if (!token) return null;
 
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'dev_secret_change_me');
+    const decoded = verifyAccessToken(token);
     const id = decoded.userId || decoded.id;
     if (!id) return null;
 
@@ -719,7 +743,7 @@ function resolveDevRequestUser(req) {
       phone: decoded.phone || '',
       role: decoded.role || 'customer',
       activeMode: decoded.activeMode || 'customer',
-      availableModes: decoded.role === 'admin' ? ['customer', 'admin'] : ['customer'],
+      availableModes: ['admin', 'owner'].includes(decoded.role) ? ['customer', 'admin'] : ['customer'],
       isPhoneVerified: true,
     };
   } catch {

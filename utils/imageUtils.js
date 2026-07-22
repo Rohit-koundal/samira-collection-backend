@@ -124,7 +124,21 @@ function normalizeProductImages(product, req) {
     data.images = [{ url: placeholderUrl(req), isPlaceholder: true, primary: true }];
     data.primaryImage = data.images[0].url;
   }
+  data.media = normalizeProductMediaResponse(data.media, req, data);
   return data;
+}
+
+function normalizeProductMediaResponse(media = {}, req, product = {}) {
+  const source = media && typeof media === 'object' ? media : {};
+  const images = Array.isArray(source.images) && source.images.length ? source.images : (product.images || []);
+  const videos = Array.isArray(source.videos) && source.videos.length ? source.videos : (product.videos || []);
+  const spin = source.spin360 || {};
+  return {
+    ...source,
+    images: images.map((item) => ({ ...(item || {}), url: rewriteImageUrl(item?.url || item, req) })).filter((item) => item.url),
+    videos: videos.map((item) => ({ ...(item || {}), url: rewriteImageUrl(item?.url || item, req), thumbnailUrl: rewriteImageUrl(item?.thumbnailUrl || item?.thumbnail || item?.url, req) })).filter((item) => item.url),
+    spin360: { ...spin, frames: (Array.isArray(spin.frames) ? spin.frames : []).map((frame, index) => ({ ...(frame || {}), url: rewriteImageUrl(frame?.url || frame, req), sortOrder: Number(frame?.sortOrder ?? index) })).filter((frame) => frame.url), videoUrl: rewriteImageUrl(spin.videoUrl, req), thumbnailUrl: rewriteImageUrl(spin.thumbnailUrl, req), totalFrames: Number(spin.totalFrames || spin.frames?.length || 0) },
+  };
 }
 
 function normalizeProductPayload(data = {}) {
@@ -139,6 +153,10 @@ function normalizeProductPayload(data = {}) {
       primary: Boolean(image.primary),
     }));
     payload.primaryImage = getPrimaryImageUrl(payload.images);
+  }
+  if (data.media && typeof data.media === 'object') {
+    const media = { ...data.media };
+    payload.media = media;
   }
   return payload;
 }

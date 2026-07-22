@@ -68,11 +68,11 @@ async function resolveWishlistProduct(productIdOrSlug) {
   if (!value) return null;
 
   if (mongoose.Types.ObjectId.isValid(value)) {
-    const byId = await Product.findById(value).populate('category', 'name slug');
+    const byId = await Product.findOne({ _id: value, isActive: true, archivedAt: null }).populate('category', 'name slug');
     if (byId) return byId;
   }
 
-  return Product.findOne({ slug: value }).populate('category', 'name slug');
+  return Product.findOne({ slug: value, isActive: true, archivedAt: null }).populate('category', 'name slug');
 }
 
 async function resolveStoredWishlistProducts(values = []) {
@@ -87,7 +87,11 @@ async function resolveStoredWishlistProducts(values = []) {
 
   if (!query.length) return { products: [], changed: true };
 
-  const products = await Product.find({ $or: query }).populate('category', 'name slug');
+  const products = await Product.find({
+    $or: query,
+    isActive: true,
+    archivedAt: null,
+  }).populate('category', 'name slug');
   const byId = new Map(products.map((product) => [String(product._id), product]));
   const bySlug = new Map(products.map((product) => [String(product.slug), product]));
 
