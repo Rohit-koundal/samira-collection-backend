@@ -114,6 +114,15 @@ app.use('/api/admin/support', protect, adminOnly, requirePermission('manage_supp
 app.use('/api/admin/uploads', protect, adminOnly, requirePermission('manage_catalog'), require('./routes/uploadRoutes'));
 app.use('/api/admin/upload', protect, adminOnly, requirePermission('manage_catalog'), require('./routes/uploadRoutes'));
 app.use('/api/admin/product-drafts', protect, adminOnly, requirePermission('manage_catalog'), require('./routes/productDraftRoutes'));
+app.use('/api/admin/reel-imports', protect, adminOnly, requirePermission('manage_catalog'), rateLimit({
+  scope: 'admin_reel_import',
+  limit: 60,
+  windowSeconds: 60,
+  identifiers: [
+    (req) => req.ip,
+    (req) => req.user?._id ? String(req.user._id) : null,
+  ],
+}), require('./modules/reel-product-import/reelImport.routes'));
 app.use('/api/admin/variant-groups', protect, adminOnly, requirePermission('manage_catalog'), require('./routes/variantGroupRoutes'));
 app.use('/api/products', require('./routes/publicProductRoutes'));
 app.use('/api/variant-groups', require('./routes/variantGroupRoutes'));

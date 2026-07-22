@@ -1,7 +1,10 @@
 const crypto = require('crypto');
 const fs = require('fs/promises');
 
-const allowedSubfolders = new Set(['products', 'categories', 'banners', 'product-videos', 'product-models']);
+const allowedSubfolders = new Set([
+  'products', 'categories', 'banners', 'product-videos', 'product-models',
+  'reel-imports/original', 'reel-imports/normalized', 'reel-imports/frames', 'reel-imports/candidates',
+]);
 const safeContentTypes = new Set([
   'image/jpeg',
   'image/png',

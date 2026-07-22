@@ -18,6 +18,24 @@ function getMediaStorageState() {
   };
 }
 
+function getStorageProvider() {
+  return getMediaStorageState().provider;
+}
+
+function createSignedReadUrl(entry) {
+  if (!entry?.url || !/^https:\/\//i.test(String(entry.url))) {
+    const error = new Error('A readable media URL is not available');
+    error.statusCode = 503;
+    error.code = 'MEDIA_READ_URL_UNAVAILABLE';
+    throw error;
+  }
+  return entry.url;
+}
+
+async function uploadGeneratedImage(file, options = {}) {
+  return uploadImage(file, { folder: options.folder || 'reel-imports/candidates' });
+}
+
 function getAvailableProviders() {
   return [
     isR2Configured() ? 'r2' : null,
@@ -225,9 +243,12 @@ async function cleanupTempFiles(files = []) {
 
 module.exports = {
   cleanupTempFiles,
+  createSignedReadUrl,
   deleteMedia,
   getMediaStorageState,
+  getStorageProvider,
   uploadBatch,
+  uploadGeneratedImage,
   uploadImage,
   uploadModel,
   uploadVideo,
