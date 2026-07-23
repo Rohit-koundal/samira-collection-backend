@@ -35,6 +35,9 @@ const productDraftSchema = new mongoose.Schema({
   status: { type: String, enum: ['draft', 'published'], default: 'draft' },
   createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   publishedProductId: { type: mongoose.Schema.Types.ObjectId, ref: 'Product' },
+  sourceType: { type: String, enum: ['reel-import'], default: undefined },
+  sourceJobId: { type: mongoose.Schema.Types.ObjectId, ref: 'ReelImport', default: undefined },
+  sourceCandidateId: { type: mongoose.Schema.Types.ObjectId, ref: 'ReelCandidate', unique: true, sparse: true, default: undefined },
 }, { timestamps: true });
 
 module.exports = mongoose.model('ProductDraft', productDraftSchema);

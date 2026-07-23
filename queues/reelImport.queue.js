@@ -1,0 +1,77 @@
+const { Queue } = require('bullmq');
+const { getReelImportConfig } = require('../config/reelImport');
+
+const QUEUE_NAME = 'reel-product-import';
+let queue;
+
+function getRedisConnection() {
+  if (!process.env.REDIS_URL) return null;
+  return { url: process.env.REDIS_URL, maxRetriesPerRequest: null };
+}
+
+function getQueue() {
+  const connection = getRedisConnection();
+  if (!connection) return null;
+  if (!queue) queue = new Queue(QUEUE_NAME, { connection });
+  return queue;
+}
+
+async function enqueueReelImport({ jobId, storageKey }) {
+  const config = getReelImportConfig();
+  const payload = { jobId: String(jobId), storageKey: String(storageKey) };
+  const activeQueue = getQueue();
+
+  if (activeQueue) {
+    await activeQueue.add('process-reel', payload, {
+      jobId: String(jobId),
+      attempts: config.maxAttempts,
+      backoff: { type: 'exponential', delay: 5000 },
+      removeOnComplete: { age: 24 * 60 * 60, count: 100 },
+      removeOnFail: { age: 7 * 24 * 60 * 60, count: 500 },
+    });
+    return { mode: 'redis' };
+  }
+
+  if (process.env.NODE_ENV === 'production') {
+    const error = new Error('Background processing is unavailable. Configure Redis and try again.');
+    error.code = 'REEL_QUEUE_UNAVAILABLE';
+    error.statusCode = 503;
+    throw error;
+  }
+
+  setImmediate(() => {
+    require('../workers/reelImport.processor').processReelImportJob(payload)
+      .catch((error) => console.error(JSON.stringify({
+        event: 'reel_import_dev_worker_failed',
+        jobId: payload.jobId,
+        code: error.code || 'PROCESSING_FAILED',
+      })));
+  });
+  return { mode: 'development-fallback' };
+}
+
+async function removeQueuedReelImport(jobId) {
+  const activeQueue = getQueue();
+  if (!activeQueue) return false;
+  const queuedJob = await activeQueue.getJob(String(jobId));
+  if (!queuedJob) return false;
+  const state = await queuedJob.getState();
+  if (['waiting', 'delayed', 'paused'].includes(state)) {
+    await queuedJob.remove();
+    return true;
+  }
+  return false;
+}
+
+async function closeReelImportQueue() {
+  if (queue) await queue.close();
+  queue = null;
+}
+
+module.exports = {
+  QUEUE_NAME,
+  closeReelImportQueue,
+  enqueueReelImport,
+  getRedisConnection,
+  removeQueuedReelImport,
+};

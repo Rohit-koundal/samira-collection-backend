@@ -16,7 +16,7 @@ function errorHandler(error, req, res, next) {
     return res.status(400).json({ message: error.message });
   }
   if (error.code === 'LIMIT_FILE_SIZE') {
-    return res.status(400).json({ message: 'Image size is too large' });
+    return res.status(400).json({ message: 'Uploaded file is too large.' });
   }
   if (error.code === 'LIMIT_FILE_COUNT' || error.code === 'LIMIT_UNEXPECTED_FILE') {
     return res.status(400).json({ message: 'Too many images uploaded. Maximum 8 images are allowed.' });
@@ -24,8 +24,15 @@ function errorHandler(error, req, res, next) {
   if (error.message?.includes('R2')) {
     return res.status(502).json({ message: error.message });
   }
-  const statusCode = res.statusCode === 200 ? 500 : res.statusCode;
-  res.status(statusCode).json({ message: error.message, stack: process.env.NODE_ENV === 'production' ? undefined : error.stack });
+  const statusCode = error.statusCode || (res.statusCode === 200 ? 500 : res.statusCode);
+  const safeMessage = statusCode >= 500 && process.env.NODE_ENV === 'production'
+    ? 'The request could not be completed. Please try again.'
+    : error.message;
+  res.status(statusCode).json({
+    message: safeMessage,
+    code: error.code,
+    stack: process.env.NODE_ENV === 'production' ? undefined : error.stack,
+  });
 }
 
 module.exports = { notFound, errorHandler };

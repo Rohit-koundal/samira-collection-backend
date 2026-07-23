@@ -5,7 +5,16 @@ const { DeleteObjectCommand, S3Client, PutObjectCommand } = require('@aws-sdk/cl
 
 let r2Client;
 
-const allowedFolders = new Set(['products', 'categories', 'banners', 'product-videos']);
+const allowedFolders = new Set([
+  'products',
+  'categories',
+  'banners',
+  'product-videos',
+  'reel-imports/original',
+  'reel-imports/normalized',
+  'reel-imports/frames',
+  'reel-imports/candidates',
+]);
 
 function isR2Configured() {
   return Boolean(
@@ -74,6 +83,8 @@ async function uploadImageToR2(file, options = {}) {
     url: buildPublicUrl(objectKey),
     publicId: objectKey,
     originalName: file.originalname,
+    mimeType: file.mimetype,
+    sizeBytes: file.size,
   };
 }
 
@@ -142,6 +153,8 @@ function resolveFileExtension(file = {}) {
 }
 
 module.exports = {
+  buildPublicUrl,
+  getR2Client,
   isR2Configured,
   uploadImageToR2,
   uploadFileToR2,

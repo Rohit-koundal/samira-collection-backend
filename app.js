@@ -9,6 +9,7 @@ const { adminOnly } = require('./middleware/adminMiddleware');
 const { corsOptions, getAllowedOrigins } = require('./config/corsOptions');
 const { isR2Configured } = require('./services/r2Upload');
 const { isCloudinaryConfigured } = require('./services/cloudinaryUpload');
+const { isReelImportEnabled } = require('./config/reelImport');
 
 const app = express();
 
@@ -53,6 +54,9 @@ app.use('/api/admin/settings', protect, adminOnly, require('./routes/settingsRou
 app.use('/api/admin/uploads', require('./routes/uploadRoutes'));
 app.use('/api/admin/upload', require('./routes/uploadRoutes'));
 app.use('/api/admin/product-drafts', require('./routes/productDraftRoutes'));
+if (isReelImportEnabled()) {
+  app.use('/api/admin/reel-imports', require('./modules/reel-product-import/reelImport.routes'));
+}
 app.use('/api/admin/variant-groups', protect, adminOnly, require('./routes/variantGroupRoutes'));
 app.use('/api/products', require('./routes/publicProductRoutes'));
 app.use('/api/variant-groups', require('./routes/variantGroupRoutes'));

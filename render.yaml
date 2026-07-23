@@ -10,6 +10,8 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
+      - key: ENABLE_REEL_PRODUCT_IMPORT
+        value: "true"
       - key: REQUIRE_DATABASE
         value: "false"
       - key: MONGO_URI

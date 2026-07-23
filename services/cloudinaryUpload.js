@@ -5,17 +5,19 @@ function isCloudinaryConfigured() {
   return Boolean(process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_API_KEY && process.env.CLOUDINARY_API_SECRET);
 }
 
-async function uploadImage(file) {
-  return uploadFile(file, 'image');
+async function uploadImage(file, options = {}) {
+  return uploadFile(file, 'image', options);
 }
 
-async function uploadFile(file, resourceType = 'image') {
+async function uploadFile(file, resourceType = 'image', options = {}) {
   if (!isCloudinaryConfigured()) return null;
 
   const cloudName = process.env.CLOUDINARY_CLOUD_NAME;
   const apiKey = process.env.CLOUDINARY_API_KEY;
   const apiSecret = process.env.CLOUDINARY_API_SECRET;
-  const folder = process.env.CLOUDINARY_FOLDER || 'samira-products';
+  const baseFolder = process.env.CLOUDINARY_FOLDER || 'samira-products';
+  const suffix = String(options.folder || '').replace(/[^a-z0-9/_-]/gi, '').replace(/^\/+|\/+$/g, '');
+  const folder = suffix ? `${baseFolder}/${suffix}` : baseFolder;
   const timestamp = Math.floor(Date.now() / 1000);
   const signature = crypto
     .createHash('sha1')
@@ -44,8 +46,8 @@ async function uploadFile(file, resourceType = 'image') {
   };
 }
 
-async function uploadVideo(file) {
-  return uploadFile(file, 'video');
+async function uploadVideo(file, options = {}) {
+  return uploadFile(file, 'video', options);
 }
 
 module.exports = { isCloudinaryConfigured, uploadImage, uploadVideo };
