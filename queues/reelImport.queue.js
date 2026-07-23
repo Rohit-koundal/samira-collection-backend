@@ -6,7 +6,22 @@ let queue;
 
 function getRedisConnection() {
   if (!process.env.REDIS_URL) return null;
-  return { url: process.env.REDIS_URL, maxRetriesPerRequest: null };
+  try {
+    const redisUrl = new URL(process.env.REDIS_URL);
+    return {
+      host: redisUrl.hostname,
+      port: Number(redisUrl.port || 6379),
+      username: redisUrl.username ? decodeURIComponent(redisUrl.username) : undefined,
+      password: redisUrl.password ? decodeURIComponent(redisUrl.password) : undefined,
+      db: redisUrl.pathname && redisUrl.pathname !== '/' ? Number(redisUrl.pathname.slice(1)) : 0,
+      tls: redisUrl.protocol === 'rediss:' ? {} : undefined,
+      maxRetriesPerRequest: null,
+    };
+  } catch {
+    const error = new Error('REDIS_URL is invalid.');
+    error.code = 'REEL_QUEUE_CONFIGURATION_INVALID';
+    throw error;
+  }
 }
 
 function getQueue() {

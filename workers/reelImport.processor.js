@@ -22,6 +22,12 @@ async function processReelImportJob({ jobId, storageKey }) {
     if (!refreshed || refreshed.status === 'cancelled' || refreshed.cancellationRequested) return { cancelled: true };
 
     await persistCandidates(refreshed, result.candidates || []);
+    if (result.metadata) {
+      refreshed.sourceVideo.durationSeconds = Number(result.metadata.durationSeconds || refreshed.sourceVideo.durationSeconds || 0);
+      refreshed.sourceVideo.width = Number(result.metadata.width || refreshed.sourceVideo.width || 0);
+      refreshed.sourceVideo.height = Number(result.metadata.height || refreshed.sourceVideo.height || 0);
+      refreshed.sourceVideo.codec = String(result.metadata.codec || refreshed.sourceVideo.codec || '');
+    }
     refreshed.statistics = {
       ...refreshed.statistics?.toObject?.() || refreshed.statistics || {},
       ...(result.statistics || {}),
