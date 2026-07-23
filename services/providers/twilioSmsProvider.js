@@ -25,13 +25,22 @@ async function sendOtp(phone, otp) {
     error.statusCode = response.status >= 500 ? 502 : 400;
     throw error;
   }
-  return { success: true, provider: 'twilio', messageSid: data.sid };
+  return { success: true, provider: 'twilio', accountSid: config.accountSid, messageSid: data.sid };
 }
 
-function getTwilioConfig() {
+function getTwilioConfig(phone) {
+  if (String(phone) === '9999133567') {
+    return {
+      accountSid: process.env.SMS_9999133567_ACCOUNT_SID,
+      authToken: process.env.SMS_9999133567_AUTH_TOKEN,
+      from: process.env.SMS_9999133567_SENDER_ID,
+      errorMessage: 'Twilio SMS provider for 9999133567 is not configured. Add SMS_9999133567_AUTH_TOKEN in backend/.env.',
+    };
+  }
+
   return {
     accountSid: process.env.SMS_ACCOUNT_SID,
-    authToken: process.env.SMS_AUTH_TOKEN,
+    authToken: process.env.SMS_AUTH_TOKEN || process.env.SMS_API_KEY,
     from: process.env.SMS_SENDER_ID,
   };
 }

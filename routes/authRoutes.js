@@ -13,7 +13,7 @@ router.post('/profile/send-email-change-otp', protect, auth.sendProfileEmailChan
 router.post('/profile/verify-email-change-otp', protect, auth.verifyProfileEmailChangeOtp);
 router.post('/refresh', auth.refresh);
 router.get('/me', protect, auth.me);
-router.post('/logout', auth.logout);
+router.post('/logout', protect, auth.logout);
 router.post('/switch-mode', protect, auth.switchMode);
 router.get('/profile', protect, auth.profile);
 router.put('/profile', protect, auth.updateProfile);

@@ -5,18 +5,7 @@ const { DeleteObjectCommand, S3Client, PutObjectCommand } = require('@aws-sdk/cl
 
 let r2Client;
 
-const allowedFolders = new Set(['products', 'categories', 'banners', 'product-videos', 'product-models']);
-const allowedExtensions = new Set(['jpg', 'png', 'webp', 'mp4', 'webm', 'mov', 'glb', 'usdz']);
-const safeContentTypes = new Set([
-  'image/jpeg',
-  'image/png',
-  'image/webp',
-  'video/mp4',
-  'video/webm',
-  'video/quicktime',
-  'model/gltf-binary',
-  'model/vnd.usdz+zip',
-]);
+const allowedFolders = new Set(['products', 'categories', 'banners', 'product-videos']);
 
 function isR2Configured() {
   return Boolean(
@@ -43,11 +32,7 @@ function getR2Client() {
 }
 
 function getR2Folder() {
-  const folder = String(process.env.R2_FOLDER || 'products').trim().toLowerCase().replace(/^\/+|\/+$/g, '');
-  if (!folder || folder.length > 100 || folder.includes('..') || !/^[a-z0-9][a-z0-9/_-]*$/.test(folder)) {
-    return 'products';
-  }
-  return folder;
+  return String(process.env.R2_FOLDER || 'products').replace(/^\/+|\/+$/g, '');
 }
 
 function buildPublicUrl(objectKey) {
@@ -67,11 +52,9 @@ function buildObjectKey(file, { folder = 'products', extension = 'webp' } = {}) 
     .replace(/\.[^.]+$/, '')
     .replace(/[^a-z0-9]+/gi, '-')
     .replace(/^-+|-+$/g, '')
-    .toLowerCase()
-    .slice(0, 80) || 'image';
+    .toLowerCase() || 'image';
   const suffix = crypto.randomBytes(5).toString('hex');
-  const requestedExtension = String(extension || 'webp').replace(/[^a-z0-9]/gi, '').toLowerCase();
-  const safeExtension = allowedExtensions.has(requestedExtension) ? requestedExtension : 'bin';
+  const safeExtension = String(extension || 'webp').replace(/[^a-z0-9]/gi, '').toLowerCase() || 'webp';
   return `${safeFolder}/${Date.now()}-${suffix}-${safeBaseName}.${safeExtension}`;
 }
 
@@ -83,7 +66,7 @@ async function uploadImageToR2(file, options = {}) {
     Bucket: process.env.R2_BUCKET_NAME,
     Key: objectKey,
     Body: buffer,
-    ContentType: resolveContentType(file, 'image/webp'),
+    ContentType: file.mimetype || 'image/webp',
     CacheControl: 'public, max-age=31536000, immutable',
   }));
 
@@ -91,24 +74,6 @@ async function uploadImageToR2(file, options = {}) {
     url: buildPublicUrl(objectKey),
     publicId: objectKey,
     originalName: file.originalname,
-  };
-}
-
-async function uploadBufferToR2(buffer, file, options = {}) {
-  const extension = options.extension || file.detectedExtension || 'webp';
-  const objectKey = buildObjectKey(file, { ...options, extension });
-  await getR2Client().send(new PutObjectCommand({
-    Bucket: process.env.R2_BUCKET_NAME,
-    Key: objectKey,
-    Body: buffer,
-    ContentType: options.contentType || file.detectedMime || file.mimetype || 'application/octet-stream',
-    CacheControl: 'public, max-age=31536000, immutable',
-  }));
-  return {
-    url: buildPublicUrl(objectKey),
-    publicId: objectKey,
-    originalName: file.originalname,
-    provider: 'r2',
   };
 }
 
@@ -121,7 +86,7 @@ async function uploadFileToR2(file, options = {}) {
     Bucket: process.env.R2_BUCKET_NAME,
     Key: objectKey,
     Body: buffer,
-    ContentType: resolveContentType(file),
+    ContentType: file.mimetype || 'application/octet-stream',
     CacheControl: 'public, max-age=31536000, immutable',
   }));
 
@@ -129,10 +94,6 @@ async function uploadFileToR2(file, options = {}) {
     url: buildPublicUrl(objectKey),
     publicId: objectKey,
     originalName: file.originalname,
-    provider: 'r2',
-    resourceType: ['glb', 'usdz'].includes(extension) ? 'raw' : 'video',
-    format: extension,
-    mimeType: resolveContentType(file),
   };
 }
 
@@ -171,34 +132,20 @@ function resolveObjectKey(identifier) {
 }
 
 function resolveFileExtension(file = {}) {
-  const detected = String(file.detectedExtension || '').toLowerCase();
-  if (allowedExtensions.has(detected)) return detected;
-  const mime = String(file.detectedMime || file.mimetype || '').toLowerCase();
+  const mime = String(file.mimetype || '').toLowerCase();
   if (mime.includes('webm')) return 'webm';
   if (mime.includes('quicktime') || mime.includes('mov')) return 'mov';
   if (mime.includes('mp4')) return 'mp4';
-  if (mime === 'model/gltf-binary') return 'glb';
-  if (mime === 'model/vnd.usdz+zip') return 'usdz';
   const original = String(file.originalname || '').split('.').pop().toLowerCase();
-  if (allowedExtensions.has(original)) return original;
-  return 'bin';
-}
-
-function resolveContentType(file = {}, fallback = 'application/octet-stream') {
-  const detected = String(file.detectedMime || '').toLowerCase();
-  if (safeContentTypes.has(detected)) return detected;
-  const declared = String(file.mimetype || '').toLowerCase();
-  if (safeContentTypes.has(declared)) return declared;
-  return fallback;
+  if (['mp4', 'webm', 'mov'].includes(original)) return original;
+  return 'mp4';
 }
 
 module.exports = {
   isR2Configured,
   uploadImageToR2,
-  uploadBufferToR2,
   uploadFileToR2,
   deleteImageFromR2,
   resolveObjectKey,
   resolveUploadFolder,
-  _private: { buildObjectKey, resolveContentType, resolveFileExtension },
 };

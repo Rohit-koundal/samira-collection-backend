@@ -1,69 +1,36 @@
 const router = require('express').Router();
-const mongoose = require('mongoose');
 const User = require('../models/User');
-const { ownerOnly } = require('../middleware/adminMiddleware');
-const { revokeAllUserSessions } = require('../services/refreshSessionService');
-const { paginationEnvelope, parsePagination } = require('../utils/requestValidation');
 
 router.get('/', async (req, res) => {
-  const { page, limit, skip, sort } = parsePagination(req.query, {
-    allowedSorts: ['createdAt', 'name', 'email', 'phone'],
-  });
   const query = String(req.query.search || '').trim();
-  const safeQuery = escapeRegex(query.slice(0, 80));
   const filter = query ? {
     $or: [
-      { phone: new RegExp(safeQuery, 'i') },
-      { name: new RegExp(safeQuery, 'i') },
-      { email: new RegExp(safeQuery, 'i') },
+      { phone: new RegExp(query, 'i') },
+      { name: new RegExp(query, 'i') },
+      { email: new RegExp(query, 'i') },
     ],
   } : {};
-  const [items, total] = await Promise.all([
-    User.find(filter).select('-password').sort(sort).skip(skip).limit(limit),
-    User.countDocuments(filter),
-  ]);
-  res.json(paginationEnvelope(items, total, page, limit));
+  res.json(await User.find(filter).select('-password').sort('-createdAt'));
 });
 
 router.patch('/:userId/block', async (req, res) => {
-  if (!mongoose.isValidObjectId(req.params.userId)) return res.status(400).json({ message: 'Invalid user ID' });
-  if (
-    !req.body
-    || Object.keys(req.body).some((key) => key !== 'isBlocked')
-    || typeof req.body.isBlocked !== 'boolean'
-  ) {
-    return res.status(400).json({ message: 'isBlocked must be a boolean' });
-  }
   const userId = req.params.userId;
-  const customer = await User.findById(userId);
+  const customer = await User.findByIdAndUpdate(userId, { isBlocked: req.body.isBlocked }, { new: true }).select('-password');
   if (!customer) return res.status(404).json({ message: 'Customer not found' });
-  if (customer.role !== 'customer') return res.status(403).json({ message: 'Only customer accounts can be blocked here' });
-  customer.isBlocked = req.body.isBlocked;
-  await customer.save();
-  if (customer.isBlocked) await revokeAllUserSessions(customer._id, 'account_blocked');
-  return res.json(customer);
+  res.json(customer);
 });
 
-router.patch('/:userId/promote-admin', ownerOnly, changeRole('admin'));
-router.patch('/:userId/demote-admin', ownerOnly, changeRole('customer'));
+router.patch('/:userId/promote-admin', async (req, res) => {
+  const user = await User.findByIdAndUpdate(req.params.userId, { role: 'admin', availableModes: ['customer', 'admin'], activeMode: 'customer' }, { new: true }).select('-password');
+  if (!user) return res.status(404).json({ message: 'User not found' });
+  res.json(user);
+});
 
-function changeRole(role) {
-  return async (req, res) => {
-    if (!mongoose.isValidObjectId(req.params.userId)) return res.status(400).json({ message: 'Invalid user ID' });
-    const user = await User.findById(req.params.userId);
-    if (!user) return res.status(404).json({ message: 'User not found' });
-    if (user.role === 'owner') return res.status(403).json({ message: 'Owner accounts cannot be changed here' });
-    user.role = role;
-    user.availableModes = role === 'admin' ? ['customer', 'admin'] : ['customer'];
-    user.activeMode = role === 'admin' ? 'admin' : 'customer';
-    await user.save();
-    await revokeAllUserSessions(user._id, 'role_changed');
-    return res.json(user);
-  };
-}
-
-function escapeRegex(value) {
-  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
+router.patch('/:userId/demote-admin', async (req, res) => {
+  if (String(req.params.userId) === String(req.user._id)) return res.status(400).json({ message: 'You cannot demote yourself' });
+  const user = await User.findByIdAndUpdate(req.params.userId, { role: 'customer', availableModes: ['customer'], activeMode: 'customer' }, { new: true }).select('-password');
+  if (!user) return res.status(404).json({ message: 'User not found' });
+  res.json(user);
+});
 
 module.exports = router;

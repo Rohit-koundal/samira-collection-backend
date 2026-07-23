@@ -2,119 +2,58 @@ const path = require('path');
 const express = require('express');
 const cors = require('cors');
 const mongoose = require('mongoose');
-const { validateEnvironment } = require('./config/env');
 const { notFound, errorHandler } = require('./middleware/errorMiddleware');
-const {
-  queryPollutionProtection,
-  rejectUnsafeMongoKeys,
-  requestCompression,
-  requestContext,
-  secureHeaders,
-} = require('./middleware/securityMiddleware');
 const devFallback = require('./middleware/devFallbackMiddleware');
 const { protect } = require('./middleware/authMiddleware');
-const { adminOnly, ownerOnly, requirePermission } = require('./middleware/adminMiddleware');
-const { auditAdminMutations } = require('./middleware/adminAuditMiddleware');
-const { rateLimit } = require('./middleware/rateLimitMiddleware');
-const { getRateLimitStoreState } = require('./services/rateLimitService');
-const { corsOptions } = require('./config/corsOptions');
-const { getMediaStorageState } = require('./services/mediaStorage');
-const { getShippingState } = require('./services/shippingService');
-const paymentController = require('./controllers/paymentController');
-const { wrapPaymentHandler } = require('./utils/paymentRouteHandler');
+const { adminOnly } = require('./middleware/adminMiddleware');
+const { corsOptions, getAllowedOrigins } = require('./config/corsOptions');
+const { isR2Configured } = require('./services/r2Upload');
+const { isCloudinaryConfigured } = require('./services/cloudinaryUpload');
 
 const app = express();
 
-app.disable('x-powered-by');
-app.set('trust proxy', process.env.TRUST_PROXY || 1);
-app.use(requestContext);
-app.use(secureHeaders);
+app.set('trust proxy', 1);
 app.use(cors(corsOptions));
-app.options(/.*/, cors(corsOptions));
-app.post(
-  '/api/payments/webhook',
-  rateLimit({ scope: 'payment_webhook', limit: 300, windowSeconds: 60 }),
-  express.raw({ type: 'application/json', limit: '1mb' }),
-  wrapPaymentHandler(paymentController.handleWebhook),
-);
-app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || '1mb' }));
-app.use(express.urlencoded({ extended: false, limit: '100kb' }));
-app.use(queryPollutionProtection);
-app.use(rejectUnsafeMongoKeys);
-app.use(requestCompression);
-if (process.env.NODE_ENV !== 'production') app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+app.options('*', cors(corsOptions));
+app.use(express.json({ limit: '30mb' }));
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 app.get('/uploads/:filename', sendImagePlaceholder);
 app.get('/placeholder.jpg', sendImagePlaceholder);
 
 app.get('/', (req, res) => res.json({ message: 'Samira Collection API is running' }));
-app.get('/health/live', (req, res) => res.json({ status: 'ok', requestId: req.id }));
-const readinessHandler = async (req, res) => {
+app.get('/health', (req, res) => {
   const dbStates = ['disconnected', 'connected', 'connecting', 'disconnecting'];
-  const database = dbStates[mongoose.connection.readyState] || 'unknown';
-  const media = getMediaStorageState();
-  const shipping = getShippingState();
-  const rateLimitStore = await getRateLimitStoreState();
-  const checks = {
-    environment: 'ok',
-    database,
-    mediaStorage: media.configured ? media.provider : 'not_configured',
-    redis: rateLimitStore.available
-      ? 'available'
-      : (rateLimitStore.configured ? 'unavailable' : 'not_configured'),
-    payments: process.env.PAYMENTS_ENABLED === 'true'
-      ? (process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET && process.env.RAZORPAY_WEBHOOK_SECRET ? 'configured' : 'not_configured')
-      : 'disabled',
-    shipping: shipping.enabled ? shipping.provider : 'disabled',
-  };
-  try {
-    validateEnvironment();
-  } catch {
-    checks.environment = 'invalid';
-  }
-  const requireDatabase = process.env.NODE_ENV === 'production' || process.env.REQUIRE_DATABASE === 'true';
-  const requireMedia = process.env.NODE_ENV === 'production'
-    ? process.env.REQUIRE_MEDIA_STORAGE !== 'false'
-    : process.env.REQUIRE_MEDIA_STORAGE === 'true';
-  const ready = checks.environment === 'ok'
-    && (!requireDatabase || database === 'connected')
-    && (!requireMedia || media.configured)
-    && (process.env.PAYMENTS_ENABLED !== 'true' || checks.payments === 'configured')
-    && (process.env.NODE_ENV !== 'production' || checks.redis === 'available');
-  return res.status(ready ? 200 : 503).json({ status: ready ? 'ready' : 'not_ready', checks, requestId: req.id });
-};
-app.get('/health/ready', readinessHandler);
-app.get('/health', readinessHandler);
+  const imageStorage = isR2Configured() ? 'r2' : isCloudinaryConfigured() ? 'cloudinary' : 'local';
+  const persistentImageStorageConfigured = imageStorage !== 'local';
+  res.json({
+    status: process.env.NODE_ENV === 'production' && !persistentImageStorageConfigured ? 'degraded' : 'ok',
+    database: dbStates[mongoose.connection.readyState] || 'unknown',
+    environment: process.env.NODE_ENV || 'development',
+    imageStorage,
+    persistentImageStorageConfigured,
+    allowedOrigins: getAllowedOrigins(),
+  });
+});
 
 app.use('/api', devFallback);
 
-app.use('/api/products', rateLimit({
-  scope: 'product_search',
-  limit: 120,
-  windowSeconds: 60,
-  when: (req) => req.method === 'GET' && Boolean(req.query.search),
-}));
 app.use('/api/auth', require('./routes/authRoutes'));
 app.post('/api/admin/login', require('./controllers/authController').login);
-app.use('/api/admin', auditAdminMutations);
-app.use('/api/admin/access', protect, adminOnly, ownerOnly, require('./routes/adminAccessRoutes'));
-app.use('/api/admin/audit-logs', protect, adminOnly, requirePermission('view_audit_logs'), require('./routes/adminAuditRoutes'));
-app.use('/api/admin/inventory', protect, adminOnly, requirePermission('manage_inventory'), require('./routes/adminInventoryRoutes'));
-app.use('/api/admin/customers', protect, adminOnly, requirePermission('manage_customers'), require('./routes/customerAdminRoutes'));
-app.use('/api/admin/users', protect, adminOnly, requirePermission('manage_customers'), require('./routes/customerAdminRoutes'));
+app.use('/api/admin/customers', protect, adminOnly, require('./routes/customerAdminRoutes'));
+app.use('/api/admin/users', protect, adminOnly, require('./routes/customerAdminRoutes'));
 app.use('/api/admin', require('./routes/adminAuthRoutes'));
-app.use('/api/admin/products', protect, adminOnly, requirePermission('manage_catalog', 'manage_inventory'), require('./routes/adminProductRoutes'));
-app.use('/api/admin/categories', protect, adminOnly, requirePermission('manage_catalog'), require('./routes/categoryRoutes'));
-app.use('/api/admin/orders', protect, adminOnly, requirePermission('manage_orders'), require('./routes/orderRoutes'));
-app.use('/api/admin/coupons', protect, adminOnly, requirePermission('manage_marketing'), require('./routes/couponRoutes'));
-app.use('/api/admin/banners', protect, adminOnly, requirePermission('manage_marketing'), require('./routes/bannerRoutes'));
-app.use('/api/admin/reviews', protect, adminOnly, requirePermission('manage_support'), require('./routes/reviewRoutes'));
-app.use('/api/admin/returns', protect, adminOnly, requirePermission('manage_support'), require('./routes/returnRoutes'));
-app.use('/api/admin/settings', protect, adminOnly, requirePermission('manage_settings'), require('./routes/settingsRoutes'));
-app.use('/api/admin/support', protect, adminOnly, requirePermission('manage_support'), require('./routes/adminSupportRoutes'));
-app.use('/api/admin/uploads', protect, adminOnly, requirePermission('manage_catalog'), require('./routes/uploadRoutes'));
-app.use('/api/admin/upload', protect, adminOnly, requirePermission('manage_catalog'), require('./routes/uploadRoutes'));
-app.use('/api/admin/product-drafts', protect, adminOnly, requirePermission('manage_catalog'), require('./routes/productDraftRoutes'));
-app.use('/api/admin/variant-groups', protect, adminOnly, requirePermission('manage_catalog'), require('./routes/variantGroupRoutes'));
+app.use('/api/admin/products', protect, adminOnly, require('./routes/adminProductRoutes'));
+app.use('/api/admin/categories', protect, adminOnly, require('./routes/categoryRoutes'));
+app.use('/api/admin/orders', protect, adminOnly, require('./routes/orderRoutes'));
+app.use('/api/admin/coupons', protect, adminOnly, require('./routes/couponRoutes'));
+app.use('/api/admin/banners', protect, adminOnly, require('./routes/bannerRoutes'));
+app.use('/api/admin/reviews', protect, adminOnly, require('./routes/reviewRoutes'));
+app.use('/api/admin/returns', protect, adminOnly, require('./routes/returnRoutes'));
+app.use('/api/admin/settings', protect, adminOnly, require('./routes/settingsRoutes'));
+app.use('/api/admin/uploads', require('./routes/uploadRoutes'));
+app.use('/api/admin/upload', require('./routes/uploadRoutes'));
+app.use('/api/admin/product-drafts', require('./routes/productDraftRoutes'));
+app.use('/api/admin/variant-groups', protect, adminOnly, require('./routes/variantGroupRoutes'));
 app.use('/api/products', require('./routes/publicProductRoutes'));
 app.use('/api/variant-groups', require('./routes/variantGroupRoutes'));
 app.use('/api/categories', require('./routes/categoryRoutes'));
@@ -122,32 +61,12 @@ app.use('/api/cart', require('./routes/cartRoutes'));
 app.use('/api/user/addresses', require('./routes/addressRoutes'));
 app.use('/api/wishlist', require('./routes/wishlistRoutes'));
 app.use('/api/orders', require('./routes/orderRoutes'));
-app.use('/api/payments', rateLimit({
-  scope: 'payment_api',
-  limit: 40,
-  windowSeconds: 10 * 60,
-}), require('./routes/paymentRoutes'));
-app.use('/api/invoices', require('./routes/invoiceRoutes'));
-app.use('/api/support', require('./routes/supportRoutes'));
+app.use('/api/payments', require('./routes/paymentRoutes'));
 
-app.post('/api/create-order', protect, rateLimit({
-  scope: 'payment_create_legacy',
-  limit: 20,
-  windowSeconds: 10 * 60,
-  identifiers: [
-    (req) => req.ip,
-    (req) => String(req.user._id),
-  ],
-}), wrapPaymentHandler(paymentController.createPaymentOrder));
-app.post('/api/verify-payment', protect, rateLimit({
-  scope: 'payment_verify_legacy',
-  limit: 40,
-  windowSeconds: 10 * 60,
-  identifiers: [
-    (req) => req.ip,
-    (req) => String(req.user._id),
-  ],
-}), wrapPaymentHandler(paymentController.verifyPayment));
+const paymentController = require('./controllers/paymentController');
+const { wrapPaymentHandler } = require('./utils/paymentRouteHandler');
+app.post('/api/create-order', protect, wrapPaymentHandler(paymentController.createPaymentOrder));
+app.post('/api/verify-payment', protect, wrapPaymentHandler(paymentController.verifyPayment));
 
 app.use('/api/coupons', require('./routes/couponRoutes'));
 app.use('/api/banners', require('./routes/bannerRoutes'));

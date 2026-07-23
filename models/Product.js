@@ -1,19 +1,5 @@
 const mongoose = require('mongoose');
 
-const productVariantSchema = new mongoose.Schema({
-  sku: { type: String, trim: true },
-  size: { type: String, trim: true },
-  color: { type: String, trim: true },
-  stock: { type: Number, min: 0, default: 0 },
-  reservedStock: { type: Number, min: 0, default: 0 },
-  price: { type: Number, min: 0 },
-  originalPrice: { type: Number, min: 0 },
-  barcode: { type: String, trim: true },
-  weight: { type: Number, min: 0 },
-  images: [{ url: String, publicId: String }],
-  isActive: { type: Boolean, default: true },
-}, { _id: true });
-
 const productSchema = new mongoose.Schema({
   name: { type: String, required: true },
   slug: { type: String, required: true, unique: true },
@@ -27,20 +13,6 @@ const productSchema = new mongoose.Schema({
   discountPercentage: Number,
   images: [{ url: String, publicId: String, primary: { type: Boolean, default: false } }],
   videos: [{ url: String, publicId: String, thumbnail: String }],
-  media: {
-    images: [{ url: String, alt: String, sortOrder: Number }],
-    videos: [{ url: String, thumbnailUrl: String, title: String }],
-    spin360: {
-      enabled: { type: Boolean, default: false },
-      type: { type: String, enum: ['image-sequence', 'video'], default: 'image-sequence' },
-      frames: [{ url: String, sortOrder: Number }],
-      videoUrl: String,
-      thumbnailUrl: String,
-      totalFrames: Number,
-    },
-    ar: { enabled: Boolean, glbUrl: String, usdzUrl: String, posterUrl: String, scale: String, placement: String },
-    vr: { enabled: Boolean, modelUrl: String, environmentUrl: String, posterUrl: String },
-  },
   sizes: [String],
   colors: [String],
   fabric: String,
@@ -49,9 +21,7 @@ const productSchema = new mongoose.Schema({
   variantName: String,
   variantColor: String,
   variantSize: String,
-  variants: [productVariantSchema],
-  stock: { type: Number, required: true, min: 0, default: 0 },
-  reservedStock: { type: Number, min: 0, default: 0 },
+  stock: { type: Number, required: true, default: 0 },
   lowStockAlert: { type: Number, default: 5 },
   sku: { type: String, unique: true, sparse: true },
   tags: [String],
@@ -71,11 +41,6 @@ const productSchema = new mongoose.Schema({
   showInTrending: { type: Boolean, default: false },
   showInFestive: { type: Boolean, default: false },
   isActive: { type: Boolean, default: true },
-  archivedAt: Date,
 }, { timestamps: true });
-
-productSchema.index({ isActive: 1, archivedAt: 1, category: 1, createdAt: -1 });
-productSchema.index({ isActive: 1, archivedAt: 1, price: 1 });
-productSchema.index({ 'variants.sku': 1 }, { sparse: true });
 
 module.exports = mongoose.model('Product', productSchema);

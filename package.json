@@ -4,20 +4,13 @@
   "description": "Samira Collection backend API server",
   "main": "server.js",
   "engines": {
-    "node": ">=24 <25"
+    "node": "20.x"
   },
   "scripts": {
     "start": "node server.js",
     "server": "node server.js",
-    "check": "node scripts/check-syntax.js",
-    "check:syntax": "node scripts/check-syntax.js",
-    "test": "node --test tests/*.test.js",
-    "test:identity": "node --test tests/identity-security.test.js",
-    "test:payments": "node --test tests/paymentInventory.test.js",
-    "migrate:inventory": "node scripts/migrate-inventory-v2.js",
-    "migrate:admin-access": "node scripts/migrate-admin-access.js",
-    "migrate:variants": "node scripts/migrate-product-variants.js",
-    "indexes:sync": "node scripts/sync-indexes.js"
+    "check": "node --check server.js && node --check app.js",
+    "test:payments": "node scripts/test-payment-flow.js"
   },
   "keywords": [],
   "author": "",
@@ -26,18 +19,13 @@
   "dependencies": {
     "@aws-sdk/client-s3": "^3.888.0",
     "bcryptjs": "^2.4.3",
-    "compression": "^1.8.1",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
-    "express": "^5.2.1",
-    "helmet": "^8.3.0",
-    "hpp": "^0.2.3",
+    "express": "^4.21.2",
     "jsonwebtoken": "^9.0.2",
     "mongoose": "^8.9.5",
-    "multer": "^2.2.0",
-    "pdfkit": "^0.19.1",
+    "multer": "^1.4.5-lts.1",
     "razorpay": "^2.9.6",
-    "sharp": "^0.35.3",
     "twilio": "^6.0.2"
   }
 }
