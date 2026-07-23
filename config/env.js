@@ -101,15 +101,6 @@ function validateEnvironment(env = process.env) {
     errors.push('A complete R2 or Cloudinary media storage configuration is required');
   }
 
-  if (String(env.ENABLE_REEL_PRODUCT_IMPORT || '').toLowerCase() === 'true') {
-    requireValue(env, 'REDIS_URL', errors);
-    requireValue(env, 'AI_VIDEO_WORKER_URL', errors);
-    requireStrongSecret(env, 'AI_VIDEO_WORKER_SERVICE_TOKEN', errors);
-    if (env.AI_VIDEO_WORKER_URL && !String(env.AI_VIDEO_WORKER_URL).startsWith('https://')) {
-      errors.push('AI_VIDEO_WORKER_URL must use HTTPS in production');
-    }
-  }
-
   const origins = String(env.CLIENT_ORIGINS || '').split(',').map((item) => item.trim()).filter(Boolean);
   if (!origins.length || origins.includes('*')) {
     errors.push('CLIENT_ORIGINS must be a non-wildcard production allowlist');

@@ -5,10 +5,7 @@ const { DeleteObjectCommand, S3Client, PutObjectCommand } = require('@aws-sdk/cl
 
 let r2Client;
 
-const allowedFolders = new Set([
-  'products', 'categories', 'banners', 'product-videos', 'product-models',
-  'reel-imports/original', 'reel-imports/normalized', 'reel-imports/frames', 'reel-imports/candidates',
-]);
+const allowedFolders = new Set(['products', 'categories', 'banners', 'product-videos', 'product-models']);
 const allowedExtensions = new Set(['jpg', 'png', 'webp', 'mp4', 'webm', 'mov', 'glb', 'usdz']);
 const safeContentTypes = new Set([
   'image/jpeg',
