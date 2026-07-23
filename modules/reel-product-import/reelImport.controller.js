@@ -158,7 +158,7 @@ async function getUploadCapabilities(req, res) {
     success: true,
     data: {
       directUploadSupported: false,
-      uploadEndpoint: '/admin/reel-imports',
+      uploadEndpoint: '/api/admin/reel-imports',
       formats: ['MP4', 'MOV', 'WebM'],
       maxDurationSeconds: config.maxDurationSeconds,
       maxFileSizeMb: config.maxFileSizeMb,

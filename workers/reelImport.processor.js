@@ -56,7 +56,10 @@ async function processReelImportJob({ jobId, storageKey }) {
 
 async function requestAiWorker(job) {
   const config = getReelImportConfig();
-  const baseUrl = String(process.env.AI_VIDEO_WORKER_URL || '').replace(/\/$/, '');
+  const configuredUrl = String(process.env.AI_VIDEO_WORKER_URL || '').replace(/\/$/, '');
+  const baseUrl = configuredUrl && !/^https?:\/\//i.test(configuredUrl)
+    ? `http://${configuredUrl}`
+    : configuredUrl;
   const token = process.env.AI_VIDEO_WORKER_SERVICE_TOKEN;
   if (!baseUrl || !token) {
     throw processingError('AI_WORKER_UNAVAILABLE', 'The video processing worker is not configured.');
@@ -84,7 +87,8 @@ async function requestAiWorker(job) {
     });
     const data = await response.json().catch(() => ({}));
     if (!response.ok) {
-      throw processingError(data.code || 'AI_WORKER_FAILED', data.message || 'Video processing failed.');
+      const safeError = data.detail && typeof data.detail === 'object' ? data.detail : data;
+      throw processingError(safeError.code || 'AI_WORKER_FAILED', safeError.message || 'Video processing failed.');
     }
     return data;
   } catch (error) {
