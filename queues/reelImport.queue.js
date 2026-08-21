@@ -47,22 +47,16 @@ async function enqueueReelImport({ jobId, storageKey }) {
     return { mode: 'redis' };
   }
 
-  if (process.env.NODE_ENV === 'production') {
-    const error = new Error('Background processing is unavailable. Configure Redis and try again.');
-    error.code = 'REEL_QUEUE_UNAVAILABLE';
-    error.statusCode = 503;
-    throw error;
-  }
-
-  setImmediate(() => {
+  setTimeout(() => {
     require('../workers/reelImport.processor').processReelImportJob(payload)
       .catch((error) => console.error(JSON.stringify({
         event: 'reel_import_dev_worker_failed',
         jobId: payload.jobId,
         code: error.code || 'PROCESSING_FAILED',
+        message: error.message,
       })));
-  });
-  return { mode: 'development-fallback' };
+  }, 25);
+  return { mode: 'in-process' };
 }
 
 async function removeQueuedReelImport(jobId) {

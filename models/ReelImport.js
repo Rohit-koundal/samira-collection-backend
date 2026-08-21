@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const storeIdPlugin = require('./plugins/storeId');
 
 const reelImportSchema = new mongoose.Schema({
   createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
@@ -50,6 +51,7 @@ const reelImportSchema = new mongoose.Schema({
   retentionExpiresAt: { type: Date, index: true },
 }, { timestamps: true });
 
+reelImportSchema.plugin(storeIdPlugin);
 reelImportSchema.index({ createdBy: 1, createdAt: -1 });
 reelImportSchema.index({ status: 1, createdAt: -1 });
 

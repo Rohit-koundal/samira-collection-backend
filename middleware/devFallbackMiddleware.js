@@ -1,5 +1,6 @@
 const mongoose = require('mongoose');
 const jwt = require('jsonwebtoken');
+const { getJwtSecret } = require('../config/env');
 
 const categories = [
   { _id: 'cat-sarees', id: 'cat-sarees', name: 'Sarees', slug: 'sarees', count: 128, description: 'Silk and festive drapes', isActive: true, displayOrder: 1 },
@@ -58,6 +59,13 @@ const settings = {
   address: 'Jaipur, Rajasthan',
   freeShippingMinAmount: 999,
   deliveryCharge: 99,
+  codEnabled: true,
+  codCharge: 0,
+  razorpayEnabled: false,
+  upiEnabled: true,
+  cardPaymentEnabled: true,
+  netBankingEnabled: true,
+  walletEnabled: true,
   returnPolicy: 'Return/exchange as per store policy.',
 };
 
@@ -132,6 +140,7 @@ function devFallback(req, res, next) {
   if (method === 'GET' && path === '/categories') return res.json(categories);
   if (method === 'GET' && path === '/banners') return res.json(banners);
   if (method === 'GET' && path === '/settings') return res.json(settings);
+  if (method === 'GET' && path === '/settings/payment-methods') return res.json(devPaymentMethods());
   if (method === 'GET' && path === '/coupons') return res.json(coupons);
   if (method === 'POST' && path === '/coupons/apply') return applyCoupon(req, res);
   if (method === 'GET' && path.startsWith('/reviews/')) return res.json([]);
@@ -408,6 +417,16 @@ function handleOrders(req, res, admin = false) {
     if (!admin && String(order.user || '') !== currentUserId) return res.status(403).json({ message: 'Not allowed to view this order' });
     return order ? res.json(order) : res.status(404).json({ message: 'Order not found' });
   }
+  if (req.method === 'POST' && req.path.endsWith('/quote')) {
+    const priced = priceDevOrder(req.body);
+    const payment = devPaymentMethods();
+    return res.json({
+      paymentMethod: priced.paymentMethod,
+      items: priced.orderItems,
+      totals: priced.orderItems.length ? priced.totals : null,
+      paymentOptions: payment.methods,
+    });
+  }
   if (req.method === 'POST' && (req.path === '/orders' || req.path === '/orders/cod')) {
     if (!currentUserId) return res.status(401).json({ message: 'Not authorized' });
     const order = createOrder(req.body, currentUser);
@@ -478,25 +497,70 @@ function handleReturns(req, res, admin = false) {
   return res.status(405).json({ message: 'Method not allowed' });
 }
 
-function createOrder(body, user) {
-  const orderItems = Array.isArray(body.orderItems) ? body.orderItems : [];
-  const totalMRP = orderItems.reduce((sum, item) => sum + Number(item.originalPrice || item.price || 0) * Number(item.quantity || 1), 0);
-  const sellingTotal = orderItems.reduce((sum, item) => sum + Number(item.price || 0) * Number(item.quantity || 1), 0);
+/**
+ * Mirrors the real pricing service: prices come from the catalogue, never
+ * from the request, so offline development behaves like production.
+ */
+function priceDevOrder(body = {}) {
+  const requested = Array.isArray(body.orderItems) ? body.orderItems : [];
+  const orderItems = requested.map((item) => {
+    const productId = String(item.product || item.productId || '');
+    const product = products.find((entry) => String(entry._id) === productId) || {};
+    const quantity = Math.max(1, Number(item.quantity || 1));
+    return {
+      product: productId,
+      name: product.name || item.name || 'Product',
+      image: Array.isArray(product.images) ? product.images[0] : '',
+      size: item.size || '',
+      color: item.color || '',
+      variantId: item.variantId || '',
+      quantity,
+      price: Number(product.price || 0),
+      originalPrice: Number(product.originalPrice || product.price || 0),
+    };
+  });
+
+  const totalMRP = orderItems.reduce((sum, item) => sum + item.originalPrice * item.quantity, 0);
+  const sellingTotal = orderItems.reduce((sum, item) => sum + item.price * item.quantity, 0);
+  const method = String(body.paymentMethod || 'COD').toUpperCase();
+
+  const coupon = coupons.find((entry) => entry.code === String(body.coupon?.code || '').toUpperCase());
+  const rawDiscount = coupon
+    ? (coupon.type === 'Percentage' ? (sellingTotal * Number(coupon.discountValue || 0)) / 100 : Number(coupon.discountValue || 0))
+    : 0;
+  const couponDiscount = Math.min(rawDiscount, Number(coupon?.maxDiscountAmount || rawDiscount), sellingTotal);
+
   const deliveryCharge = sellingTotal >= Number(settings.freeShippingMinAmount || 999) ? 0 : Number(settings.deliveryCharge || 99);
+  const codCharge = method === 'COD' ? Number(settings.codCharge || 0) : 0;
+
+  return {
+    orderItems,
+    paymentMethod: method,
+    totals: {
+      totalMRP,
+      productDiscount: Math.max(0, totalMRP - sellingTotal),
+      couponDiscount,
+      discount: Math.max(0, totalMRP - sellingTotal) + couponDiscount,
+      deliveryCharge,
+      codCharge,
+      finalAmount: Math.max(0, sellingTotal - couponDiscount + deliveryCharge + codCharge),
+      coupon: coupon ? { code: coupon.code, discountAmount: couponDiscount } : undefined,
+    },
+  };
+}
+
+function createOrder(body, user) {
+  const { orderItems, paymentMethod, totals } = priceDevOrder(body);
   return createItem(orders, {
     ...body,
     user: user?._id || user?.id,
     orderItems,
-    paymentMethod: body.paymentMethod || 'COD',
-    paymentProvider: body.paymentProvider || 'COD',
+    paymentMethod,
+    paymentProvider: body.paymentProvider || (paymentMethod === 'COD' ? 'COD' : 'Razorpay'),
     paymentStatus: body.paymentStatus || 'Pending',
+    paymentState: body.paymentState || 'PENDING',
     orderStatus: body.orderStatus || 'Pending',
-    totalMRP,
-    productDiscount: Math.max(0, totalMRP - sellingTotal),
-    couponDiscount: Number(body.coupon?.discountAmount || 0),
-    deliveryCharge,
-    codCharge: 0,
-    finalAmount: Number(body.finalAmount || Math.max(0, sellingTotal - Number(body.coupon?.discountAmount || 0) + deliveryCharge)),
+    ...totals,
     statusTimeline: [{ status: 'Pending', date: new Date().toISOString(), note: 'Dev fallback order placed' }],
   }, 'dev-order');
 }
@@ -689,6 +753,18 @@ function slugify(value = '') {
   return String(value).trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || `dev-${Date.now()}`;
 }
 
+function devPaymentMethods() {
+  const { buildPaymentOptions } = require('../services/paymentSettingsService');
+  const { isRazorpayConfigured } = require('../services/razorpayService');
+  return {
+    methods: buildPaymentOptions(settings, { razorpayConfigured: isRazorpayConfigured() }),
+    codCharge: Number(settings.codCharge || 0),
+    codMaxAmount: Number(settings.codMaxAmount || 0) || null,
+    deliveryCharge: Number(settings.deliveryCharge),
+    freeShippingMinAmount: Number(settings.freeShippingMinAmount),
+  };
+}
+
 function devUser(role = 'customer') {
   return {
     _id: `offline-${role}`,
@@ -708,7 +784,7 @@ function resolveDevRequestUser(req) {
   if (!token) return null;
 
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'dev_secret_change_me');
+    const decoded = jwt.verify(token, getJwtSecret());
     const id = decoded.userId || decoded.id;
     if (!id) return null;
 

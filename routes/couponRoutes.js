@@ -1,9 +1,9 @@
 const router = require('express').Router();
 const coupon = require('../controllers/couponController');
-const { protect } = require('../middleware/authMiddleware');
+const { optionalProtect, protect } = require('../middleware/authMiddleware');
 const { adminOnly } = require('../middleware/adminMiddleware');
 router.get('/', coupon.getCoupons);
-router.post('/apply', coupon.applyCoupon);
+router.post('/apply', optionalProtect, coupon.applyCoupon);
 router.post('/', protect, adminOnly, coupon.createCoupon);
 router.put('/:id', protect, adminOnly, coupon.updateCoupon);
 router.delete('/:id', protect, adminOnly, coupon.deleteCoupon);

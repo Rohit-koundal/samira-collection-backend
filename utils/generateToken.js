@@ -1,4 +1,5 @@
 const jwt = require('jsonwebtoken');
+const { getJwtRefreshSecret, getJwtSecret } = require('../config/env');
 
 function tokenPayload(user) {
   const id = user._id || user.id || user;
@@ -14,7 +15,7 @@ function tokenPayload(user) {
 }
 
 function generateToken(user) {
-  return jwt.sign(tokenPayload(user), process.env.JWT_SECRET || 'dev_secret_change_me', {
+  return jwt.sign(tokenPayload(user), getJwtSecret(), {
     expiresIn: process.env.JWT_EXPIRES_IN || '15m',
   });
 }
@@ -22,7 +23,7 @@ function generateToken(user) {
 function generateRefreshToken(user) {
   return jwt.sign(
     { ...tokenPayload(user), tokenType: 'refresh' },
-    process.env.JWT_REFRESH_SECRET || process.env.JWT_SECRET || 'dev_secret_change_me',
+    getJwtRefreshSecret(),
     { expiresIn: process.env.JWT_REFRESH_EXPIRES_IN || '30d' },
   );
 }

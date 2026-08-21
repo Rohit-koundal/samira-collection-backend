@@ -1,0 +1,73 @@
+const Order = require('../models/Order');
+const Shipment = require('../models/Shipment');
+const { ApiError, notFound } = require('../utils/apiError');
+const { notifyLater } = require('./notificationService');
+
+function toShipmentStatus(orderStatus) {
+  if (orderStatus === 'Packed') return 'READY_TO_SHIP';
+  if (orderStatus === 'Shipped') return 'SHIPPED';
+  if (orderStatus === 'Out for Delivery') return 'OUT_FOR_DELIVERY';
+  if (orderStatus === 'Delivered') return 'DELIVERED';
+  return null;
+}
+
+async function upsertShipmentForOrder(order, { courierName, trackingNumber, trackingUrl, awb, status, note } = {}) {
+  if (!order) throw notFound('Order not found');
+
+  const nextStatus = status || toShipmentStatus(order.orderStatus) || 'READY_TO_SHIP';
+  const payload = {
+    courierName: courierName || undefined,
+    trackingNumber: trackingNumber || undefined,
+    trackingUrl: trackingUrl || undefined,
+    awb: awb || trackingNumber || undefined,
+    status: nextStatus,
+  };
+
+  let shipment = order.shipment
+    ? await Shipment.findById(order.shipment._id || order.shipment)
+    : await Shipment.findOne({ order: order._id });
+
+  if (!shipment) {
+    shipment = await Shipment.create({
+      order: order._id,
+      storeId: order.storeId || undefined,
+      provider: 'manual',
+      events: [{ status: nextStatus, note: note || 'Shipment created', date: new Date() }],
+      ...payload,
+    });
+    order.shipment = shipment._id;
+    await order.save();
+  } else {
+    Object.assign(shipment, Object.fromEntries(Object.entries(payload).filter(([, value]) => value !== undefined)));
+    if (!shipment.storeId && order.storeId) shipment.storeId = order.storeId;
+    shipment.events.push({ status: nextStatus, note: note || `Status set to ${nextStatus}`, date: new Date() });
+    await shipment.save();
+  }
+
+  if (['SHIPPED', 'IN_TRANSIT', 'OUT_FOR_DELIVERY'].includes(nextStatus)) {
+    notifyLater({
+      userId: order.user,
+      event: 'ORDER_SHIPPED',
+      title: 'Your order is on the way',
+      message: shipment.trackingNumber
+        ? `Tracking ${shipment.trackingNumber}${shipment.courierName ? ` via ${shipment.courierName}` : ''}`
+        : 'Your order has been shipped.',
+      metadata: { orderId: String(order._id), shipmentId: String(shipment._id) },
+    });
+  }
+
+  return shipment;
+}
+
+async function getShipmentForOrder(orderId) {
+  const order = await Order.findById(orderId).select('shipment');
+  if (!order) throw new ApiError('NOT_FOUND', 'Order not found');
+  if (order.shipment) return Shipment.findById(order.shipment);
+  return Shipment.findOne({ order: orderId });
+}
+
+module.exports = {
+  getShipmentForOrder,
+  toShipmentStatus,
+  upsertShipmentForOrder,
+};

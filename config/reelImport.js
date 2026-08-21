@@ -5,7 +5,8 @@ function readNumber(name, fallback, { min = 0, max = Number.MAX_SAFE_INTEGER } =
 }
 
 function isReelImportEnabled() {
-  return String(process.env.ENABLE_REEL_PRODUCT_IMPORT || '').toLowerCase() === 'true';
+  const raw = String(process.env.ENABLE_REEL_PRODUCT_IMPORT ?? 'true').trim().toLowerCase();
+  return raw === 'true' || raw === '1' || raw === 'yes';
 }
 
 function getReelImportConfig() {

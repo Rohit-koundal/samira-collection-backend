@@ -2,6 +2,8 @@ const router = require('express').Router();
 const product = require('../controllers/productController');
 
 router.get('/', product.getProducts);
+router.get('/quick-analyze/status', product.getQuickAddVisionStatus);
+router.post('/quick-analyze', product.analyzeQuickAdd);
 router.get('/:id', product.getProductById);
 router.post('/', product.createProduct);
 router.put('/:id', product.updateProduct);

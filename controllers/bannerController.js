@@ -1,7 +1,16 @@
 const Banner = require('../models/Banner');
 const { deleteImageFromR2, isR2Configured } = require('../services/r2Upload');
+const { andFilter } = require('../services/storeService');
+
+function withStoreId(payload, req) {
+  const next = { ...payload };
+  delete next.storeId;
+  if (req.store?._id) next.storeId = req.store._id;
+  return next;
+}
+
 exports.getBanners = async (req, res) => {
-  const query = req.query.admin === 'true' ? {} : { isActive: true };
+  const query = andFilter(req.query.admin === 'true' || String(req.baseUrl || '').includes('/seller') ? {} : { isActive: true }, req.tenantFilter);
   res.json(await Banner.find(query).sort('displayOrder'));
 };
 exports.getBannerById = async (req, res) => {
@@ -13,7 +22,7 @@ exports.createBanner = async (req, res) => {
   if (!req.body.title) return res.status(400).json({ message: 'Banner title is required' });
   if (!req.body.image) return res.status(400).json({ message: 'Banner image is required' });
   if (req.body.image?.startsWith('data:')) return res.status(400).json({ message: 'Banner image must be an uploaded file URL' });
-  res.status(201).json(await Banner.create(normalizeBannerPayload(req.body)));
+  res.status(201).json(await Banner.create(withStoreId(normalizeBannerPayload(req.body), req)));
 };
 exports.updateBanner = async (req, res) => {
   if (req.body.image?.startsWith('data:')) return res.status(400).json({ message: 'Banner image must be an uploaded file URL' });

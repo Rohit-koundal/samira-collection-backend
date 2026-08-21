@@ -1,9 +1,17 @@
 const Category = require('../models/Category');
 const slugify = require('../utils/slugify');
 const { deleteImageFromR2, isR2Configured } = require('../services/r2Upload');
+const { andFilter } = require('../services/storeService');
+
+function withStoreId(payload, req) {
+  const next = { ...payload };
+  delete next.storeId;
+  if (req.store?._id) next.storeId = req.store._id;
+  return next;
+}
 
 exports.getCategories = async (req, res) => {
-  const query = req.query.admin === 'true' ? {} : { isActive: true };
+  const query = andFilter(req.query.admin === 'true' || String(req.baseUrl || '').includes('/seller') ? {} : { isActive: true }, req.tenantFilter);
   res.json(await Category.find(query).sort('displayOrder name'));
 };
 exports.getCategoryById = async (req, res) => {
@@ -15,7 +23,7 @@ exports.createCategory = async (req, res) => {
   if (!req.body.name || req.body.name.trim().length < 2) return res.status(400).json({ message: 'Category name is required' });
   if (req.body.image?.startsWith('data:')) return res.status(400).json({ message: 'Category image must be an uploaded file URL' });
   const slug = req.body.slug?.trim() || slugify(req.body.name);
-  res.status(201).json(await Category.create({ ...req.body, name: req.body.name.trim(), slug }));
+  res.status(201).json(await Category.create(withStoreId({ ...req.body, name: req.body.name.trim(), slug }, req)));
 };
 exports.updateCategory = async (req, res) => {
   const existingCategory = await Category.findById(req.params.id);

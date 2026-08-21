@@ -9,5 +9,7 @@ router.delete('/admin/:id', protect, adminOnly, review.deleteReview);
 router.patch('/:id/visibility', protect, adminOnly, review.toggleVisibility);
 router.delete('/:id', protect, adminOnly, review.deleteReview);
 router.post('/:productId', protect, review.createReview);
+router.get('/:productId/mine', protect, review.getMyReview);
+router.put('/:id', protect, review.updateReview);
 router.get('/:productId', review.getReviews);
 module.exports = router;

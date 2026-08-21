@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const storeIdPlugin = require('./plugins/storeId');
 
 const imageSchema = new mongoose.Schema({
   url: String,
@@ -38,6 +39,15 @@ const productDraftSchema = new mongoose.Schema({
   sourceType: { type: String, enum: ['reel-import'], default: undefined },
   sourceJobId: { type: mongoose.Schema.Types.ObjectId, ref: 'ReelImport', default: undefined },
   sourceCandidateId: { type: mongoose.Schema.Types.ObjectId, ref: 'ReelCandidate', unique: true, sparse: true, default: undefined },
+  confidence: { type: Number, min: 0, max: 1 },
+  detectedColors: [String],
+  detectedPattern: String,
+  suggestedCategory: String,
+  suggestedTags: [String],
+  draftTitle: String,
+  draftDescription: String,
 }, { timestamps: true });
+
+productDraftSchema.plugin(storeIdPlugin);
 
 module.exports = mongoose.model('ProductDraft', productDraftSchema);

@@ -55,6 +55,7 @@ async function processReelImportJob({ jobId, storageKey }) {
     structuredLog('reel_import_failed', jobId, {
       durationMs: Date.now() - started,
       code: error.code || 'REEL_PROCESSING_FAILED',
+      message: error.message,
     });
     throw error;
   }
@@ -67,8 +68,16 @@ async function requestAiWorker(job) {
     ? `http://${configuredUrl}`
     : configuredUrl;
   const token = process.env.AI_VIDEO_WORKER_SERVICE_TOKEN;
+
   if (!baseUrl || !token) {
-    throw processingError('AI_WORKER_UNAVAILABLE', 'The video processing worker is not configured.');
+    // Local/dev path: process with bundled ffmpeg when the Python worker is not configured.
+    try {
+      job.progress = { percentage: 25, currentStep: 'Extracting frames', message: 'Reading the reel and preparing product photos.' };
+      await job.save().catch(() => null);
+      return await require('../services/localReelProcessor.service').processReelLocally(job);
+    } catch (error) {
+      throw processingError(error.code || 'REEL_PROCESSING_FAILED', error.message || 'Video processing failed.');
+    }
   }
 
   const controller = new AbortController();
@@ -134,9 +143,10 @@ function safeProcessingMessage(error) {
     'INVALID_VIDEO',
     'FFMPEG_UNAVAILABLE',
     'STORAGE_FAILURE',
+    'REEL_JOB_NOT_FOUND',
   ]);
-  if (safeCodes.has(error.code)) return error.message;
-  return 'The reel could not be processed. Please retry or upload a clearer video.';
+  if (safeCodes.has(error.code) && error.message) return error.message;
+  return error.message || 'The reel could not be processed. Please retry or upload a clearer video.';
 }
 
 function processingError(code, message) {

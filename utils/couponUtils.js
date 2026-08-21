@@ -1,11 +1,11 @@
-const Coupon = require('../models/Coupon');
+const couponService = require('../services/couponService');
 
-async function incrementCouponUsage(couponCode) {
-  if (!couponCode) return;
-  await Coupon.findOneAndUpdate(
-    { code: String(couponCode).toUpperCase() },
-    { $inc: { usedCount: 1 } },
-  );
+/**
+ * @deprecated Use couponService.consumeCoupon. Kept as a thin wrapper so any
+ * leftover caller still goes through the usage-limit-safe path.
+ */
+async function incrementCouponUsage(couponCode, options) {
+  return couponService.consumeCoupon(couponCode, options);
 }
 
 module.exports = {

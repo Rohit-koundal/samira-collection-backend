@@ -1,23 +1,24 @@
 const jwt = require('jsonwebtoken');
 const mongoose = require('mongoose');
 const User = require('../models/User');
+const { getJwtSecret } = require('../config/env');
 
 async function protect(req, res, next) {
   const header = req.headers.authorization || '';
   const token = header.startsWith('Bearer ') ? header.split(' ')[1] : null;
-  if (!token) return res.status(401).json({ message: 'Not authorized' });
+  if (!token) return res.status(401).json({ success: false, code: 'UNAUTHORIZED', message: 'Not authorized' });
 
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'dev_secret_change_me');
+    const decoded = jwt.verify(token, getJwtSecret());
     if (canUseOfflineSession(decoded)) {
       req.user = buildOfflineUser(decoded);
       return next();
     }
     req.user = await User.findById(decoded.id).select('-password');
-    if (!req.user || req.user.isBlocked) return res.status(401).json({ message: 'Account unavailable' });
+    if (!req.user || req.user.isBlocked) return res.status(401).json({ success: false, code: 'UNAUTHORIZED', message: 'Account unavailable' });
     next();
   } catch (error) {
-    res.status(401).json({ message: 'Token failed' });
+    res.status(401).json({ success: false, code: 'UNAUTHORIZED', message: 'Token failed' });
   }
 }
 
@@ -45,4 +46,29 @@ function buildOfflineUser(decoded) {
   return user;
 }
 
-module.exports = { protect };
+/**
+ * Attaches req.user when a valid token is present, but never fails the
+ * request. Used by preview endpoints such as coupon apply so a logged-in
+ * customer's first-order / per-customer limits can be checked without
+ * blocking guests.
+ */
+async function optionalProtect(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.split(' ')[1] : null;
+  if (!token) return next();
+
+  try {
+    const decoded = jwt.verify(token, getJwtSecret());
+    if (canUseOfflineSession(decoded)) {
+      req.user = buildOfflineUser(decoded);
+      return next();
+    }
+    const user = await User.findById(decoded.id).select('-password');
+    if (user && !user.isBlocked) req.user = user;
+  } catch {
+    // Invalid tokens are ignored here; the caller is still anonymous.
+  }
+  return next();
+}
+
+module.exports = { optionalProtect, protect };

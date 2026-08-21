@@ -1,5 +1,6 @@
 const fs = require('fs');
 const fsp = require('fs/promises');
+const path = require('path');
 const { pipeline } = require('stream/promises');
 const {
   DeleteObjectCommand,
@@ -57,12 +58,15 @@ async function uploadGeneratedImage(file) {
 }
 
 async function objectExists({ provider, storageKey, url }) {
-  if (provider === 'r2') {
+  if (provider === 'r2' && isR2Configured()) {
     try {
       await getR2Client().send(new HeadObjectCommand({ Bucket: process.env.R2_BUCKET_NAME, Key: storageKey }));
       return true;
     } catch {
-      return false;
+      const publicUrl = url || buildPublicUrl(storageKey);
+      if (!publicUrl) return false;
+      const response = await fetch(publicUrl, { method: 'HEAD', signal: AbortSignal.timeout(12000) }).catch(() => null);
+      return Boolean(response?.ok);
     }
   }
   if (provider === 'cloudinary' && url) {
@@ -72,19 +76,46 @@ async function objectExists({ provider, storageKey, url }) {
   return false;
 }
 
-async function downloadObject({ provider, storageKey, url }, destinationPath) {
-  if (provider === 'r2') {
-    const response = await getR2Client().send(new GetObjectCommand({
-      Bucket: process.env.R2_BUCKET_NAME,
-      Key: storageKey,
-    }));
-    await pipeline(response.Body, fs.createWriteStream(destinationPath, { flags: 'wx' }));
-    return destinationPath;
+async function writeBodyToFile(body, destinationPath) {
+  await fsp.mkdir(path.dirname(destinationPath), { recursive: true });
+  if (body && typeof body.transformToByteArray === 'function') {
+    const bytes = await body.transformToByteArray();
+    await fsp.writeFile(destinationPath, Buffer.from(bytes));
+    return;
   }
-  const readUrl = await createSignedReadUrl({ provider, storageKey, url });
-  const response = await fetch(readUrl);
-  if (!response.ok || !response.body) throw new Error('Unable to download stored reel.');
-  await pipeline(response.body, fs.createWriteStream(destinationPath, { flags: 'wx' }));
+  await pipeline(body, fs.createWriteStream(destinationPath));
+}
+
+async function downloadObject({ provider, storageKey, url }, destinationPath) {
+  const errors = [];
+  if (provider === 'r2' && isR2Configured()) {
+    try {
+      const response = await getR2Client().send(new GetObjectCommand({
+        Bucket: process.env.R2_BUCKET_NAME,
+        Key: storageKey,
+      }));
+      await writeBodyToFile(response.Body, destinationPath);
+      return destinationPath;
+    } catch (error) {
+      errors.push(error.message);
+    }
+  }
+
+  const readUrl = url || (provider === 'r2' ? buildPublicUrl(storageKey) : '');
+  if (!readUrl) {
+    const failure = new Error(errors[0] || 'Unable to download stored reel.');
+    failure.code = 'STORAGE_FAILURE';
+    throw failure;
+  }
+
+  const response = await fetch(readUrl, { signal: AbortSignal.timeout(120000) });
+  if (!response.ok) {
+    const failure = new Error(errors[0] || 'The stored reel could not be downloaded from cloud storage.');
+    failure.code = 'STORAGE_FAILURE';
+    throw failure;
+  }
+  await fsp.mkdir(path.dirname(destinationPath), { recursive: true });
+  await fsp.writeFile(destinationPath, Buffer.from(await response.arrayBuffer()));
   return destinationPath;
 }
 

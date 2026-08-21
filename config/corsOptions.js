@@ -35,7 +35,13 @@ function isAllowedRenderOrigin(origin) {
 function isLocalhostOrigin(origin) {
   try {
     const url = new URL(origin);
-    return url.protocol === 'http:' && ['localhost', '127.0.0.1'].includes(url.hostname);
+    if (url.protocol !== 'http:') return false;
+    const { hostname } = url;
+    if (['localhost', '127.0.0.1'].includes(hostname)) return true;
+    if (/^192\.168\.\d{1,3}\.\d{1,3}$/.test(hostname)) return true;
+    if (/^10\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(hostname)) return true;
+    if (/^172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}$/.test(hostname)) return true;
+    return false;
   } catch (error) {
     return false;
   }
@@ -59,7 +65,7 @@ function corsOptions(req, callback) {
     return callback(null, {
       origin: true,
       methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-      allowedHeaders: ['Content-Type', 'Authorization'],
+      allowedHeaders: ['Content-Type', 'Authorization', 'x-session-id', 'x-store-slug', 'x-store-id', 'x-request-id'],
       maxAge: 86400,
     });
   }

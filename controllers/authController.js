@@ -5,21 +5,55 @@ const { generateRefreshToken, generateToken } = require('../utils/generateToken'
 const { normalizePhone, normalizeEmail, createOtp, createEmailOtp, hashOtp, verifyOtp: verifyOtpRecord, verifyEmailOtp: verifyEmailOtpRecord } = require('../services/otpService');
 const { sendOtp } = require('../services/smsService');
 const { sendOtpEmail } = require('../services/emailService');
+const { getDemoOtp, getJwtRefreshSecret, getJwtSecret, getOtpMode, isDemoOtpMode } = require('../config/env');
+const { ApiError } = require('../utils/apiError');
+const { optionalEmail, requireIndianMobile, requireString } = require('../utils/validators');
+const { listMemberships } = require('../services/storeService');
 
 const otpRateLimit = new Map();
 const offlineProfiles = new Map();
 const PROFILE_VERIFICATION_TOKEN_TTL = process.env.PROFILE_VERIFICATION_TOKEN_TTL || '15m';
-const TEST_OTP = '123456';
 
-exports.register = async (req, res) => {
-  const user = await User.create(req.body);
-  res.status(201).json(authPayload(user));
+/**
+ * Public self-service registration. Only the fields below may come from the
+ * client; role, mode and verification flags are always decided server-side so
+ * a crafted request cannot create an admin or a pre-verified account.
+ */
+exports.register = async (req, res, next) => {
+  try {
+    const name = requireString(req.body?.name, 'name', { max: 80 });
+    const phone = requireIndianMobile(req.body?.phone);
+    const email = optionalEmail(req.body?.email);
+    const password = requireString(req.body?.password, 'password', { min: 6, max: 128 });
+
+    const existing = await User.findOne(email ? { $or: [{ phone }, { email }] } : { phone }).select('_id');
+    if (existing) throw new ApiError('VALIDATION_ERROR', 'An account already exists with these details. Please login instead.');
+
+    const user = await User.create({
+      name,
+      phone,
+      ...(email ? { email } : {}),
+      password,
+      role: 'customer',
+      activeMode: 'customer',
+      availableModes: ['customer'],
+      isPhoneVerified: false,
+      isEmailVerified: false,
+      isBlocked: false,
+    });
+
+    res.status(201).json(authPayload(user));
+  } catch (error) {
+    next(error);
+  }
 };
 
 exports.login = async (req, res) => {
-  const { email, password } = req.body;
-  const user = await User.findOne({ email });
-  if (!user || !(await user.matchPassword(password))) return res.status(401).json({ message: 'Invalid credentials' });
+  const email = String(req.body?.email || '').trim().toLowerCase();
+  const password = String(req.body?.password || '');
+  const user = email ? await User.findOne({ email }) : null;
+  if (!user || !(await user.matchPassword(password))) return res.status(401).json({ success: false, code: 'UNAUTHORIZED', message: 'Invalid credentials' });
+  if (user.isBlocked) return res.status(403).json({ success: false, code: 'FORBIDDEN', message: 'Account is blocked' });
   const shouldUpgradePassword = user.hasLegacyPlainPassword?.();
   if (user.role === 'admin') {
     user.availableModes = ['customer', 'admin'];
@@ -125,13 +159,9 @@ exports.sendProfilePhoneChangeOtp = async (req, res) => {
 
     const { otp, record } = await createOtp(phone, 'profile_phone_change', req);
     const delivery = await deliverOtpWithFallback(phone, otp, record);
-    return res.json({
-      success: true,
-      message: 'OTP sent successfully',
-      ...(delivery.devOtp ? { devOtp: delivery.devOtp } : {}),
-    });
+    return res.json({ success: true, message: 'OTP sent successfully', ...otpResponse(delivery) });
   } catch (error) {
-    res.status(error.statusCode || 400).json({ message: error.message });
+    res.status(error.statusCode || 400).json({ success: false, code: error.errorCode, message: error.message });
   }
 };
 
@@ -162,13 +192,15 @@ exports.sendProfileEmailChangeOtp = async (req, res) => {
 
     const { otp } = await createEmailOtp(email, 'profile_email_change', req);
     const delivery = await sendOtpEmail(email, otp);
+    const exposeDemoOtp = isDemoOtpMode() && delivery?.devOtp;
     return res.json({
       success: true,
       message: 'OTP sent successfully',
-      ...(delivery.devOtp ? { devOtp: delivery.devOtp } : {}),
+      otpMode: getOtpMode(),
+      ...(exposeDemoOtp ? { demoOtp: delivery.devOtp, devOtp: delivery.devOtp } : {}),
     });
   } catch (error) {
-    res.status(error.statusCode || 400).json({ message: error.message });
+    res.status(error.statusCode || 400).json({ success: false, code: error.errorCode, message: error.message });
   }
 };
 
@@ -210,11 +242,9 @@ exports.sendOtp = async (req, res) => {
 
     const { otp, record } = await createOtp(phone, 'login', req);
     const delivery = await deliverOtpWithFallback(phone, otp, record);
-    const response = { success: true, message: 'OTP sent successfully' };
-    if (delivery.devOtp) response.devOtp = delivery.devOtp;
-    res.json(response);
+    res.json({ success: true, message: 'OTP sent successfully', ...otpResponse(delivery) });
   } catch (error) {
-    res.status(error.statusCode || 400).json({ message: error.message });
+    res.status(error.statusCode || 400).json({ success: false, code: error.errorCode, message: error.message });
   }
 };
 
@@ -232,7 +262,20 @@ exports.verifyOtp = async (req, res) => {
   }
 };
 
-exports.me = async (req, res) => res.json(sanitize(req.user));
+exports.me = async (req, res) => {
+  const data = sanitize(req.user);
+  if (!req.user.offlineSession) {
+    const memberships = await listMemberships(req.user._id);
+    data.stores = memberships.map((item) => ({
+      id: String(item.store?._id || ''),
+      name: item.store?.name,
+      slug: item.store?.slug,
+      role: item.role,
+      status: item.store?.status,
+    }));
+  }
+  res.json(data);
+};
 
 exports.logout = async (req, res) => {
   res.json({ success: true, message: 'Logged out successfully' });
@@ -243,7 +286,7 @@ exports.refresh = async (req, res) => {
   if (!token) return res.status(401).json({ message: 'Refresh token required' });
 
   try {
-    const decoded = jwt.verify(token, process.env.JWT_REFRESH_SECRET || process.env.JWT_SECRET || 'dev_secret_change_me');
+    const decoded = jwt.verify(token, getJwtRefreshSecret());
     if (decoded.tokenType !== 'refresh') return res.status(401).json({ message: 'Invalid refresh token' });
 
     let user;
@@ -262,16 +305,21 @@ exports.refresh = async (req, res) => {
 
 exports.switchMode = async (req, res) => {
   let mode = String(req.body.mode || req.body.activeMode || req.query.mode || '').trim();
-  if (!['customer', 'admin'].includes(mode)) {
+  if (!['customer', 'admin', 'seller'].includes(mode)) {
     if (req.user.role === 'admin' && req.user.availableModes?.includes('admin') && req.user.activeMode !== 'admin') {
       mode = 'admin';
+    } else if (req.user.availableModes?.includes('seller') && req.user.activeMode !== 'seller') {
+      mode = 'seller';
     } else if (req.user.role === 'admin' && req.user.availableModes?.includes('customer') && req.user.activeMode === 'admin') {
       mode = 'customer';
     }
   }
-  if (!['customer', 'admin'].includes(mode)) return res.status(400).json({ message: 'Invalid mode' });
+  if (!['customer', 'admin', 'seller'].includes(mode)) return res.status(400).json({ message: 'Invalid mode' });
   if (mode === 'admin' && (req.user.role !== 'admin' || !req.user.availableModes?.includes('admin'))) {
     return res.status(403).json({ message: 'Admin mode is not allowed' });
+  }
+  if (mode === 'seller' && !req.user.availableModes?.includes('seller')) {
+    return res.status(403).json({ message: 'Seller mode is not allowed' });
   }
   if (req.user.offlineSession) {
     req.user.activeMode = mode;
@@ -329,7 +377,9 @@ async function upsertPhoneLoginUser(phone, { activeMode = 'customer' } = {}) {
     user.availableModes = ['customer', 'admin'];
   } else {
     user.role = 'customer';
-    user.availableModes = ['customer'];
+    const modes = new Set(['customer']);
+    if (user.availableModes?.includes('seller')) modes.add('seller');
+    user.availableModes = [...modes];
   }
   user.activeMode = activeMode;
   await user.save();
@@ -373,13 +423,31 @@ function canRefreshOfflineSession(decoded) {
     && String(decoded.userId || decoded.id || '').startsWith('offline-');
 }
 
+/**
+ * Demo mode: if the SMS provider is unavailable the fixed demo code stays
+ * usable and is returned to the client so the product can be demonstrated.
+ * Production mode: a delivery failure is a real failure — the code is never
+ * downgraded to a guessable value and never leaves the server.
+ */
 async function deliverOtpWithFallback(phone, otp, record) {
   const delivery = await sendOtp(phone, otp);
-  if (delivery?.success) return delivery;
 
-  record.otpHash = hashOtp(phone, TEST_OTP);
-  await record.save();
-  return { success: true, provider: 'fallback', devOtp: TEST_OTP };
+  if (!isDemoOtpMode()) {
+    if (delivery?.success) return { success: true, provider: delivery.provider };
+    throw new ApiError('SERVICE_UNAVAILABLE', 'We could not send the OTP right now. Please try again shortly.');
+  }
+
+  const demoOtp = getDemoOtp();
+  if (!delivery?.success && record) {
+    record.otpHash = hashOtp(phone, demoOtp);
+    await record.save();
+  }
+  return { success: true, provider: delivery?.success ? delivery.provider : 'demo', demoOtp };
+}
+
+function otpResponse(delivery) {
+  if (!isDemoOtpMode() || !delivery?.demoOtp) return { otpMode: getOtpMode() };
+  return { otpMode: 'demo', demoOtp: delivery.demoOtp, devOtp: delivery.demoOtp };
 }
 
 function allowOtpRequest(phone, ip) {
@@ -460,7 +528,7 @@ function createProfileChangeToken({ userId, targetType, target }) {
       targetType,
       target,
     },
-    process.env.JWT_SECRET || 'dev_secret_change_me',
+    getJwtSecret(),
     { expiresIn: PROFILE_VERIFICATION_TOKEN_TTL },
   );
 }
@@ -468,7 +536,7 @@ function createProfileChangeToken({ userId, targetType, target }) {
 function verifyProfileChangeToken(token, { userId, targetType, target }) {
   if (!token) return false;
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'dev_secret_change_me');
+    const decoded = jwt.verify(token, getJwtSecret());
     return decoded?.tokenType === 'profile_verification'
       && String(decoded.userId) === String(userId)
       && decoded.targetType === targetType

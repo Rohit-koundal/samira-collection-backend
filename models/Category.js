@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const storeIdPlugin = require('./plugins/storeId');
 
 const categorySchema = new mongoose.Schema({
   name: { type: String, required: true },
@@ -8,5 +9,8 @@ const categorySchema = new mongoose.Schema({
   isActive: { type: Boolean, default: true },
   displayOrder: { type: Number, default: 0 },
 }, { timestamps: true });
+
+categorySchema.plugin(storeIdPlugin);
+categorySchema.index({ storeId: 1, slug: 1 });
 
 module.exports = mongoose.model('Category', categorySchema);

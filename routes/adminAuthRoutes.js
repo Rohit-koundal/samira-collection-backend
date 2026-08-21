@@ -1,7 +1,6 @@
 const router = require('express').Router();
 const auth = require('../controllers/authController');
 const dashboard = require('../controllers/dashboardController');
-const User = require('../models/User');
 const { protect } = require('../middleware/authMiddleware');
 const { adminOnly } = require('../middleware/adminMiddleware');
 
@@ -14,11 +13,8 @@ router.get('/dashboard/low-stock', protect, adminOnly, dashboard.lowStock);
 router.get('/inventory/low-stock', protect, adminOnly, dashboard.lowStock);
 router.get('/reports/sales', protect, adminOnly, dashboard.salesReport);
 router.get('/reports/products', protect, adminOnly, dashboard.productReport);
-router.get('/customers', protect, adminOnly, async (req, res) => {
-  res.json(await User.find({ role: 'customer' }).select('-password').sort('-createdAt'));
-});
-router.patch('/customers/:id/block', protect, adminOnly, async (req, res) => {
-  res.json(await User.findByIdAndUpdate(req.params.id, { isBlocked: req.body.isBlocked }, { new: true }).select('-password'));
-});
+// Customer listing, blocking and role changes live in customerAdminRoutes,
+// which is mounted earlier on /api/admin/customers and carries the
+// self-lockout and id validation guards.
 
 module.exports = router;

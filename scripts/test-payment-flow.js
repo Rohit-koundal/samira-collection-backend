@@ -1,16 +1,20 @@
 #!/usr/bin/env node
 /**
- * Dry-run tests for payment storage logic.
+ * Fast, dependency-free checks for the pure payment helpers.
  * Run: npm run test:payments
+ *
+ * The database-backed payment flow (verification against the stored order,
+ * webhook idempotency, stock movement) is covered by `npm test`, which boots
+ * an in-memory MongoDB replica set.
  */
 const assert = require('assert');
+const crypto = require('crypto');
 const { verifyRazorpaySignature, pickOrderFields } = require('../utils/paymentUtils');
 
 function testSignatureVerification() {
   const secret = 'test_secret_key';
   const orderId = 'order_abc123';
   const paymentId = 'pay_xyz789';
-  const crypto = require('crypto');
   const validSignature = crypto.createHmac('sha256', secret).update(`${orderId}|${paymentId}`).digest('hex');
 
   assert.strictEqual(verifyRazorpaySignature({
@@ -34,7 +38,14 @@ function testSignatureVerification() {
     secret,
   }), false);
 
-  console.log('✓ Razorpay signature verification');
+  assert.strictEqual(verifyRazorpaySignature({
+    razorpayOrderId: orderId,
+    razorpayPaymentId: paymentId,
+    razorpaySignature: validSignature,
+    secret: 'a_different_secret',
+  }), false);
+
+  console.log('\u2713 Razorpay signature verification');
 }
 
 function testPickOrderFields() {
@@ -53,192 +64,60 @@ function testPickOrderFields() {
     coupon: { code: 'SAVE10', discount: 100 },
   });
   assert.strictEqual(fields.extraField, undefined);
-  console.log('✓ pickOrderFields whitelist');
+  console.log('\u2713 pickOrderFields whitelist');
 }
 
-async function testFailedPaymentPersistence() {
-  require('dotenv').config();
+function testCouponDiscountRules() {
+  const { calculateDiscount } = require('../services/couponService');
 
-  if (!process.env.MONGO_URI) {
-    console.log('↷ Skipping DB test (MONGO_URI not set)');
-    return;
-  }
-
-  const mongoose = require('mongoose');
-  const Order = require('../models/Order');
-  const User = require('../models/User');
-  const Product = require('../models/Product');
-  const paymentController = require('../controllers/paymentController');
-
-  await mongoose.connect(process.env.MONGO_URI);
-
-  let user = await User.findOne({ phone: '9999999901' });
-  if (!user) {
-    user = await User.create({
-      name: 'Payment Test User',
-      phone: '9999999901',
-      isPhoneVerified: true,
-      role: 'customer',
-    });
-  }
-
-  let product = await Product.findOne({ isActive: true });
-  if (!product) {
-    throw new Error('No active product found in database for payment dry-run');
-  }
-
-  const req = {
-    user,
-    body: {
-      reason: 'Payment cancelled by customer (dry-run)',
-      razorpayOrderId: `order_test_${Date.now()}`,
-      orderPayload: {
-        orderItems: [{
-          product: product._id,
-          name: product.name,
-          quantity: 1,
-          size: product.sizes?.[0] || 'Free Size',
-          color: product.colors?.[0] || 'Wine',
-        }],
-        shippingAddress: {
-          fullName: 'Payment Test User',
-          mobile: '9999999901',
-          pincode: '302001',
-          state: 'Rajasthan',
-          city: 'Jaipur',
-          houseNo: '1',
-          area: 'Test Area',
-        },
-        paymentMethod: 'UPI',
-        paymentProvider: 'Razorpay',
-      },
-    },
-  };
-
-  const res = {
-    statusCode: 200,
-    body: null,
-    status(code) {
-      this.statusCode = code;
-      return this;
-    },
-    json(payload) {
-      this.body = payload;
-      return this;
-    },
-  };
-
-  await paymentController.recordPaymentFailure(req, res);
-
-  assert.strictEqual(res.statusCode, 202);
-  assert.strictEqual(res.body.success, false);
-  assert.ok(res.body.order?._id);
-  assert.strictEqual(res.body.order.paymentStatus, 'Failed');
-  assert.strictEqual(res.body.order.orderStatus, 'Cancelled');
-  assert.ok(res.body.order.paymentFailureReason);
-
-  const saved = await Order.findById(res.body.order._id);
-  assert.ok(saved);
-  assert.strictEqual(saved.paymentStatus, 'Failed');
-
-  await Order.findByIdAndDelete(saved._id);
-  await mongoose.disconnect();
-  console.log('✓ Failed payment persisted to orders collection');
+  assert.strictEqual(calculateDiscount({ type: 'Percentage', discountValue: 10 }, 2000), 200);
+  assert.strictEqual(calculateDiscount({ type: 'Percentage', discountValue: 50, maxDiscountAmount: 300 }, 5000), 300);
+  assert.strictEqual(calculateDiscount({ type: 'Flat', discountValue: 5000 }, 800), 800, 'discount cannot exceed the cart total');
+  assert.strictEqual(calculateDiscount(null, 800), 0);
+  console.log('\u2713 Coupon discount calculation');
 }
 
-async function testPendingOrderMarkedFailed() {
-  require('dotenv').config();
+function testPaymentSettingRules() {
+  const { assertPaymentMethodAllowed, resolveCodCharge, resolveDeliveryCharge } = require('../services/paymentSettingsService');
 
-  if (!process.env.MONGO_URI) {
-    console.log('↷ Skipping pending→failed DB test (MONGO_URI not set)');
-    return;
-  }
+  assert.strictEqual(resolveCodCharge('COD', { codCharge: 49 }), 49);
+  assert.strictEqual(resolveCodCharge('UPI', { codCharge: 49 }), 0);
+  assert.strictEqual(resolveDeliveryCharge(1500, { deliveryCharge: 99, freeShippingMinAmount: 999 }), 0);
+  assert.strictEqual(resolveDeliveryCharge(500, { deliveryCharge: 99, freeShippingMinAmount: 999 }), 99);
 
-  const mongoose = require('mongoose');
-  const Order = require('../models/Order');
-  const User = require('../models/User');
-  const Product = require('../models/Product');
-  const paymentController = require('../controllers/paymentController');
+  assert.throws(
+    () => assertPaymentMethodAllowed('COD', { codEnabled: false }, { razorpayConfigured: true }),
+    /Cash on Delivery is currently unavailable/,
+  );
+  assert.throws(
+    () => assertPaymentMethodAllowed('COD', { codEnabled: true, codMaxAmount: 1000 }, { razorpayConfigured: true, orderAmount: 2000 }),
+    /up to Rs. 1000/,
+  );
+  assert.throws(
+    () => assertPaymentMethodAllowed('UPI', { razorpayEnabled: true }, { razorpayConfigured: false }),
+    /Online payment is not available/,
+  );
+  assert.throws(
+    () => assertPaymentMethodAllowed('CRYPTO', { codEnabled: true }, { razorpayConfigured: true }),
+    /valid payment method/,
+  );
 
-  await mongoose.connect(process.env.MONGO_URI);
-
-  const user = await User.findOne({ phone: '9999999901' });
-  const product = await Product.findOne({ isActive: true });
-  if (!user || !product) {
-    await mongoose.disconnect();
-    throw new Error('Test fixtures missing (user/product)');
-  }
-
-  const razorpayOrderId = `order_pending_${Date.now()}`;
-  const pending = await Order.create({
-    user: user._id,
-    orderItems: [{
-      product: product._id,
-      name: product.name,
-      quantity: 1,
-      price: product.price,
-      originalPrice: product.originalPrice || product.price,
-    }],
-    shippingAddress: { fullName: 'Payment Test User', mobile: '9999999901' },
-    paymentMethod: 'UPI',
-    paymentProvider: 'Razorpay',
-    paymentStatus: 'Pending',
-    orderStatus: 'Pending',
-    razorpayOrderId,
-    totalMRP: product.price,
-    productDiscount: 0,
-    couponDiscount: 0,
-    deliveryCharge: 0,
-    codCharge: 0,
-    finalAmount: product.price,
-    statusTimeline: [{ status: 'Pending', date: new Date(), note: 'Awaiting Razorpay payment' }],
-  });
-
-  const stockBefore = product.stock;
-  const req = {
-    user,
-    body: {
-      reason: 'Payment cancelled by customer (pending dry-run)',
-      razorpayOrderId,
-      orderPayload: { orderItems: [{ product: product._id, quantity: 1 }] },
-    },
-  };
-  const res = {
-    statusCode: 200,
-    body: null,
-    status(code) {
-      this.statusCode = code;
-      return this;
-    },
-    json(payload) {
-      this.body = payload;
-      return this;
-    },
-  };
-
-  await paymentController.recordPaymentFailure(req, res);
-
-  assert.strictEqual(res.statusCode, 202);
-  assert.strictEqual(res.body.order._id.toString(), pending._id.toString());
-  assert.strictEqual(res.body.order.paymentStatus, 'Failed');
-
-  const refreshedProduct = await Product.findById(product._id);
-  assert.strictEqual(refreshedProduct.stock, stockBefore, 'stock must not change on failed payment');
-
-  await Order.findByIdAndDelete(pending._id);
-  await mongoose.disconnect();
-  console.log('✓ Pending order updated to Failed without stock reduction');
+  assertPaymentMethodAllowed('UPI', { razorpayEnabled: true, upiEnabled: true }, { razorpayConfigured: true });
+  assertPaymentMethodAllowed('COD', { codEnabled: true, codMaxAmount: 5000 }, { razorpayConfigured: false, orderAmount: 2000 });
+  console.log('\u2713 Payment method and charge rules');
 }
 
-async function run() {
+function run() {
   testSignatureVerification();
   testPickOrderFields();
-  await testFailedPaymentPersistence();
-  await testPendingOrderMarkedFailed();
-  console.log('\nAll payment flow tests passed.');
+  testCouponDiscountRules();
+  testPaymentSettingRules();
+  console.log('\nAll payment helper tests passed. Run "npm test" for the full database-backed suite.');
 }
 
-run().catch((error) => {
+try {
+  run();
+} catch (error) {
   console.error('\nPayment flow test failed:', error.message);
   process.exit(1);
-});
+}

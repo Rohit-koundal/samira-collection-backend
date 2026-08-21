@@ -6,7 +6,10 @@ function verifyRazorpaySignature({ razorpayOrderId, razorpayPaymentId, razorpayS
     .createHmac('sha256', secret)
     .update(`${razorpayOrderId}|${razorpayPaymentId}`)
     .digest('hex');
-  return expected === razorpaySignature;
+  const expectedBuffer = Buffer.from(expected);
+  const actualBuffer = Buffer.from(String(razorpaySignature));
+  if (expectedBuffer.length !== actualBuffer.length) return false;
+  return crypto.timingSafeEqual(expectedBuffer, actualBuffer);
 }
 
 function pickOrderFields(body = {}) {

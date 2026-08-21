@@ -18,6 +18,18 @@ function getRazorpayClient() {
 }
 
 async function createRazorpayOrder({ amountInPaise, receipt, notes = {} }) {
+  if (!isRazorpayConfigured()) throw new Error('Razorpay is not configured');
+
+  if (process.env.RAZORPAY_MOCK === '1') {
+    return {
+      id: `order_mock_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`,
+      amount: amountInPaise,
+      currency: 'INR',
+      receipt,
+      notes,
+    };
+  }
+
   const razorpay = getRazorpayClient();
   if (!razorpay) throw new Error('Razorpay is not configured');
 

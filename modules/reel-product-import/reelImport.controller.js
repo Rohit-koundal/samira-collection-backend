@@ -38,6 +38,7 @@ async function createImport(req, res, next) {
     try {
       reelImport = await ReelImport.create({
         createdBy: req.user._id,
+        storeId: req.store?._id,
         sourceVideo: {
           ...stored,
           originalFilename: safeOriginalFilename(file.originalname),
@@ -84,8 +85,17 @@ async function createImportFromStoredVideo(req, res, next) {
     const config = getReelImportConfig();
     const provider = getStorageProvider();
     const sizeBytes = Number(source.sizeBytes || 0);
-    if (!provider || provider !== source.provider || !source.storageKey) {
-      throw validationError('INVALID_STORAGE_REFERENCE', 'The uploaded video does not have a valid storage reference.');
+    if (!provider) {
+      throw validationError(
+        'REEL_STORAGE_NOT_CONFIGURED',
+        'Reel Product Import needs Cloudflare R2 or Cloudinary. Add those keys in backend/.env, then restart the server.',
+      );
+    }
+    if (provider !== source.provider || !source.storageKey) {
+      throw validationError(
+        'INVALID_STORAGE_REFERENCE',
+        'The uploaded video is missing a valid cloud storage reference. Re-upload after R2 or Cloudinary is connected.',
+      );
     }
     if (!['video/mp4', 'video/quicktime', 'video/webm'].includes(String(source.mimeType || '').toLowerCase())) {
       throw validationError('UNSUPPORTED_VIDEO_FORMAT', 'Only MP4, MOV, and WebM videos are supported.');
@@ -99,7 +109,7 @@ async function createImportFromStoredVideo(req, res, next) {
       url: String(source.url || ''),
     };
     if (!await objectExists(storedVideo)) {
-      throw validationError('STORED_VIDEO_NOT_FOUND', 'The uploaded video could not be found in R2.');
+      throw validationError('STORED_VIDEO_NOT_FOUND', 'The uploaded video could not be found in cloud storage.');
     }
     const existing = await ReelImport.findOne({
       createdBy: req.user._id,
@@ -154,6 +164,7 @@ async function createImportFromStoredVideo(req, res, next) {
 
 async function getUploadCapabilities(req, res) {
   const config = getReelImportConfig();
+  const storageProvider = getStorageProvider();
   res.json({
     success: true,
     data: {
@@ -162,6 +173,10 @@ async function getUploadCapabilities(req, res) {
       formats: ['MP4', 'MOV', 'WebM'],
       maxDurationSeconds: config.maxDurationSeconds,
       maxFileSizeMb: config.maxFileSizeMb,
+      storageConfigured: Boolean(storageProvider),
+      storageProvider: storageProvider || null,
+      queueConfigured: Boolean(String(process.env.REDIS_URL || '').trim()),
+      workerConfigured: Boolean(String(process.env.AI_VIDEO_WORKER_URL || '').trim()),
     },
   });
 }
@@ -448,6 +463,14 @@ async function createDraftForCandidate(job, candidate, userId) {
     sourceType: 'reel-import',
     sourceJobId: job._id,
     sourceCandidateId: candidate._id,
+    storeId: job.storeId,
+    confidence: Number(candidate.confidence?.overall || 0),
+    detectedColors: listValue(suggestions.primaryColor).concat(listValue(suggestions.secondaryColors)),
+    detectedPattern: suggestions.pattern || '',
+    suggestedCategory: suggestions.category || '',
+    suggestedTags: tags,
+    draftTitle: name,
+    draftDescription: String(overrides.description || suggestions.altText || ''),
   });
   candidate.productDraft = draft._id;
   candidate.status = 'draft_created';

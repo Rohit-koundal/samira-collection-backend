@@ -1,4 +1,16 @@
 const mongoose = require('mongoose');
+const storeIdPlugin = require('./plugins/storeId');
+
+const variantSchema = new mongoose.Schema({
+  sku: String,
+  size: { type: String, default: '' },
+  color: { type: String, default: '' },
+  stock: { type: Number, default: 0, min: 0 },
+  price: Number,
+  originalPrice: Number,
+  images: [{ url: String, publicId: String, primary: { type: Boolean, default: false } }],
+  isActive: { type: Boolean, default: true },
+}, { _id: true });
 
 const productSchema = new mongoose.Schema({
   name: { type: String, required: true },
@@ -21,6 +33,7 @@ const productSchema = new mongoose.Schema({
   variantName: String,
   variantColor: String,
   variantSize: String,
+  variants: { type: [variantSchema], default: [] },
   stock: { type: Number, required: true, default: 0 },
   lowStockAlert: { type: Number, default: 5 },
   sku: { type: String, unique: true, sparse: true },
@@ -41,6 +54,23 @@ const productSchema = new mongoose.Schema({
   showInTrending: { type: Boolean, default: false },
   showInFestive: { type: Boolean, default: false },
   isActive: { type: Boolean, default: true },
+  isArchived: { type: Boolean, default: false, index: true },
+  deletedAt: Date,
 }, { timestamps: true });
+
+productSchema.plugin(storeIdPlugin);
+productSchema.index({ storeId: 1, slug: 1 });
+productSchema.index({ storeId: 1, sku: 1 });
+productSchema.index({ storeId: 1, category: 1, createdAt: -1 });
+productSchema.index({ storeId: 1, isActive: 1, createdAt: -1 });
+
+productSchema.pre('save', function syncVariantStock(next) {
+  if (Array.isArray(this.variants) && this.variants.length) {
+    this.stock = this.variants
+      .filter((variant) => variant && variant.isActive !== false)
+      .reduce((sum, variant) => sum + Math.max(0, Number(variant.stock || 0)), 0);
+  }
+  next();
+});
 
 module.exports = mongoose.model('Product', productSchema);

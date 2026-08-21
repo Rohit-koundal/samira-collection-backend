@@ -6,6 +6,7 @@ const upload = require('../middleware/uploadMiddleware');
 const { protect } = require('../middleware/authMiddleware');
 const { adminOnly } = require('../middleware/adminMiddleware');
 const { isR2Configured, uploadFileToR2, uploadImageToR2 } = require('../services/r2Upload');
+const { isCloudinaryConfigured, uploadImage, uploadVideo } = require('../services/cloudinaryUpload');
 const { isLocalRequest } = require('../utils/imageUtils');
 
 const uploadDir = path.join(__dirname, '..', 'uploads');
@@ -24,7 +25,7 @@ const videoUpload = multer({
     if (!allowedTypes.includes(file.mimetype)) return cb(new Error('Only mp4, webm and mov videos are allowed'));
     cb(null, true);
   },
-  limits: { fileSize: 20 * 1024 * 1024, files: 2 },
+  limits: { fileSize: 250 * 1024 * 1024, files: 2 },
 });
 
 function canBypassUploadAuth(req) {
@@ -38,7 +39,62 @@ function protectUpload(req, res, next) {
 
 function adminOnlyUpload(req, res, next) {
   if (canBypassUploadAuth(req)) return next();
+  if (req.storeMember) return next();
   return adminOnly(req, res, next);
+}
+
+function requiresPersistentStorage(req) {
+  return process.env.NODE_ENV === 'production' && !isLocalRequest(req);
+}
+
+function getActiveUploadProvider() {
+  if (isR2Configured()) return 'r2';
+  if (isCloudinaryConfigured()) return 'cloudinary';
+  return 'local';
+}
+
+function isReelImportFolder(folder = '') {
+  return String(folder || '').toLowerCase().startsWith('reel-imports');
+}
+
+function localFilePayload(file) {
+  const fileName = path.basename(file.filename || file.path || '');
+  return {
+    url: `/uploads/${fileName}`,
+    publicId: fileName,
+    originalName: file.originalname,
+    mimeType: file.mimetype,
+    sizeBytes: file.size,
+    provider: 'local',
+  };
+}
+
+function withProvider(files, provider) {
+  return (files || []).map((file) => ({ ...file, provider: file.provider || provider }));
+}
+
+function storageUnavailable(res, kind) {
+  return res.status(503).json({
+    message: kind === 'reel'
+      ? 'Reel Product Import needs Cloudflare R2 or Cloudinary. Local disk storage is not enough for video processing.'
+      : `Product ${kind} uploads must use Cloudflare R2 or Cloudinary in this environment. Please configure storage before uploading.`,
+    code: 'PERSISTENT_UPLOAD_STORAGE_REQUIRED',
+  });
+}
+
+async function persistUploads(req, { folder, toR2, toCloudinary }) {
+  const uploadFolder = folder || req.query.folder;
+  if (isR2Configured()) {
+    const files = await Promise.all(req.files.map((file) => toR2(file, { folder: uploadFolder })));
+    await cleanupTempFiles(req.files);
+    return withProvider(files, 'r2');
+  }
+  if (isCloudinaryConfigured()) {
+    const files = await Promise.all(req.files.map((file) => toCloudinary(file, { folder: uploadFolder })));
+    await cleanupTempFiles(req.files);
+    return withProvider(files.filter(Boolean), 'cloudinary');
+  }
+  return withProvider(req.files.map(localFilePayload), 'local');
 }
 
 router.post('/', protectUpload, adminOnlyUpload, (req, res, next) => {
@@ -49,19 +105,13 @@ router.post('/', protectUpload, adminOnlyUpload, (req, res, next) => {
       if (!req.files?.length) {
         return res.status(400).json({ message: 'No images were uploaded. Please select at least one image file.' });
       }
-
-      const uploadFolder = req.query.folder;
-      if (!isR2Configured()) {
+      if (!isR2Configured() && !isCloudinaryConfigured() && requiresPersistentStorage(req)) {
         await cleanupTempFiles(req.files);
-        return res.status(503).json({
-          message: 'Product image uploads must use Cloudflare R2 in this environment. Please configure R2 before uploading images.',
-          code: 'PERSISTENT_UPLOAD_STORAGE_REQUIRED',
-        });
+        return storageUnavailable(res, 'image');
       }
-
-      const files = await Promise.all(req.files.map((file) => uploadImageToR2(file, { folder: uploadFolder })));
-      await cleanupTempFiles(req.files);
-      return res.status(201).json({ files });
+      const files = await persistUploads(req, { toR2: uploadImageToR2, toCloudinary: uploadImage });
+      if (!files.length) return res.status(400).json({ message: 'No image was uploaded. Please try again.' });
+      return res.status(201).json({ files, provider: getActiveUploadProvider() });
     } catch (uploadError) {
       await cleanupTempFiles(req.files);
       return next(uploadError);
@@ -77,19 +127,19 @@ router.post('/videos', protectUpload, adminOnlyUpload, (req, res, next) => {
       if (!req.files?.length) {
         return res.status(400).json({ message: 'No videos were uploaded. Please select at least one video file.' });
       }
-
-      const uploadFolder = req.query.folder || 'product-videos';
-      if (!isR2Configured()) {
+      const folder = req.query.folder || 'product-videos';
+      const reelFolder = isReelImportFolder(folder);
+      if (!isR2Configured() && !isCloudinaryConfigured() && (requiresPersistentStorage(req) || reelFolder)) {
         await cleanupTempFiles(req.files);
-        return res.status(503).json({
-          message: 'Product video uploads must use Cloudflare R2 in this environment. Please configure R2 before uploading videos.',
-          code: 'PERSISTENT_UPLOAD_STORAGE_REQUIRED',
-        });
+        return storageUnavailable(res, reelFolder ? 'reel' : 'video');
       }
-
-      const files = await Promise.all(req.files.map((file) => uploadFileToR2(file, { folder: uploadFolder })));
-      await cleanupTempFiles(req.files);
-      return res.status(201).json({ files });
+      const files = await persistUploads(req, {
+        folder,
+        toR2: uploadFileToR2,
+        toCloudinary: uploadVideo,
+      });
+      if (!files.length) return res.status(400).json({ message: 'No video was uploaded. Please try again.' });
+      return res.status(201).json({ files, provider: getActiveUploadProvider() });
     } catch (uploadError) {
       await cleanupTempFiles(req.files);
       return next(uploadError);
@@ -98,7 +148,7 @@ router.post('/videos', protectUpload, adminOnlyUpload, (req, res, next) => {
 });
 
 async function cleanupTempFiles(files = []) {
-  await Promise.all(files.map((file) => fs.unlink(file.path).catch(() => null)));
+  await Promise.all((files || []).map((file) => fs.unlink(file.path).catch(() => null)));
 }
 
 module.exports = router;

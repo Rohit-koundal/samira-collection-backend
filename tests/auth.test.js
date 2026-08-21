@@ -1,0 +1,198 @@
+const test = require('node:test');
+const assert = require('node:assert/strict');
+
+const { request, resetDatabase, startTestEnvironment, stopTestEnvironment } = require('./helpers');
+const { createAdmin, createCustomer } = require('./factories');
+const User = require('../models/User');
+
+test.before(startTestEnvironment);
+test.after(stopTestEnvironment);
+test.beforeEach(resetDatabase);
+
+test('public registration cannot create an admin account', async () => {
+  const { status, data } = await request('/api/auth/register', {
+    method: 'POST',
+    body: {
+      name: 'Attacker',
+      phone: '9812345670',
+      email: 'attacker@test.local',
+      password: 'password123',
+      role: 'admin',
+      activeMode: 'admin',
+      availableModes: ['customer', 'admin'],
+      isPhoneVerified: true,
+      isBlocked: false,
+    },
+  });
+
+  assert.equal(status, 201);
+  assert.equal(data.user.role, 'customer');
+  assert.equal(data.user.activeMode, 'customer');
+  assert.deepEqual(data.user.availableModes, ['customer']);
+  assert.equal(data.user.isPhoneVerified, false);
+
+  const stored = await User.findOne({ phone: '9812345670' });
+  assert.equal(stored.role, 'customer');
+});
+
+test('registration rejects an invalid phone number', async () => {
+  const { status, data } = await request('/api/auth/register', {
+    method: 'POST',
+    body: { name: 'Bad Phone', phone: '12345', password: 'password123' },
+  });
+
+  assert.equal(status, 400);
+  assert.equal(data.code, 'VALIDATION_ERROR');
+});
+
+test('registration does not return the password hash', async () => {
+  const { data } = await request('/api/auth/register', {
+    method: 'POST',
+    body: { name: 'Safe User', phone: '9812345671', password: 'password123' },
+  });
+
+  assert.equal(data.user.password, undefined);
+});
+
+test('a customer cannot promote themselves to admin', async () => {
+  const { user, token } = await createCustomer();
+
+  const { status } = await request(`/api/admin/customers/${user._id}/promote-admin`, {
+    method: 'PATCH',
+    token,
+    body: {},
+  });
+
+  assert.equal(status, 403);
+  const stored = await User.findById(user._id);
+  assert.equal(stored.role, 'customer');
+});
+
+test('an unauthenticated caller cannot promote a user', async () => {
+  const { user } = await createCustomer();
+  const { status } = await request(`/api/admin/customers/${user._id}/promote-admin`, { method: 'PATCH', body: {} });
+  assert.equal(status, 401);
+});
+
+test('an admin can promote and demote another user', async () => {
+  const { token } = await createAdmin();
+  await createAdmin(); // keeps a second admin so demotion is permitted
+  const { user: customer } = await createCustomer();
+
+  const promoted = await request(`/api/admin/customers/${customer._id}/promote-admin`, { method: 'PATCH', token, body: {} });
+  assert.equal(promoted.status, 200);
+  assert.equal(promoted.data.role, 'admin');
+
+  const demoted = await request(`/api/admin/customers/${customer._id}/demote-admin`, { method: 'PATCH', token, body: {} });
+  assert.equal(demoted.status, 200);
+  assert.equal(demoted.data.role, 'customer');
+});
+
+test('an admin cannot demote themselves', async () => {
+  const { user, token } = await createAdmin();
+  const { status } = await request(`/api/admin/customers/${user._id}/demote-admin`, { method: 'PATCH', token, body: {} });
+  assert.equal(status, 403);
+});
+
+test('the last remaining admin cannot be demoted', async () => {
+  const { token } = await createAdmin();
+  const { user: other } = await createAdmin();
+
+  // Demote the second admin, leaving only the caller.
+  await request(`/api/admin/customers/${other._id}/demote-admin`, { method: 'PATCH', token, body: {} });
+
+  const { user: third } = await createAdmin();
+  const onlyAdminToken = (await createAdmin()).token;
+  await request(`/api/admin/customers/${third._id}/demote-admin`, { method: 'PATCH', token: onlyAdminToken, body: {} });
+
+  const remaining = await User.countDocuments({ role: 'admin' });
+  assert.ok(remaining >= 1, 'at least one admin must always remain');
+});
+
+test('an admin cannot block their own account', async () => {
+  const { user, token } = await createAdmin();
+  const { status } = await request(`/api/admin/customers/${user._id}/block`, { method: 'PATCH', token, body: { isBlocked: true } });
+  assert.equal(status, 403);
+});
+
+test('block requires a boolean flag', async () => {
+  const { token } = await createAdmin();
+  const { user } = await createCustomer();
+  const { status, data } = await request(`/api/admin/customers/${user._id}/block`, { method: 'PATCH', token, body: { isBlocked: 'yes-please' } });
+  assert.equal(status, 400);
+  assert.equal(data.code, 'VALIDATION_ERROR');
+});
+
+test('a malformed user id is rejected before reaching the database', async () => {
+  const { token } = await createAdmin();
+  const { status, data } = await request('/api/admin/customers/not-an-id/block', { method: 'PATCH', token, body: { isBlocked: true } });
+  assert.equal(status, 400);
+  assert.equal(data.code, 'VALIDATION_ERROR');
+});
+
+test('a blocked user is denied access', async () => {
+  const { token } = await createCustomer({ isBlocked: true });
+  const { status } = await request('/api/auth/me', { token });
+  assert.equal(status, 401);
+});
+
+test('demo OTP mode issues and reveals the fixed code, and it verifies', async () => {
+  const sent = await request('/api/auth/send-otp', { method: 'POST', body: { phone: '9812345672' } });
+  assert.equal(sent.status, 200);
+  assert.equal(sent.data.otpMode, 'demo');
+  assert.equal(sent.data.demoOtp, '123456');
+
+  const verified = await request('/api/auth/verify-otp', { method: 'POST', body: { phone: '9812345672', otp: '123456' } });
+  assert.equal(verified.status, 200);
+  assert.ok(verified.data.token);
+  assert.equal(verified.data.user.role, 'customer');
+  assert.equal(verified.data.user.isPhoneVerified, true);
+});
+
+test('OTP login promotes only numbers listed in ADMIN_PHONE_NUMBERS', async () => {
+  const previous = process.env.ADMIN_PHONE_NUMBERS;
+  process.env.ADMIN_PHONE_NUMBERS = '9812345673';
+  try {
+    await request('/api/auth/send-otp', { method: 'POST', body: { phone: '9812345674' } });
+    const nonAdmin = await request('/api/auth/verify-otp', { method: 'POST', body: { phone: '9812345674', otp: '123456' } });
+    assert.equal(nonAdmin.data.user.role, 'customer');
+
+    await request('/api/auth/send-otp', { method: 'POST', body: { phone: '9812345673' } });
+    const admin = await request('/api/auth/verify-otp', { method: 'POST', body: { phone: '9812345673', otp: '123456' } });
+    assert.equal(admin.data.user.role, 'admin');
+  } finally {
+    process.env.ADMIN_PHONE_NUMBERS = previous;
+  }
+});
+
+test('production OTP mode never reveals a code to the client', async () => {
+  process.env.OTP_MODE = 'production';
+  try {
+    const sent = await request('/api/auth/send-otp', { method: 'POST', body: { phone: '9812345675' } });
+    assert.equal(sent.data?.demoOtp, undefined);
+    assert.equal(sent.data?.devOtp, undefined);
+
+    // With no real provider connected the request must fail rather than fall
+    // back to a guessable code.
+    if (sent.status === 200) {
+      const guessed = await request('/api/auth/verify-otp', { method: 'POST', body: { phone: '9812345675', otp: '123456' } });
+      assert.notEqual(guessed.status, 200, 'the fixed demo code must not work in production mode');
+    } else {
+      assert.equal(sent.status, 503);
+    }
+  } finally {
+    process.env.OTP_MODE = 'demo';
+  }
+});
+
+test('an admin login attempt with wrong credentials is rejected', async () => {
+  await createAdmin({ email: 'realadmin@test.local', password: 'CorrectHorse1' });
+  const { status } = await request('/api/admin/login', { method: 'POST', body: { email: 'realadmin@test.local', password: 'wrong-password' } });
+  assert.equal(status, 401);
+});
+
+test('a blocked admin cannot log in with a password', async () => {
+  await createAdmin({ email: 'blockedadmin@test.local', password: 'CorrectHorse1', isBlocked: true });
+  const { status } = await request('/api/admin/login', { method: 'POST', body: { email: 'blockedadmin@test.local', password: 'CorrectHorse1' } });
+  assert.equal(status, 403);
+});

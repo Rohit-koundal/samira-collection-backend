@@ -6,32 +6,47 @@ const { notFound, errorHandler } = require('./middleware/errorMiddleware');
 const devFallback = require('./middleware/devFallbackMiddleware');
 const { protect } = require('./middleware/authMiddleware');
 const { adminOnly } = require('./middleware/adminMiddleware');
+const { optionalResolveStore, requireStoreMember } = require('./middleware/storeMiddleware');
+const { requestContext } = require('./middleware/requestContext');
 const { corsOptions, getAllowedOrigins } = require('./config/corsOptions');
 const { isR2Configured } = require('./services/r2Upload');
 const { isCloudinaryConfigured } = require('./services/cloudinaryUpload');
-const { isReelImportEnabled } = require('./config/reelImport');
+const { redisHealthStatus } = require('./services/redisHealth');
+const instagram = require('./controllers/instagramController');
 
 const app = express();
 
 app.set('trust proxy', 1);
+app.use(requestContext);
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
+
+// Razorpay signs the raw request body, so this route must be registered
+// before express.json() replaces it with a parsed object.
+app.post(
+  '/api/payments/webhook/razorpay',
+  express.raw({ type: '*/*', limit: '1mb' }),
+  (req, res, next) => require('./controllers/paymentController').razorpayWebhook(req, res).catch(next),
+);
+
 app.use(express.json({ limit: '30mb' }));
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 app.get('/uploads/:filename', sendImagePlaceholder);
 app.get('/placeholder.jpg', sendImagePlaceholder);
 
 app.get('/', (req, res) => res.json({ message: 'Samira Collection API is running' }));
-app.get('/health', (req, res) => {
+app.get('/health', async (req, res) => {
   const dbStates = ['disconnected', 'connected', 'connecting', 'disconnecting'];
   const imageStorage = isR2Configured() ? 'r2' : isCloudinaryConfigured() ? 'cloudinary' : 'local';
   const persistentImageStorageConfigured = imageStorage !== 'local';
+  const redis = await redisHealthStatus();
   res.json({
     status: process.env.NODE_ENV === 'production' && !persistentImageStorageConfigured ? 'degraded' : 'ok',
     database: dbStates[mongoose.connection.readyState] || 'unknown',
     environment: process.env.NODE_ENV || 'development',
     imageStorage,
     persistentImageStorageConfigured,
+    redis,
     allowedOrigins: getAllowedOrigins(),
   });
 });
@@ -54,13 +69,16 @@ app.use('/api/admin/settings', protect, adminOnly, require('./routes/settingsRou
 app.use('/api/admin/uploads', require('./routes/uploadRoutes'));
 app.use('/api/admin/upload', require('./routes/uploadRoutes'));
 app.use('/api/admin/product-drafts', require('./routes/productDraftRoutes'));
-if (isReelImportEnabled()) {
-  app.use('/api/admin/reel-imports', require('./modules/reel-product-import/reelImport.routes'));
-}
+app.use('/api/admin/reel-imports', require('./modules/reel-product-import/reelImport.routes'));
 app.use('/api/admin/variant-groups', protect, adminOnly, require('./routes/variantGroupRoutes'));
-app.use('/api/products', require('./routes/publicProductRoutes'));
+app.use('/api/admin/audit-logs', protect, adminOnly, require('./routes/auditAdminRoutes'));
+app.use('/api/stores', require('./routes/storeRoutes'));
+app.use('/api/seller', protect, requireStoreMember, require('./routes/sellerRoutes'));
+app.get('/api/instagram/oauth/callback', instagram.oauthCallback);
+app.use('/api/analytics', require('./routes/analyticsRoutes'));
+app.use('/api/products', optionalResolveStore, require('./routes/publicProductRoutes'));
 app.use('/api/variant-groups', require('./routes/variantGroupRoutes'));
-app.use('/api/categories', require('./routes/categoryRoutes'));
+app.use('/api/categories', optionalResolveStore, require('./routes/categoryRoutes'));
 app.use('/api/cart', require('./routes/cartRoutes'));
 app.use('/api/user/addresses', require('./routes/addressRoutes'));
 app.use('/api/wishlist', require('./routes/wishlistRoutes'));
@@ -73,10 +91,17 @@ app.post('/api/create-order', protect, wrapPaymentHandler(paymentController.crea
 app.post('/api/verify-payment', protect, wrapPaymentHandler(paymentController.verifyPayment));
 
 app.use('/api/coupons', require('./routes/couponRoutes'));
-app.use('/api/banners', require('./routes/bannerRoutes'));
+app.use('/api/banners', optionalResolveStore, require('./routes/bannerRoutes'));
 app.use('/api/reviews', require('./routes/reviewRoutes'));
 app.use('/api/returns', require('./routes/returnRoutes'));
 app.use('/api/settings', require('./routes/settingsRoutes'));
+app.use('/api/contact', optionalResolveStore, require('./routes/contactRoutes'));
+app.use('/api/newsletter', optionalResolveStore, require('./routes/newsletterRoutes'));
+app.use('/api/notifications', require('./routes/notificationRoutes'));
+app.use('/api/admin/contact', protect, adminOnly, require('./routes/contactRoutes'));
+app.use('/api/admin/newsletter', protect, adminOnly, require('./routes/newsletterRoutes'));
+
+app.use(require('./routes/seoRoutes'));
 
 app.use(notFound);
 app.use(errorHandler);

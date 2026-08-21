@@ -2,6 +2,7 @@ const crypto = require('crypto');
 const mongoose = require('mongoose');
 const Otp = require('../models/Otp');
 const { normalizePhone, requireValidPhone } = require('../utils/phoneUtils');
+const { getDemoOtp, getJwtSecret, isDemoOtpMode } = require('../config/env');
 
 const memoryOtps = new Map();
 
@@ -14,10 +15,7 @@ function getExpiryMinutes() {
 }
 
 function generateOtp() {
-  const provider = String(process.env.OTP_PROVIDER || 'mock').toLowerCase();
-  const devOtp = String(process.env.OTP_DEV_CODE || '123456').trim() || '123456';
-  if (process.env.NODE_ENV !== 'production' && (provider === 'mock' || provider === 'sms' || provider === 'twilio')) return devOtp;
-  if (provider === 'mock') return devOtp;
+  if (isDemoOtpMode()) return getDemoOtp();
   return String(crypto.randomInt(100000, 1000000));
 }
 
@@ -25,14 +23,16 @@ function hashOtp(phoneOrOtp, maybeOtp) {
   const phone = maybeOtp === undefined ? '' : phoneOrOtp;
   const otp = maybeOtp === undefined ? phoneOrOtp : maybeOtp;
   return crypto
-    .createHmac('sha256', process.env.JWT_SECRET || 'dev_secret_change_me')
+    .createHmac('sha256', getJwtSecret())
     .update(`${phone}:${otp}`)
     .digest('hex');
 }
 
 function compareOtp(phone, otp, otpHash) {
-  const expected = hashOtp(phone, otp);
-  return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(otpHash));
+  const expected = Buffer.from(hashOtp(phone, otp));
+  const actual = Buffer.from(String(otpHash || ''));
+  if (expected.length !== actual.length) return false;
+  return crypto.timingSafeEqual(expected, actual);
 }
 
 function verifyOtpHash(phone, otp, otpHash) {

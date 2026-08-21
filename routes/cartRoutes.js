@@ -1,7 +1,7 @@
 const router = require('express').Router();
 const cart = require('../controllers/cartController');
-const { protect } = require('../middleware/authMiddleware');
-router.use(protect);
+const { optionalProtect } = require('../middleware/authMiddleware');
+router.use(optionalProtect);
 router.get('/', cart.getCart);
 router.post('/', cart.addToCart);
 router.put('/:itemId', cart.updateCartItem);

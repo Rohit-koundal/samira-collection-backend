@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const storeIdPlugin = require('./plugins/storeId');
 
 const bannerSchema = new mongoose.Schema({
   title: String,
@@ -16,5 +17,8 @@ const bannerSchema = new mongoose.Schema({
   displayOrder: { type: Number, default: 0 },
   views: { type: Number, default: 0 },
 }, { timestamps: true });
+
+bannerSchema.plugin(storeIdPlugin);
+bannerSchema.index({ storeId: 1, isActive: 1, displayOrder: 1 });
 
 module.exports = mongoose.model('Banner', bannerSchema);
