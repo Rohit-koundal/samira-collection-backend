@@ -98,6 +98,7 @@ async function loadOrderItems(orderItems) {
       originalPrice: unitMRP,
       discount: round(unitMRP - unitPrice),
       tax: 0,
+      lineTotal: round(unitPrice * quantity),
       category: product.category,
       storeId: product.storeId || null,
     });
@@ -137,7 +138,16 @@ async function buildOrderDraft({ orderItems, couponCode, paymentMethod, settings
   const productDiscount = round(Math.max(0, totalMRP - sellingTotal));
   const deliveryCharge = resolveDeliveryCharge(sellingTotal, storeSettings);
   const prepaidDiscount = resolvePrepaidDiscount(method, sellingTotal - couponDiscount, storeSettings);
-  const payableBeforeCod = round(Math.max(0, sellingTotal - couponDiscount - prepaidDiscount + deliveryCharge));
+  const platformFee = items.length ? Math.max(0, Number(storeSettings.platformFee ?? 23)) : 0;
+  const taxRate = Math.max(0, Number(storeSettings.gstRate ?? 5));
+  const taxableAmount = Math.max(0, sellingTotal - couponDiscount);
+  const taxAmount = taxRate > 0 ? round((taxableAmount * taxRate) / (100 + taxRate)) : 0;
+  if (taxAmount > 0 && taxableAmount > 0) {
+    items.forEach((item) => {
+      item.tax = round((Number(item.lineTotal || 0) / taxableAmount) * taxAmount);
+    });
+  }
+  const payableBeforeCod = round(Math.max(0, sellingTotal - couponDiscount - prepaidDiscount + deliveryCharge + platformFee));
 
   await assertPaymentMethodAllowed(method, storeSettings, {
     razorpayConfigured: isRazorpayConfigured(),
@@ -162,6 +172,9 @@ async function buildOrderDraft({ orderItems, couponCode, paymentMethod, settings
       discount: round(productDiscount + couponDiscount + prepaidDiscount),
       deliveryCharge,
       codCharge,
+      platformFee,
+      taxAmount,
+      taxRate,
       finalAmount,
       coupon: coupon ? { code: coupon.code, discountAmount: couponDiscount } : undefined,
     },

@@ -76,6 +76,8 @@ async function setSettings(overrides = {}) {
     razorpayEnabled: false,
     deliveryCharge: 99,
     freeShippingMinAmount: 999,
+    platformFee: 0,
+    gstRate: 0,
     ...overrides,
   }, { new: true, upsert: true });
 }

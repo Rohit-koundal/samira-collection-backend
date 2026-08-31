@@ -191,6 +191,38 @@ test('an admin login attempt with wrong credentials is rejected', async () => {
   assert.equal(status, 401);
 });
 
+test('a customer can log in with email or mobile and password', async () => {
+  await createCustomer({
+    email: 'shopper@test.local',
+    phone: '9812345699',
+    password: 'CorrectHorse1',
+  });
+
+  const byEmail = await request('/api/auth/login', {
+    method: 'POST',
+    body: { email: 'shopper@test.local', password: 'CorrectHorse1' },
+  });
+  assert.equal(byEmail.status, 200);
+  assert.equal(byEmail.data.user.phone, '9812345699');
+
+  const byPhone = await request('/api/auth/login', {
+    method: 'POST',
+    body: { phone: '9812345699', password: 'CorrectHorse1' },
+  });
+  assert.equal(byPhone.status, 200);
+  assert.equal(byPhone.data.user.email, 'shopper@test.local');
+});
+
+test('an OTP-only account cannot use password login', async () => {
+  await createCustomer({ email: 'otpuser@test.local', phone: '9812345698' });
+  const { status, data } = await request('/api/auth/login', {
+    method: 'POST',
+    body: { phone: '9812345698', password: 'anything1' },
+  });
+  assert.equal(status, 401);
+  assert.match(String(data.message), /OTP/i);
+});
+
 test('a blocked admin cannot log in with a password', async () => {
   await createAdmin({ email: 'blockedadmin@test.local', password: 'CorrectHorse1', isBlocked: true });
   const { status } = await request('/api/admin/login', { method: 'POST', body: { email: 'blockedadmin@test.local', password: 'CorrectHorse1' } });

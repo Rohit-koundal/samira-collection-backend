@@ -28,6 +28,8 @@ const settingsSchema = new mongoose.Schema({
   ourStory: String,
   legalBusinessName: String,
   gstin: String,
+  gstRate: { type: Number, default: 5 },
+  platformFee: { type: Number, default: 23 },
   invoicePrefix: { type: String, default: 'SC' },
   billingAddress: String,
   returnWindowDays: { type: Number, default: 7 },

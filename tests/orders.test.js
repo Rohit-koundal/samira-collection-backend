@@ -282,6 +282,24 @@ test('deleting an order cancels it instead of destroying the record', async () =
   assert.equal((await Product.findById(product._id)).stock, 5);
 });
 
+test('the quote endpoint includes platform fee and inclusive GST when configured', async () => {
+  const { token } = await createCustomer();
+  const product = await createProduct({ price: 1050, originalPrice: 1200, stock: 5 });
+  await setSettings({ deliveryCharge: 0, freeShippingMinAmount: 0, platformFee: 23, gstRate: 5, codCharge: 0 });
+
+  const { status, data } = await request('/api/orders/quote', {
+    method: 'POST',
+    token,
+    body: { orderItems: [{ product: String(product._id), quantity: 1 }], paymentMethod: 'COD' },
+  });
+
+  assert.equal(status, 200);
+  assert.equal(data.totals.platformFee, 23);
+  assert.equal(data.totals.taxRate, 5);
+  assert.equal(data.totals.taxAmount, 50);
+  assert.equal(data.totals.finalAmount, 1073);
+});
+
 test('the quote endpoint returns backend totals and allowed payment methods', async () => {
   const { token } = await createCustomer();
   const product = await createProduct({ price: 500, originalPrice: 800, stock: 5 });

@@ -22,6 +22,8 @@ exports.getPaymentMethods = asyncHandler(async (req, res) => {
     codMinAmount: Number(settings.codMinAmount || 0) || null,
     deliveryCharge: Number(settings.deliveryCharge ?? 99),
     freeShippingMinAmount: Number(settings.freeShippingMinAmount ?? 999),
+    platformFee: Number(settings.platformFee ?? 23),
+    gstRate: Number(settings.gstRate ?? 5),
   });
 });
 
@@ -37,7 +39,7 @@ exports.updateSettings = asyncHandler(async (req, res) => {
     throw new ApiError('VALIDATION_ERROR', 'Valid email is required');
   }
 
-  for (const field of ['deliveryCharge', 'freeShippingMinAmount', 'codCharge', 'codMaxAmount', 'codMinAmount', 'returnWindowDays', 'prepaidDiscountValue', 'rtoBlockMinOrders', 'rtoBlockThreshold']) {
+  for (const field of ['deliveryCharge', 'freeShippingMinAmount', 'codCharge', 'codMaxAmount', 'codMinAmount', 'returnWindowDays', 'prepaidDiscountValue', 'rtoBlockMinOrders', 'rtoBlockThreshold', 'platformFee', 'gstRate']) {
     if (updates[field] === undefined || updates[field] === '') continue;
     const value = Number(updates[field]);
     if (!Number.isFinite(value) || value < 0) {

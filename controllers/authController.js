@@ -50,9 +50,21 @@ exports.register = async (req, res, next) => {
 
 exports.login = async (req, res) => {
   const email = String(req.body?.email || '').trim().toLowerCase();
+  const phone = String(req.body?.phone || '').replace(/\D/g, '').replace(/^91/, '');
   const password = String(req.body?.password || '');
-  const user = email ? await User.findOne({ email }) : null;
-  if (!user || !(await user.matchPassword(password))) return res.status(401).json({ success: false, code: 'UNAUTHORIZED', message: 'Invalid credentials' });
+  let user = email ? await User.findOne({ email }) : null;
+  if (!user && /^[6-9]\d{9}$/.test(phone)) {
+    user = await User.findOne({ phone });
+  }
+  if (!user) return res.status(401).json({ success: false, code: 'UNAUTHORIZED', message: 'Invalid email, mobile number or password' });
+  if (!user.password) {
+    return res.status(401).json({
+      success: false,
+      code: 'UNAUTHORIZED',
+      message: 'This account uses OTP login. Go back and continue with OTP.',
+    });
+  }
+  if (!(await user.matchPassword(password))) return res.status(401).json({ success: false, code: 'UNAUTHORIZED', message: 'Invalid credentials' });
   if (user.isBlocked) return res.status(403).json({ success: false, code: 'FORBIDDEN', message: 'Account is blocked' });
   const shouldUpgradePassword = user.hasLegacyPlainPassword?.();
   if (user.role === 'admin') {
