@@ -15,8 +15,15 @@ exports.getSettings = asyncHandler(async (req, res) => {
  */
 exports.getPaymentMethods = asyncHandler(async (req, res) => {
   const settings = await getStoreSettings();
+  const requestedAmount = req.query.amount === undefined || req.query.amount === ''
+    ? null
+    : Number(req.query.amount);
   res.json({
-    methods: buildPaymentOptions(settings, { razorpayConfigured: isRazorpayConfigured() }),
+    methods: buildPaymentOptions(settings, {
+      razorpayConfigured: isRazorpayConfigured(),
+      orderAmount: Number.isFinite(requestedAmount) ? requestedAmount : null,
+      pincode: String(req.query.pincode || ''),
+    }),
     codCharge: Math.max(0, Number(settings.codCharge || 0)),
     codMaxAmount: Number(settings.codMaxAmount || 0) || null,
     codMinAmount: Number(settings.codMinAmount || 0) || null,

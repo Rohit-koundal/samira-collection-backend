@@ -54,7 +54,6 @@ app.get('/health', async (req, res) => {
 app.use('/api', devFallback);
 
 app.use('/api/auth', require('./routes/authRoutes'));
-app.post('/api/admin/login', require('./controllers/authController').login);
 app.use('/api/admin/customers', protect, adminOnly, require('./routes/customerAdminRoutes'));
 app.use('/api/admin/users', protect, adminOnly, require('./routes/customerAdminRoutes'));
 app.use('/api/admin', require('./routes/adminAuthRoutes'));

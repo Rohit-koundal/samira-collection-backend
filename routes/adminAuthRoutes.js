@@ -4,7 +4,7 @@ const dashboard = require('../controllers/dashboardController');
 const { protect } = require('../middleware/authMiddleware');
 const { adminOnly } = require('../middleware/adminMiddleware');
 
-router.post('/login', auth.login);
+router.post('/login', auth.adminLogin);
 router.get('/profile', protect, adminOnly, auth.profile);
 router.get('/dashboard/stats', protect, adminOnly, dashboard.stats);
 router.get('/dashboard/overview', protect, adminOnly, dashboard.overview);

@@ -9,49 +9,20 @@ test.before(startTestEnvironment);
 test.after(stopTestEnvironment);
 test.beforeEach(resetDatabase);
 
-test('public registration cannot create an admin account', async () => {
-  const { status, data } = await request('/api/auth/register', {
+test('password-based customer registration is disabled because signup is OTP-only', async () => {
+  const { status } = await request('/api/auth/register', {
     method: 'POST',
     body: {
-      name: 'Attacker',
+      name: 'Legacy customer',
       phone: '9812345670',
-      email: 'attacker@test.local',
+      email: 'legacy@test.local',
       password: 'password123',
-      role: 'admin',
-      activeMode: 'admin',
-      availableModes: ['customer', 'admin'],
-      isPhoneVerified: true,
-      isBlocked: false,
     },
   });
 
-  assert.equal(status, 201);
-  assert.equal(data.user.role, 'customer');
-  assert.equal(data.user.activeMode, 'customer');
-  assert.deepEqual(data.user.availableModes, ['customer']);
-  assert.equal(data.user.isPhoneVerified, false);
-
+  assert.equal(status, 404);
   const stored = await User.findOne({ phone: '9812345670' });
-  assert.equal(stored.role, 'customer');
-});
-
-test('registration rejects an invalid phone number', async () => {
-  const { status, data } = await request('/api/auth/register', {
-    method: 'POST',
-    body: { name: 'Bad Phone', phone: '12345', password: 'password123' },
-  });
-
-  assert.equal(status, 400);
-  assert.equal(data.code, 'VALIDATION_ERROR');
-});
-
-test('registration does not return the password hash', async () => {
-  const { data } = await request('/api/auth/register', {
-    method: 'POST',
-    body: { name: 'Safe User', phone: '9812345671', password: 'password123' },
-  });
-
-  assert.equal(data.user.password, undefined);
+  assert.equal(stored, null);
 });
 
 test('a customer cannot promote themselves to admin', async () => {
@@ -191,7 +162,20 @@ test('an admin login attempt with wrong credentials is rejected', async () => {
   assert.equal(status, 401);
 });
 
-test('a customer can log in with email or mobile and password', async () => {
+test('an admin can sign in through the separate admin password endpoint', async () => {
+  await createAdmin({ email: 'adminlogin@test.local', password: 'CorrectHorse1' });
+  const { status, data } = await request('/api/admin/login', {
+    method: 'POST',
+    body: { email: 'adminlogin@test.local', password: 'CorrectHorse1' },
+  });
+
+  assert.equal(status, 200);
+  assert.equal(data.user.role, 'admin');
+  assert.equal(data.user.activeMode, 'admin');
+  assert.ok(data.token);
+});
+
+test('customer password login is disabled because storefront login is OTP-only', async () => {
   await createCustomer({
     email: 'shopper@test.local',
     phone: '9812345699',
@@ -202,25 +186,17 @@ test('a customer can log in with email or mobile and password', async () => {
     method: 'POST',
     body: { email: 'shopper@test.local', password: 'CorrectHorse1' },
   });
-  assert.equal(byEmail.status, 200);
-  assert.equal(byEmail.data.user.phone, '9812345699');
-
-  const byPhone = await request('/api/auth/login', {
-    method: 'POST',
-    body: { phone: '9812345699', password: 'CorrectHorse1' },
-  });
-  assert.equal(byPhone.status, 200);
-  assert.equal(byPhone.data.user.email, 'shopper@test.local');
+  assert.equal(byEmail.status, 404);
 });
 
-test('an OTP-only account cannot use password login', async () => {
-  await createCustomer({ email: 'otpuser@test.local', phone: '9812345698' });
-  const { status, data } = await request('/api/auth/login', {
+test('a customer account cannot use the admin password login', async () => {
+  await createCustomer({ email: 'shopper@test.local', phone: '9812345698', password: 'CorrectHorse1' });
+  const { status, data } = await request('/api/admin/login', {
     method: 'POST',
-    body: { phone: '9812345698', password: 'anything1' },
+    body: { email: 'shopper@test.local', password: 'CorrectHorse1' },
   });
-  assert.equal(status, 401);
-  assert.match(String(data.message), /OTP/i);
+  assert.equal(status, 403);
+  assert.match(String(data.message), /admin/i);
 });
 
 test('a blocked admin cannot log in with a password', async () => {

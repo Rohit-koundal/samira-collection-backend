@@ -7,48 +7,13 @@ const { sendOtp } = require('../services/smsService');
 const { sendOtpEmail } = require('../services/emailService');
 const { getDemoOtp, getJwtRefreshSecret, getJwtSecret, getOtpMode, isDemoOtpMode } = require('../config/env');
 const { ApiError } = require('../utils/apiError');
-const { optionalEmail, requireIndianMobile, requireString } = require('../utils/validators');
 const { listMemberships } = require('../services/storeService');
 
 const otpRateLimit = new Map();
 const offlineProfiles = new Map();
 const PROFILE_VERIFICATION_TOKEN_TTL = process.env.PROFILE_VERIFICATION_TOKEN_TTL || '15m';
 
-/**
- * Public self-service registration. Only the fields below may come from the
- * client; role, mode and verification flags are always decided server-side so
- * a crafted request cannot create an admin or a pre-verified account.
- */
-exports.register = async (req, res, next) => {
-  try {
-    const name = requireString(req.body?.name, 'name', { max: 80 });
-    const phone = requireIndianMobile(req.body?.phone);
-    const email = optionalEmail(req.body?.email);
-    const password = requireString(req.body?.password, 'password', { min: 6, max: 128 });
-
-    const existing = await User.findOne(email ? { $or: [{ phone }, { email }] } : { phone }).select('_id');
-    if (existing) throw new ApiError('VALIDATION_ERROR', 'An account already exists with these details. Please login instead.');
-
-    const user = await User.create({
-      name,
-      phone,
-      ...(email ? { email } : {}),
-      password,
-      role: 'customer',
-      activeMode: 'customer',
-      availableModes: ['customer'],
-      isPhoneVerified: false,
-      isEmailVerified: false,
-      isBlocked: false,
-    });
-
-    res.status(201).json(authPayload(user));
-  } catch (error) {
-    next(error);
-  }
-};
-
-exports.login = async (req, res) => {
+async function passwordLogin(req, res, { requireAdmin = false } = {}) {
   const email = String(req.body?.email || '').trim().toLowerCase();
   const phone = String(req.body?.phone || '').replace(/\D/g, '').replace(/^91/, '');
   const password = String(req.body?.password || '');
@@ -66,6 +31,9 @@ exports.login = async (req, res) => {
   }
   if (!(await user.matchPassword(password))) return res.status(401).json({ success: false, code: 'UNAUTHORIZED', message: 'Invalid credentials' });
   if (user.isBlocked) return res.status(403).json({ success: false, code: 'FORBIDDEN', message: 'Account is blocked' });
+  if (requireAdmin && user.role !== 'admin') {
+    return res.status(403).json({ success: false, code: 'FORBIDDEN', message: 'Admin access is required' });
+  }
   const shouldUpgradePassword = user.hasLegacyPlainPassword?.();
   if (user.role === 'admin') {
     user.availableModes = ['customer', 'admin'];
@@ -78,7 +46,11 @@ exports.login = async (req, res) => {
     await user.save();
   }
   res.json(authPayload(user));
-};
+}
+
+// Password authentication is reserved for the separate admin workspace.
+// Storefront customers use the mobile OTP endpoints below.
+exports.adminLogin = (req, res) => passwordLogin(req, res, { requireAdmin: true });
 
 exports.profile = async (req, res) => res.json(req.user);
 
