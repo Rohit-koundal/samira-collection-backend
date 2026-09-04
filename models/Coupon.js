@@ -3,6 +3,9 @@ const storeIdPlugin = require('./plugins/storeId');
 
 const couponSchema = new mongoose.Schema({
   code: { type: String, required: true, unique: true, uppercase: true, trim: true },
+  title: { type: String, trim: true, maxlength: 120 },
+  description: { type: String, trim: true, maxlength: 500 },
+  terms: { type: String, trim: true, maxlength: 1200 },
   type: { type: String, enum: ['Percentage', 'Flat'], required: true },
   discountValue: { type: Number, required: true },
   minOrderAmount: { type: Number, default: 0 },
@@ -18,6 +21,7 @@ const couponSchema = new mongoose.Schema({
   applicableCategories: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Category' }],
   customerLimit: Number,
   firstOrderOnly: { type: Boolean, default: false },
+  isPublic: { type: Boolean, default: true },
   isActive: { type: Boolean, default: true },
 }, { timestamps: true });
 

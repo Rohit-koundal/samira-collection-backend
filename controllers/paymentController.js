@@ -132,6 +132,7 @@ async function createPaymentOrder(req, res) {
     paymentMethod: req.body?.paymentMethod || 'UPI',
     userId: req.user?._id,
     shippingAddress,
+    tenantFilter: req.tenantFilter,
   });
 
   const amountInPaise = amountToPaise(draft.totals.finalAmount);

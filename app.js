@@ -3,7 +3,6 @@ const express = require('express');
 const cors = require('cors');
 const mongoose = require('mongoose');
 const { notFound, errorHandler } = require('./middleware/errorMiddleware');
-const devFallback = require('./middleware/devFallbackMiddleware');
 const { protect } = require('./middleware/authMiddleware');
 const { adminOnly } = require('./middleware/adminMiddleware');
 const { optionalResolveStore, requireStoreMember } = require('./middleware/storeMiddleware');
@@ -51,8 +50,6 @@ app.get('/health', async (req, res) => {
   });
 });
 
-app.use('/api', devFallback);
-
 app.use('/api/auth', require('./routes/authRoutes'));
 app.use('/api/admin/customers', protect, adminOnly, require('./routes/customerAdminRoutes'));
 app.use('/api/admin/users', protect, adminOnly, require('./routes/customerAdminRoutes'));
@@ -60,11 +57,12 @@ app.use('/api/admin', require('./routes/adminAuthRoutes'));
 app.use('/api/admin/products', protect, adminOnly, require('./routes/adminProductRoutes'));
 app.use('/api/admin/categories', protect, adminOnly, require('./routes/categoryRoutes'));
 app.use('/api/admin/orders', protect, adminOnly, require('./routes/orderRoutes'));
-app.use('/api/admin/coupons', protect, adminOnly, require('./routes/couponRoutes'));
+app.use('/api/admin/coupons', protect, adminOnly, optionalResolveStore, require('./routes/couponRoutes'));
 app.use('/api/admin/banners', protect, adminOnly, require('./routes/bannerRoutes'));
 app.use('/api/admin/reviews', protect, adminOnly, require('./routes/reviewRoutes'));
 app.use('/api/admin/returns', protect, adminOnly, require('./routes/returnRoutes'));
 app.use('/api/admin/settings', protect, adminOnly, require('./routes/settingsRoutes'));
+app.use('/api/admin/customization', protect, adminOnly, require('./routes/websiteCustomizationRoutes'));
 app.use('/api/admin/uploads', require('./routes/uploadRoutes'));
 app.use('/api/admin/upload', require('./routes/uploadRoutes'));
 app.use('/api/admin/product-drafts', require('./routes/productDraftRoutes'));
@@ -89,11 +87,12 @@ const { wrapPaymentHandler } = require('./utils/paymentRouteHandler');
 app.post('/api/create-order', protect, wrapPaymentHandler(paymentController.createPaymentOrder));
 app.post('/api/verify-payment', protect, wrapPaymentHandler(paymentController.verifyPayment));
 
-app.use('/api/coupons', require('./routes/couponRoutes'));
+app.use('/api/coupons', optionalResolveStore, require('./routes/couponRoutes'));
 app.use('/api/banners', optionalResolveStore, require('./routes/bannerRoutes'));
-app.use('/api/reviews', require('./routes/reviewRoutes'));
+app.use('/api/reviews', optionalResolveStore, require('./routes/reviewRoutes'));
 app.use('/api/returns', require('./routes/returnRoutes'));
 app.use('/api/settings', require('./routes/settingsRoutes'));
+app.get('/api/website-config', require('./controllers/websiteCustomizationController').getActiveConfig);
 app.use('/api/contact', optionalResolveStore, require('./routes/contactRoutes'));
 app.use('/api/newsletter', optionalResolveStore, require('./routes/newsletterRoutes'));
 app.use('/api/notifications', require('./routes/notificationRoutes'));

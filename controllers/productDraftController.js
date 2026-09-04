@@ -157,7 +157,7 @@ function buildProductPayloadFromDraft(draft) {
     name: data.name,
     slug: data.slug || slugify(data.name || 'product'),
     sku: data.sku,
-    brand: data.brand || 'Samira Collection',
+    brand: data.brand || '',
     shortDescription: data.shortDescription || '',
     description: data.description || '',
     category: data.category?._id || data.category || undefined,

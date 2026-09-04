@@ -11,6 +11,8 @@ const reviewSchema = new mongoose.Schema({
   photos: [String],
   verifiedPurchase: { type: Boolean, default: false },
   isVisible: { type: Boolean, default: true },
+  helpfulBy: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User', select: false }],
+  helpfulCount: { type: Number, default: 0, min: 0 },
 }, { timestamps: true });
 
 reviewSchema.plugin(storeIdPlugin);

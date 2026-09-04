@@ -121,6 +121,57 @@ test('the public coupon list hides expired coupons', async () => {
   assert.equal(codes.includes('DEADONE'), false);
 });
 
+test('the public coupon list hides future, exhausted and private coupons', async () => {
+  await createCoupon({ code: 'PUBLIC10', usedCount: 3 });
+  await createCoupon({ code: 'FUTURE10', validFrom: new Date(Date.now() + 86400000) });
+  await createCoupon({ code: 'USEDUP10', usageLimit: 2, usedCount: 2 });
+  await createCoupon({ code: 'PRIVATE10', isPublic: false });
+
+  const { status, data } = await request('/api/coupons');
+  assert.equal(status, 200);
+  assert.deepEqual(data.map((coupon) => coupon.code), ['PUBLIC10']);
+  assert.equal(Object.hasOwn(data[0], 'usedCount'), false, 'internal usage details are not exposed publicly');
+  assert.equal(Object.hasOwn(data[0], 'isActive'), false, 'internal status is not exposed publicly');
+});
+
+test('available coupons are evaluated against the bag and sorted by real savings', async () => {
+  const product = await createProduct({ price: 2000, stock: 5 });
+  await createCoupon({ code: 'TENPERCENT', type: 'Percentage', discountValue: 10 });
+  await createCoupon({ code: 'SAVE350', type: 'Flat', discountValue: 350 });
+  await createCoupon({ code: 'SPEND3000', type: 'Flat', discountValue: 500, minOrderAmount: 3000 });
+
+  const { status, data } = await request('/api/coupons/available', {
+    method: 'POST',
+    body: { items: [{ product: String(product._id), quantity: 1 }], paymentMethod: 'COD' },
+  });
+
+  assert.equal(status, 200);
+  assert.equal(data.cartTotal, 2000);
+  assert.equal(data.bestCouponCode, 'SAVE350', JSON.stringify(data));
+  assert.equal(data.items[0].code, 'SAVE350');
+  assert.equal(data.items[0].estimatedDiscount, 350);
+  const unavailable = data.items.find((coupon) => coupon.code === 'SPEND3000');
+  assert.equal(unavailable.eligible, false);
+  assert.equal(unavailable.amountNeeded, 1000);
+});
+
+test('coupon preview ignores prices and totals supplied by the browser', async () => {
+  const product = await createProduct({ price: 2000, stock: 5 });
+  const coupon = await createCoupon({ code: 'SAFE10', type: 'Percentage', discountValue: 10 });
+
+  const { status, data } = await request('/api/coupons/apply', {
+    method: 'POST',
+    body: {
+      code: coupon.code,
+      cartTotal: 1,
+      items: [{ product: String(product._id), quantity: 1, price: 1, lineTotal: 1 }],
+    },
+  });
+
+  assert.equal(status, 200);
+  assert.equal(data.discountAmount, 200);
+});
+
 test('an anonymous caller cannot list all coupons via the admin flag', async () => {
   await createCoupon({ code: 'HIDDEN1', isActive: false });
   const { data } = await request('/api/coupons?admin=true');
@@ -132,6 +183,14 @@ test('an admin can list inactive coupons', async () => {
   await createCoupon({ code: 'HIDDEN2', isActive: false });
   const { data } = await request('/api/admin/coupons?admin=true', { token });
   assert.equal(data.some((coupon) => coupon.code === 'HIDDEN2'), true);
+});
+
+test('the admin coupon endpoint returns management data without a query flag', async () => {
+  const { token } = await createAdmin();
+  await createCoupon({ code: 'HIDDEN3', isActive: false, usedCount: 4 });
+  const { status, data } = await request('/api/admin/coupons', { token });
+  assert.equal(status, 200);
+  assert.equal(data.find((coupon) => coupon.code === 'HIDDEN3').usedCount, 4);
 });
 
 test('a customer cannot create a coupon', async () => {
@@ -193,6 +252,57 @@ test('creating a coupon ignores usedCount from the client', async () => {
   assert.equal(status, 201);
   assert.equal(data.usedCount, 0);
   assert.equal((await Coupon.findById(data._id)).usedCount, 0);
+});
+
+test('coupon administration rejects invalid limits, date ranges and duplicate codes', async () => {
+  const { token } = await createAdmin();
+  await createCoupon({ code: 'UNIQUE10' });
+  const base = { code: 'NEWCODE', type: 'Flat', discountValue: 100, expiryDate: new Date(Date.now() + 86400000) };
+
+  const negative = await request('/api/admin/coupons', { method: 'POST', token, body: { ...base, usageLimit: -1 } });
+  assert.equal(negative.status, 400);
+  assert.equal(negative.data.code, 'VALIDATION_ERROR');
+
+  const invalidDates = await request('/api/admin/coupons', {
+    method: 'POST', token, body: { ...base, validFrom: new Date(Date.now() + 172800000), expiryDate: new Date(Date.now() + 86400000) },
+  });
+  assert.equal(invalidDates.status, 400);
+
+  const duplicate = await request('/api/admin/coupons', { method: 'POST', token, body: { ...base, code: 'UNIQUE10' } });
+  assert.equal(duplicate.status, 409);
+  assert.equal(duplicate.data.code, 'DUPLICATE_REQUEST');
+});
+
+test('coupon updates validate the complete resulting offer', async () => {
+  const { token } = await createAdmin();
+  const coupon = await createCoupon({ type: 'Flat', discountValue: 500 });
+
+  const { status, data } = await request(`/api/admin/coupons/${coupon._id}`, {
+    method: 'PUT', token, body: { type: 'Percentage' },
+  });
+
+  assert.equal(status, 400);
+  assert.equal(data.code, 'VALIDATION_ERROR');
+  assert.equal((await Coupon.findById(coupon._id)).type, 'Flat');
+});
+
+test('unused coupons are deleted while redeemed coupons are archived', async () => {
+  const { token } = await createAdmin();
+  const unused = await createCoupon({ code: 'UNUSED10' });
+  const used = await createCoupon({ code: 'USEDONCE', usedCount: 1 });
+
+  const deleted = await request(`/api/admin/coupons/${unused._id}`, { method: 'DELETE', token });
+  assert.equal(deleted.status, 200);
+  assert.equal(deleted.data.archived, false);
+  assert.equal(await Coupon.findById(unused._id), null);
+
+  const archived = await request(`/api/admin/coupons/${used._id}`, { method: 'DELETE', token });
+  assert.equal(archived.status, 200);
+  assert.equal(archived.data.archived, true);
+  const stored = await Coupon.findById(used._id);
+  assert.equal(stored.isActive, false);
+  assert.equal(stored.isPublic, false);
+  assert.equal(stored.usedCount, 1);
 });
 
 test('a product-restricted coupon is refused for other products', async () => {

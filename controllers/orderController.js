@@ -69,6 +69,7 @@ exports.quoteOrder = asyncHandler(async (req, res) => {
     settings,
     userId: req.user?._id,
     shippingAddress: req.body.shippingAddress,
+    tenantFilter: req.tenantFilter,
   });
 
   return res.json({
@@ -97,6 +98,7 @@ exports.createOrder = asyncHandler(async (req, res) => {
     paymentMethod: req.body?.paymentMethod || 'COD',
     userId: req.user?._id,
     shippingAddress,
+    tenantFilter: req.tenantFilter,
   });
 
   const order = await runInTransaction(async (session) => {

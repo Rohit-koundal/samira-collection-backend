@@ -2,6 +2,7 @@ const Coupon = require('../models/Coupon');
 const Order = require('../models/Order');
 const { ApiError } = require('../utils/apiError');
 const { requireCouponCode } = require('../utils/validators');
+const { andFilter } = require('./storeService');
 
 /**
  * Single source of truth for coupon rules.
@@ -28,6 +29,8 @@ function itemCategoryId(item) {
 }
 
 function itemLineTotal(item) {
+  const storedLineTotal = Number(item?.lineTotal);
+  if (Number.isFinite(storedLineTotal) && storedLineTotal >= 0) return storedLineTotal;
   return Number(item?.price || 0) * Math.max(1, Number(item?.quantity || 1));
 }
 
@@ -58,15 +61,15 @@ function eligibleCartTotal(coupon, cartTotal, items) {
   return eligible;
 }
 
-async function assertCustomerRules(coupon, userId) {
+async function assertCustomerRules(coupon, userId, tenantFilter = {}) {
   if (!userId || !coupon) return;
 
   if (coupon.firstOrderOnly) {
-    const prior = await Order.countDocuments({
+    const prior = await Order.countDocuments(andFilter({
       user: userId,
       orderStatus: { $ne: 'Cancelled' },
       paymentStatus: { $ne: 'Failed' },
-    });
+    }, tenantFilter));
     if (prior > 0) {
       throw new ApiError('INVALID_COUPON', 'This coupon is valid on your first order only');
     }
@@ -74,12 +77,12 @@ async function assertCustomerRules(coupon, userId) {
 
   const customerLimit = Number(coupon.customerLimit || 0);
   if (customerLimit > 0) {
-    const usedByCustomer = await Order.countDocuments({
+    const usedByCustomer = await Order.countDocuments(andFilter({
       user: userId,
       'coupon.code': coupon.code,
       orderStatus: { $ne: 'Cancelled' },
       paymentStatus: { $ne: 'Failed' },
-    });
+    }, tenantFilter));
     if (usedByCustomer >= customerLimit) {
       throw new ApiError('INVALID_COUPON', 'You have already used this coupon the maximum number of times');
     }
@@ -89,17 +92,15 @@ async function assertCustomerRules(coupon, userId) {
 /**
  * Loads a coupon and checks every rule. Never trusts a client-sent discount.
  */
-async function validateCoupon({ code, cartTotal, paymentMethod, items, userId } = {}) {
-  const normalizedCode = requireCouponCode(code);
-  const coupon = await Coupon.findOne({ code: normalizedCode });
-
+async function assertCouponRules(coupon, { cartTotal, paymentMethod, items, userId, tenantFilter = {} } = {}) {
   if (!coupon || !coupon.isActive) {
     throw new ApiError('INVALID_COUPON', 'This coupon code is not valid');
   }
-  if (coupon.validFrom && new Date(coupon.validFrom) > new Date()) {
+  const now = new Date();
+  if (coupon.validFrom && new Date(coupon.validFrom) > now) {
     throw new ApiError('INVALID_COUPON', 'This coupon is not active yet');
   }
-  if (coupon.expiryDate && new Date(coupon.expiryDate) < new Date()) {
+  if (coupon.expiryDate && new Date(coupon.expiryDate) < now) {
     throw new ApiError('COUPON_EXPIRED', 'This coupon has expired');
   }
   if (coupon.usageLimit && Number(coupon.usedCount || 0) >= Number(coupon.usageLimit)) {
@@ -111,18 +112,29 @@ async function validateCoupon({ code, cartTotal, paymentMethod, items, userId } 
     throw new ApiError('INVALID_COUPON', 'Add items to your bag before applying a coupon');
   }
   if (coupon.minOrderAmount && amount < Number(coupon.minOrderAmount)) {
-    throw new ApiError('INVALID_COUPON', `Add items worth Rs. ${Math.ceil(Number(coupon.minOrderAmount) - amount)} more to use this coupon`);
+    const amountNeeded = Math.ceil(Number(coupon.minOrderAmount) - amount);
+    const error = new ApiError('INVALID_COUPON', `Add items worth Rs. ${amountNeeded} more to use this coupon`);
+    error.amountNeeded = amountNeeded;
+    throw error;
   }
 
-  const allowedMethods = Array.isArray(coupon.applicablePaymentMethods) ? coupon.applicablePaymentMethods.filter(Boolean) : [];
-  if (paymentMethod && allowedMethods.length && !allowedMethods.includes(paymentMethod)) {
-    throw new ApiError('INVALID_COUPON', `This coupon cannot be used with ${paymentMethod} payments`);
+  const method = String(paymentMethod || '').toUpperCase();
+  const allowedMethods = Array.isArray(coupon.applicablePaymentMethods)
+    ? coupon.applicablePaymentMethods.map((item) => String(item).toUpperCase()).filter(Boolean)
+    : [];
+  if (method && allowedMethods.length && !allowedMethods.includes(method)) {
+    throw new ApiError('INVALID_COUPON', `This coupon cannot be used with ${method} payments`);
   }
 
   eligibleCartTotal(coupon, cartTotal, items);
-  await assertCustomerRules(coupon, userId);
-
+  await assertCustomerRules(coupon, userId, tenantFilter);
   return coupon;
+}
+
+async function validateCoupon({ code, cartTotal, paymentMethod, items, userId, tenantFilter = {} } = {}) {
+  const normalizedCode = requireCouponCode(code);
+  const coupon = await Coupon.findOne(andFilter({ code: normalizedCode }, tenantFilter));
+  return assertCouponRules(coupon, { cartTotal, paymentMethod, items, userId, tenantFilter });
 }
 
 /** Discount is always recomputed from the stored coupon definition. */
@@ -139,21 +151,42 @@ function calculateDiscount(coupon, cartTotal, items) {
 }
 
 /** Convenience wrapper returning both the coupon and its computed discount. */
-async function validateAndPrice({ code, cartTotal, paymentMethod, items, userId } = {}) {
-  const coupon = await validateCoupon({ code, cartTotal, paymentMethod, items, userId });
+async function validateAndPrice({ code, cartTotal, paymentMethod, items, userId, tenantFilter = {} } = {}) {
+  const coupon = await validateCoupon({ code, cartTotal, paymentMethod, items, userId, tenantFilter });
   return { coupon, discountAmount: calculateDiscount(coupon, cartTotal, items) };
+}
+
+async function evaluateCoupon(coupon, context = {}) {
+  try {
+    await assertCouponRules(coupon, context);
+    return {
+      eligible: true,
+      estimatedDiscount: calculateDiscount(coupon, context.cartTotal, context.items),
+      reason: '',
+      reasonCode: '',
+      amountNeeded: 0,
+    };
+  } catch (error) {
+    return {
+      eligible: false,
+      estimatedDiscount: 0,
+      reason: error.message || 'This coupon is not eligible for your bag',
+      reasonCode: error.errorCode || 'INVALID_COUPON',
+      amountNeeded: Number(error.amountNeeded || 0),
+    };
+  }
 }
 
 /**
  * Increments usage only while the limit still allows it, so two orders racing
  * for the last redemption cannot both consume it.
  */
-async function consumeCoupon(code, { session } = {}) {
+async function consumeCoupon(code, { session, tenantFilter = {} } = {}) {
   if (!code) return null;
   const normalizedCode = String(code).toUpperCase();
 
   const withinLimit = await Coupon.findOneAndUpdate(
-    {
+    andFilter({
       code: normalizedCode,
       $or: [
         { usageLimit: { $exists: false } },
@@ -161,7 +194,7 @@ async function consumeCoupon(code, { session } = {}) {
         { usageLimit: 0 },
         { $expr: { $lt: ['$usedCount', '$usageLimit'] } },
       ],
-    },
+    }, tenantFilter),
     { $inc: { usedCount: 1 } },
     { new: true, session },
   );
@@ -173,10 +206,10 @@ async function consumeCoupon(code, { session } = {}) {
 }
 
 /** Gives a redemption back; never drives usedCount below zero. */
-async function releaseCoupon(code, { session } = {}) {
+async function releaseCoupon(code, { session, tenantFilter = {} } = {}) {
   if (!code) return null;
   return Coupon.findOneAndUpdate(
-    { code: String(code).toUpperCase(), usedCount: { $gt: 0 } },
+    andFilter({ code: String(code).toUpperCase(), usedCount: { $gt: 0 } }, tenantFilter),
     { $inc: { usedCount: -1 } },
     { new: true, session },
   );
@@ -185,6 +218,7 @@ async function releaseCoupon(code, { session } = {}) {
 module.exports = {
   calculateDiscount,
   consumeCoupon,
+  evaluateCoupon,
   releaseCoupon,
   validateAndPrice,
   validateCoupon,

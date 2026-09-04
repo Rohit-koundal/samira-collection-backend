@@ -21,6 +21,7 @@ const {
   resolvePrepaidDiscount,
 } = require('./paymentSettingsService');
 const { requireObjectId, requireQuantity } = require('../utils/validators');
+const { andFilter, defaultStoreFilter } = require('./storeService');
 
 /**
  * Authoritative order pricing.
@@ -40,7 +41,7 @@ function normalizeMethod(paymentMethod) {
   return method === 'RAZORPAY' ? 'UPI' : method;
 }
 
-async function loadOrderItems(orderItems) {
+async function loadOrderItems(orderItems, { tenantFilter = {} } = {}) {
   if (!Array.isArray(orderItems) || !orderItems.length) {
     throw new ApiError('VALIDATION_ERROR', 'Your bag is empty');
   }
@@ -56,7 +57,7 @@ async function loadOrderItems(orderItems) {
     const productId = requireObjectId(raw.product || raw.productId, 'product');
     const quantity = requireQuantity(raw.quantity ?? 1, 'quantity');
 
-    const product = await Product.findById(productId);
+    const product = await Product.findOne(andFilter({ _id: productId }, tenantFilter));
     if (!product) throw new ApiError('NOT_FOUND', `${raw.name || 'A product'} is no longer available`);
     if (product.isActive === false || product.isArchived) throw new ApiError('OUT_OF_STOCK', `${product.name} is no longer available`);
 
@@ -116,7 +117,7 @@ async function loadOrderItems(orderItems) {
  * Builds the priced order draft used by COD checkout, Razorpay order
  * creation, payment verification and the checkout quote endpoint.
  */
-async function buildOrderDraft({ orderItems, couponCode, paymentMethod, settings, userId, shippingAddress } = {}) {
+async function buildOrderDraft({ orderItems, couponCode, paymentMethod, settings, userId, shippingAddress, tenantFilter } = {}) {
   const storeSettings = settings || await getStoreSettings();
   const method = normalizeMethod(paymentMethod);
   const { items, totalMRP, sellingTotal } = await loadOrderItems(orderItems);
@@ -124,12 +125,17 @@ async function buildOrderDraft({ orderItems, couponCode, paymentMethod, settings
   let coupon = null;
   let couponDiscount = 0;
   if (couponCode) {
+    // A checkout can originate from the main storefront or a seller domain.
+    // When no request tenant was resolved, derive it from the authoritative
+    // product rows while continuing to support legacy coupons without storeId.
+    const couponTenantFilter = tenantFilter || (items[0]?.storeId ? defaultStoreFilter(items[0].storeId) : {});
     const priced = await couponService.validateAndPrice({
       code: couponCode,
       cartTotal: sellingTotal,
       paymentMethod: method,
       items,
       userId,
+      tenantFilter: couponTenantFilter,
     });
     coupon = priced.coupon;
     couponDiscount = priced.discountAmount;

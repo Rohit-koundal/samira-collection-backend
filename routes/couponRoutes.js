@@ -3,6 +3,7 @@ const coupon = require('../controllers/couponController');
 const { optionalProtect, protect } = require('../middleware/authMiddleware');
 const { adminOnly } = require('../middleware/adminMiddleware');
 router.get('/', coupon.getCoupons);
+router.post('/available', optionalProtect, coupon.getAvailableCoupons);
 router.post('/apply', optionalProtect, coupon.applyCoupon);
 router.post('/', protect, adminOnly, coupon.createCoupon);
 router.put('/:id', protect, adminOnly, coupon.updateCoupon);
