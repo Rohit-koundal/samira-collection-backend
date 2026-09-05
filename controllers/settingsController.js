@@ -1,7 +1,7 @@
 const Settings = require('../models/Settings');
 const { asyncHandler } = require('../middleware/validate');
 const { ApiError } = require('../utils/apiError');
-const { buildPaymentOptions, getStoreSettings } = require('../services/paymentSettingsService');
+const { buildPaymentOptions, getStoreSettings, razorpayDisabledReason, razorpayUsable } = require('../services/paymentSettingsService');
 const { isRazorpayConfigured } = require('../services/razorpayService');
 const { logAudit } = require('../services/auditService');
 
@@ -15,12 +15,13 @@ exports.getSettings = asyncHandler(async (req, res) => {
  */
 exports.getPaymentMethods = asyncHandler(async (req, res) => {
   const settings = await getStoreSettings();
+  const razorpayConfigured = isRazorpayConfigured();
   const requestedAmount = req.query.amount === undefined || req.query.amount === ''
     ? null
     : Number(req.query.amount);
   res.json({
     methods: buildPaymentOptions(settings, {
-      razorpayConfigured: isRazorpayConfigured(),
+      razorpayConfigured,
       orderAmount: Number.isFinite(requestedAmount) ? requestedAmount : null,
       pincode: String(req.query.pincode || ''),
     }),
@@ -31,6 +32,28 @@ exports.getPaymentMethods = asyncHandler(async (req, res) => {
     freeShippingMinAmount: Number(settings.freeShippingMinAmount ?? 999),
     platformFee: Number(settings.platformFee ?? 23),
     gstRate: Number(settings.gstRate ?? 5),
+    gateway: {
+      provider: 'Razorpay',
+      enabled: Boolean(settings.razorpayEnabled),
+      configured: razorpayConfigured,
+      ready: razorpayUsable(settings, { razorpayConfigured }),
+      disabledReason: razorpayDisabledReason(settings, { razorpayConfigured }),
+    },
+  });
+});
+
+exports.getPaymentReadiness = asyncHandler(async (req, res) => {
+  const settings = await getStoreSettings();
+  const configured = isRazorpayConfigured();
+  const keyId = String(process.env.RAZORPAY_KEY_ID || '');
+  res.json({
+    provider: 'Razorpay',
+    enabled: Boolean(settings.razorpayEnabled),
+    configured,
+    ready: razorpayUsable(settings, { razorpayConfigured: configured }),
+    mode: configured ? (keyId.startsWith('rzp_live_') ? 'live' : 'test') : 'not-configured',
+    webhookConfigured: Boolean(process.env.RAZORPAY_WEBHOOK_SECRET),
+    disabledReason: razorpayDisabledReason(settings, { razorpayConfigured: configured }),
   });
 });
 

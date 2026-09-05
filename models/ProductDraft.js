@@ -13,6 +13,20 @@ const videoSchema = new mongoose.Schema({
   thumbnail: String,
 }, { _id: false });
 
+const sizeChartRowSchema = new mongoose.Schema({
+  size: String,
+  acrossShoulder: Number,
+  sleeveLength: Number,
+  bust: Number,
+  chest: Number,
+  waist: Number,
+  frontLength: Number,
+  bottomLength: Number,
+  hips: Number,
+  outseamLength: Number,
+  inseamLength: Number,
+}, { _id: false });
+
 const productDraftSchema = new mongoose.Schema({
   name: String,
   slug: String,
@@ -27,6 +41,14 @@ const productDraftSchema = new mongoose.Schema({
   sellingPrice: Number,
   stock: Number,
   sizes: [String],
+  sizingMode: { type: String, enum: ['auto', 'sized', 'free-size'], default: 'auto' },
+  sizeChartProfile: { type: String, default: 'auto' },
+  sizeChart: {
+    unit: { type: String, enum: ['in', 'cm'], default: 'in' },
+    columns: { type: [String], default: [] },
+    rows: { type: [sizeChartRowSchema], default: [] },
+  },
+  sizeFitNotes: String,
   colors: [String],
   fabric: String,
   occasion: String,

@@ -13,44 +13,14 @@ const otpRateLimit = new Map();
 const offlineProfiles = new Map();
 const PROFILE_VERIFICATION_TOKEN_TTL = process.env.PROFILE_VERIFICATION_TOKEN_TTL || '15m';
 
-async function passwordLogin(req, res, { requireAdmin = false } = {}) {
-  const email = String(req.body?.email || '').trim().toLowerCase();
-  const phone = String(req.body?.phone || '').replace(/\D/g, '').replace(/^91/, '');
-  const password = String(req.body?.password || '');
-  let user = email ? await User.findOne({ email }) : null;
-  if (!user && /^[6-9]\d{9}$/.test(phone)) {
-    user = await User.findOne({ phone });
-  }
-  if (!user) return res.status(401).json({ success: false, code: 'UNAUTHORIZED', message: 'Invalid email, mobile number or password' });
-  if (!user.password) {
-    return res.status(401).json({
-      success: false,
-      code: 'UNAUTHORIZED',
-      message: 'This account uses OTP login. Go back and continue with OTP.',
-    });
-  }
-  if (!(await user.matchPassword(password))) return res.status(401).json({ success: false, code: 'UNAUTHORIZED', message: 'Invalid credentials' });
-  if (user.isBlocked) return res.status(403).json({ success: false, code: 'FORBIDDEN', message: 'Account is blocked' });
-  if (requireAdmin && user.role !== 'admin') {
-    return res.status(403).json({ success: false, code: 'FORBIDDEN', message: 'Admin access is required' });
-  }
-  const shouldUpgradePassword = user.hasLegacyPlainPassword?.();
-  if (user.role === 'admin') {
-    user.availableModes = ['customer', 'admin'];
-    user.activeMode = 'admin';
-  }
-  if (shouldUpgradePassword) {
-    user.markModified('password');
-  }
-  if (user.role === 'admin' || shouldUpgradePassword) {
-    await user.save();
-  }
-  res.json(authPayload(user));
-}
-
-// Password authentication is reserved for the separate admin workspace.
-// Storefront customers use the mobile OTP endpoints below.
-exports.adminLogin = (req, res) => passwordLogin(req, res, { requireAdmin: true });
+// Kept as a compatibility endpoint for older clients. Password-based admin
+// access is intentionally disabled; every account, including admins, must be
+// verified through the shared mobile OTP flow.
+exports.adminLogin = (_req, res) => res.status(410).json({
+  success: false,
+  code: 'OTP_REQUIRED',
+  message: 'Admin access uses mobile number and OTP only.',
+});
 
 exports.profile = async (req, res) => res.json(req.user);
 

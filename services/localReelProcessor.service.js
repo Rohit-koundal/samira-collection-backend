@@ -4,46 +4,66 @@ const path = require('path');
 const { spawn } = require('child_process');
 const ffmpegPath = require('ffmpeg-static');
 const ffprobePath = require('ffprobe-static').path;
-const { downloadObject, putBufferToR2, getStorageProvider } = require('./mediaStorage.service');
-const { buildPublicUrl, isR2Configured } = require('./r2Upload');
+const Category = require('../models/Category');
+const { downloadObject, getStorageProvider, uploadGeneratedImage } = require('./mediaStorage.service');
+const { analyzeCandidateFiles, isVisionEnabled } = require('./reelCandidateVision.service');
+const { updateActiveRunProgress } = require('./reelImportProgress.service');
 
 const MAX_FRAMES = 24;
 const MAX_PRODUCTS = 8;
 const FRAMES_PER_PRODUCT = 3;
 
-function run(binary, args, { timeoutMs = 120000 } = {}) {
+function run(binary, args, { timeoutMs = 120000, signal } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(binary, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '';
     let stderr = '';
+    let settled = false;
+    const cleanup = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+    };
+    const fail = (error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(error);
+    };
+    const onAbort = () => {
+      child.kill('SIGKILL');
+      fail(Object.assign(new Error('Video processing was cancelled or timed out.'), { code: 'REEL_WORKER_TIMEOUT' }));
+    };
     const timer = setTimeout(() => {
       child.kill('SIGKILL');
-      reject(Object.assign(new Error('Video processing timed out.'), { code: 'REEL_WORKER_TIMEOUT' }));
+      fail(Object.assign(new Error('Video processing timed out.'), { code: 'REEL_WORKER_TIMEOUT' }));
     }, timeoutMs);
+    if (signal?.aborted) return onAbort();
+    signal?.addEventListener('abort', onAbort, { once: true });
     child.stdout.on('data', (chunk) => { stdout += String(chunk); });
     child.stderr.on('data', (chunk) => { stderr += String(chunk); });
     child.on('error', (error) => {
-      clearTimeout(timer);
-      reject(Object.assign(new Error(error.code === 'ENOENT' ? 'FFmpeg is not available for local reel processing.' : error.message), {
+      fail(Object.assign(new Error(error.code === 'ENOENT' ? 'FFmpeg is not available for local reel processing.' : error.message), {
         code: 'FFMPEG_UNAVAILABLE',
       }));
     });
     child.on('close', (code) => {
-      clearTimeout(timer);
+      if (settled) return;
+      settled = true;
+      cleanup();
       if (code === 0) resolve({ stdout, stderr });
       else reject(Object.assign(new Error(stderr.slice(-280) || 'FFmpeg failed.'), { code: 'FFMPEG_UNAVAILABLE' }));
     });
   });
 }
 
-async function probeVideo(filePath) {
+async function probeVideo(filePath, { signal } = {}) {
   const { stdout } = await run(ffprobePath, [
     '-v', 'error',
     '-print_format', 'json',
     '-show_format',
     '-show_streams',
     filePath,
-  ], { timeoutMs: 60000 });
+  ], { timeoutMs: 60000, signal });
 
   const payload = JSON.parse(stdout || '{}');
   const videoStream = (payload.streams || []).find((stream) => stream.codec_type === 'video') || {};
@@ -56,7 +76,7 @@ async function probeVideo(filePath) {
   };
 }
 
-async function extractFrames(videoPath, outputDir, fps = 0.5) {
+async function extractFrames(videoPath, outputDir, fps = 0.5, { signal } = {}) {
   await fsp.mkdir(outputDir, { recursive: true });
   const safeFps = Math.max(0.4, Math.min(1, Number(fps) || 0.5));
   const pattern = path.join(outputDir, 'frame-%04d.jpg');
@@ -69,7 +89,7 @@ async function extractFrames(videoPath, outputDir, fps = 0.5) {
     '-q:v', '4',
     '-frames:v', String(MAX_FRAMES),
     pattern,
-  ], { timeoutMs: 4 * 60 * 1000 });
+  ], { timeoutMs: 4 * 60 * 1000, signal });
 
   const files = (await fsp.readdir(outputDir))
     .filter((name) => /^frame-\d+\.jpg$/i.test(name))
@@ -91,16 +111,18 @@ function chunkFrames(frames) {
 }
 
 async function uploadFrame(frame, jobId, groupNumber) {
-  if (getStorageProvider() !== 'r2' || !isR2Configured()) {
+  if (!getStorageProvider()) {
     throw Object.assign(new Error('Cloud storage is required to save product frames.'), { code: 'STORAGE_FAILURE' });
   }
-  const buffer = await fsp.readFile(frame.path);
-  const key = `reel-imports/candidates/${jobId}/${String(groupNumber).padStart(3, '0')}-${String(Math.round(frame.timestampSeconds * 1000)).padStart(10, '0')}.jpg`;
-  const stored = await putBufferToR2(buffer, key, 'image/jpeg');
+  const stored = await uploadGeneratedImage({
+    path: frame.path,
+    originalname: `${jobId}-${String(groupNumber).padStart(3, '0')}-${String(Math.round(frame.timestampSeconds * 1000)).padStart(10, '0')}.jpg`,
+    mimetype: 'image/jpeg',
+  });
   return {
-    provider: 'r2',
+    provider: stored.provider,
     storageKey: stored.storageKey,
-    url: stored.url || buildPublicUrl(stored.storageKey),
+    url: stored.url,
     timestampSeconds: Math.round(frame.timestampSeconds * 1000) / 1000,
     qualityScore: 0.72,
     sharpnessScore: 0.7,
@@ -109,16 +131,20 @@ async function uploadFrame(frame, jobId, groupNumber) {
   };
 }
 
-async function updateProgress(job, percentage, currentStep, message) {
-  job.progress = { percentage, currentStep, message };
-  await job.save().catch(() => null);
+async function updateProgress(job, runId, stage, percentage, currentStep, message) {
+  return updateActiveRunProgress(job._id, runId, {
+    stage,
+    percentage,
+    currentStep,
+    message,
+  });
 }
 
 /**
  * Local reel processor used when the Python AI worker is not configured.
  * Extracts a small set of frames with bundled ffmpeg and groups them into review candidates.
  */
-async function processReelLocally(job) {
+async function processReelLocally(job, { runId } = {}) {
   if (!ffmpegPath || !ffprobePath) {
     throw Object.assign(new Error('FFmpeg is not available for local reel processing.'), { code: 'FFMPEG_UNAVAILABLE' });
   }
@@ -132,26 +158,65 @@ async function processReelLocally(job) {
   const framesDir = path.join(workspace, 'frames');
 
   try {
-    await updateProgress(job, 20, 'Downloading video', 'Fetching the reel from storage.');
+    await updateProgress(job, runId, 'downloading_video', 20, 'Downloading video', 'Fetching the reel from storage.');
     await downloadObject({
       provider: job.sourceVideo.provider,
       storageKey: job.sourceVideo.storageKey,
       url: job.sourceVideo.url,
-    }, videoPath);
+    }, videoPath, {
+      expectedSizeBytes: job.sourceVideo.sizeBytes,
+      timeoutMs: 3 * 60 * 1000,
+    });
 
-    await updateProgress(job, 40, 'Reading video', 'Checking duration and extracting product photos.');
+    await updateProgress(job, runId, 'reading_video', 32, 'Reading video', 'Checking the reel duration, dimensions, and format.');
     const metadata = await probeVideo(videoPath);
+
+    await updateProgress(job, runId, 'extracting_frames', 45, 'Extracting frames', 'Finding clear product moments throughout the reel.');
     const frames = await extractFrames(videoPath, framesDir, 0.5);
     if (!frames.length) {
       throw Object.assign(new Error('No usable product frames were detected. Try a clearer, slower reel.'), { code: 'NO_USABLE_FRAMES' });
     }
 
-    await updateProgress(job, 70, 'Saving product photos', `Found ${frames.length} photos. Uploading them for review.`);
+    await updateProgress(job, runId, 'analyzing_frames', 58, 'Grouping products', `Found ${frames.length} possible photos. Grouping nearby product views.`);
     const groups = chunkFrames(frames);
+    const categories = isVisionEnabled()
+      ? await Category.find({ isActive: { $ne: false } }).select('_id name').lean()
+      : [];
+    const smartDetails = [];
+    for (let index = 0; index < groups.length; index += 1) {
+      const groupNumber = index + 1;
+      const percentage = 62 + Math.round((index / Math.max(1, groups.length)) * 12);
+      await updateProgress(
+        job,
+        runId,
+        'analyzing_details',
+        percentage,
+        'Smart product details',
+        isVisionEnabled()
+          ? `Identifying product ${groupNumber} of ${groups.length} from multiple reel views.`
+          : 'Preparing product groups for admin confirmation.',
+      );
+      smartDetails.push(await analyzeCandidateFiles({
+        groupNumber,
+        filePaths: groups[index].map((frame) => frame.path),
+        categories,
+        subcategories: [],
+      }));
+    }
+
     const candidates = [];
     for (let index = 0; index < groups.length; index += 1) {
       const groupNumber = index + 1;
       const group = groups[index];
+      const percentage = 75 + Math.round((index / Math.max(1, groups.length)) * 14);
+      await updateProgress(
+        job,
+        runId,
+        'saving_frames',
+        percentage,
+        'Saving product photos',
+        `Saving product group ${groupNumber} of ${groups.length} for review.`,
+      );
       const persisted = [];
       for (const frame of group) {
         const uploaded = await uploadFrame(frame, String(job._id), groupNumber);
@@ -164,26 +229,11 @@ async function processReelLocally(job) {
           endSeconds: Math.round(group[group.length - 1].timestampSeconds * 1000) / 1000,
         },
         frames: persisted,
-        suggestions: {
-          name: `Product ${groupNumber}`,
-          category: '',
-          subcategory: '',
-          primaryColor: '',
-          secondaryColors: [],
-          pattern: '',
-          occasion: [],
-          tags: ['reel-import'],
-          altText: `Reel product candidate ${groupNumber}`,
-        },
-        confidence: {
-          category: 0,
-          primaryColor: 0,
-          pattern: 0,
-          occasion: 0,
-          overall: 0.45,
-        },
+        ...smartDetails[index],
       });
     }
+
+    await updateProgress(job, runId, 'saving_frames', 90, 'Product photos saved', `${candidates.length} possible product group${candidates.length === 1 ? '' : 's'} prepared.`);
 
     return {
       jobId: String(job._id),
@@ -204,5 +254,6 @@ async function processReelLocally(job) {
 }
 
 module.exports = {
+  isLocalReelProcessorAvailable: () => Boolean(ffmpegPath && ffprobePath),
   processReelLocally,
 };

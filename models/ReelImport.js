@@ -1,6 +1,23 @@
 const mongoose = require('mongoose');
 const storeIdPlugin = require('./plugins/storeId');
 
+const reelImportStageSchema = new mongoose.Schema({
+  key: { type: String, required: true },
+  label: { type: String, required: true },
+  status: {
+    type: String,
+    enum: ['running', 'completed', 'failed', 'cancelled'],
+    default: 'running',
+  },
+  percentage: { type: Number, default: 0, min: 0, max: 100 },
+  message: { type: String, default: '' },
+  attempt: { type: Number, default: 0 },
+  startedAt: { type: Date, default: Date.now },
+  completedAt: Date,
+  durationMs: Number,
+  errorCode: String,
+}, { _id: false });
+
 const reelImportSchema = new mongoose.Schema({
   createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
   sourceVideo: {
@@ -23,9 +40,16 @@ const reelImportSchema = new mongoose.Schema({
   },
   progress: {
     percentage: { type: Number, default: 0, min: 0, max: 100 },
+    stage: { type: String, default: 'uploading_video' },
     currentStep: { type: String, default: 'Uploading video' },
     message: { type: String, default: '' },
+    startedAt: { type: Date, default: Date.now },
+    updatedAt: { type: Date, default: Date.now },
   },
+  stageHistory: { type: [reelImportStageSchema], default: [] },
+  lastHeartbeatAt: { type: Date, default: Date.now, index: true },
+  activeRunId: { type: String, default: null, select: false },
+  queueJobId: { type: String, default: null },
   processingConfig: {
     framesPerSecond: Number,
     sceneThreshold: Number,
@@ -54,5 +78,6 @@ const reelImportSchema = new mongoose.Schema({
 reelImportSchema.plugin(storeIdPlugin);
 reelImportSchema.index({ createdBy: 1, createdAt: -1 });
 reelImportSchema.index({ status: 1, createdAt: -1 });
+reelImportSchema.index({ status: 1, lastHeartbeatAt: 1 });
 
 module.exports = mongoose.model('ReelImport', reelImportSchema);

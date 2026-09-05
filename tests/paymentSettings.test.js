@@ -2,7 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const { request, resetDatabase, startTestEnvironment, stopTestEnvironment } = require('./helpers');
-const { createCustomer, createProduct, setSettings, validAddress } = require('./factories');
+const { createAdmin, createCustomer, createProduct, setSettings, validAddress } = require('./factories');
 const Order = require('../models/Order');
 
 test.before(startTestEnvironment);
@@ -11,6 +11,7 @@ test.beforeEach(async () => {
   await resetDatabase();
   delete process.env.RAZORPAY_KEY_ID;
   delete process.env.RAZORPAY_KEY_SECRET;
+  delete process.env.RAZORPAY_WEBHOOK_SECRET;
 });
 
 function orderBody(product, overrides = {}) {
@@ -110,6 +111,39 @@ test('an online method is refused when Razorpay is enabled but not configured', 
 
   const { status } = await request('/api/orders', { method: 'POST', token, body: orderBody(product, { paymentMethod: 'UPI' }) });
   assert.equal(status, 400);
+});
+
+test('all configured online methods are offered and admin readiness exposes no secrets', async () => {
+  await setSettings({
+    razorpayEnabled: true,
+    upiEnabled: true,
+    cardPaymentEnabled: true,
+    netBankingEnabled: true,
+    walletEnabled: true,
+  });
+  process.env.RAZORPAY_KEY_ID = 'rzp_test_safe_key';
+  process.env.RAZORPAY_KEY_SECRET = 'server-only-secret';
+  process.env.RAZORPAY_WEBHOOK_SECRET = 'server-only-webhook-secret';
+  const { token } = await createAdmin();
+
+  const methods = await request('/api/settings/payment-methods');
+  const online = methods.data.methods.filter((option) => option.key !== 'COD');
+  assert.deepEqual(online.map((option) => option.key), ['UPI', 'CARD', 'NETBANKING', 'WALLET']);
+  assert.equal(online.every((option) => option.enabled), true);
+  assert.equal(methods.data.gateway.ready, true);
+
+  const readiness = await request('/api/admin/settings/payment-readiness', { token });
+  assert.equal(readiness.status, 200);
+  assert.deepEqual(readiness.data, {
+    provider: 'Razorpay',
+    enabled: true,
+    configured: true,
+    ready: true,
+    mode: 'test',
+    webhookConfigured: true,
+    disabledReason: '',
+  });
+  assert.equal(JSON.stringify(readiness.data).includes('server-only'), false);
 });
 
 test('an individually disabled online method is not offered and is rejected', async () => {

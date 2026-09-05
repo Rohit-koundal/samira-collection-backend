@@ -59,64 +59,131 @@ async function uploadGeneratedImage(file) {
 
 async function objectExists({ provider, storageKey, url }) {
   if (provider === 'r2' && isR2Configured()) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 12000);
     try {
-      await getR2Client().send(new HeadObjectCommand({ Bucket: process.env.R2_BUCKET_NAME, Key: storageKey }));
+      await getR2Client().send(
+        new HeadObjectCommand({ Bucket: process.env.R2_BUCKET_NAME, Key: storageKey }),
+        { abortSignal: controller.signal },
+      );
       return true;
     } catch {
       const publicUrl = url || buildPublicUrl(storageKey);
       if (!publicUrl) return false;
       const response = await fetch(publicUrl, { method: 'HEAD', signal: AbortSignal.timeout(12000) }).catch(() => null);
       return Boolean(response?.ok);
+    } finally {
+      clearTimeout(timer);
     }
   }
   if (provider === 'cloudinary' && url) {
-    const response = await fetch(url, { method: 'HEAD' }).catch(() => null);
+    const response = await fetch(url, { method: 'HEAD', signal: AbortSignal.timeout(12000) }).catch(() => null);
     return Boolean(response?.ok);
   }
   return false;
 }
 
-async function writeBodyToFile(body, destinationPath) {
+function createAbortContext(parentSignal, timeoutMs) {
+  const controller = new AbortController();
+  const abortFromParent = () => controller.abort(parentSignal?.reason);
+  const timer = setTimeout(() => controller.abort(new Error('Storage operation timed out.')), timeoutMs);
+  if (parentSignal?.aborted) abortFromParent();
+  else parentSignal?.addEventListener('abort', abortFromParent, { once: true });
+  return {
+    signal: controller.signal,
+    cleanup() {
+      clearTimeout(timer);
+      parentSignal?.removeEventListener('abort', abortFromParent);
+    },
+  };
+}
+
+async function writeBodyToFile(body, destinationPath, { signal } = {}) {
   await fsp.mkdir(path.dirname(destinationPath), { recursive: true });
+  if (body && (typeof body.pipe === 'function' || typeof body.getReader === 'function')) {
+    await pipeline(body, fs.createWriteStream(destinationPath), { signal });
+    return;
+  }
   if (body && typeof body.transformToByteArray === 'function') {
+    if (signal?.aborted) throw signal.reason || new Error('Storage operation aborted.');
     const bytes = await body.transformToByteArray();
+    if (signal?.aborted) throw signal.reason || new Error('Storage operation aborted.');
     await fsp.writeFile(destinationPath, Buffer.from(bytes));
     return;
   }
-  await pipeline(body, fs.createWriteStream(destinationPath));
+  throw new Error('Storage returned an unreadable response body.');
 }
 
-async function downloadObject({ provider, storageKey, url }, destinationPath) {
+async function verifyDownloadedFile(destinationPath, expectedSizeBytes) {
+  const details = await fsp.stat(destinationPath);
+  const expected = Number(expectedSizeBytes || 0);
+  if (!details.size || (expected > 0 && details.size < expected)) {
+    const error = new Error('The stored reel download was incomplete.');
+    error.code = 'STORAGE_DOWNLOAD_INCOMPLETE';
+    throw error;
+  }
+  return details.size;
+}
+
+function normalizeDownloadError(error, errors) {
+  if (error?.code === 'STORAGE_DOWNLOAD_INCOMPLETE') return error;
+  const timedOut = error?.name === 'AbortError'
+    || error?.code === 'ABORT_ERR'
+    || /aborted|timed out/i.test(String(error?.message || ''));
+  const failure = new Error(timedOut
+    ? 'Downloading the reel from storage timed out. Please retry the import.'
+    : 'The stored reel could not be downloaded from cloud storage.');
+  failure.code = timedOut ? 'STORAGE_DOWNLOAD_TIMEOUT' : 'STORAGE_FAILURE';
+  failure.cause = error;
+  failure.storageErrors = errors;
+  return failure;
+}
+
+async function downloadObject(
+  { provider, storageKey, url },
+  destinationPath,
+  { expectedSizeBytes = 0, timeoutMs = 3 * 60 * 1000, signal } = {},
+) {
   const errors = [];
+  const overall = createAbortContext(signal, timeoutMs);
   if (provider === 'r2' && isR2Configured()) {
+    const r2Attempt = createAbortContext(overall.signal, Math.min(60000, Math.max(10000, Math.floor(timeoutMs / 2))));
     try {
       const response = await getR2Client().send(new GetObjectCommand({
         Bucket: process.env.R2_BUCKET_NAME,
         Key: storageKey,
-      }));
-      await writeBodyToFile(response.Body, destinationPath);
+      }), { abortSignal: r2Attempt.signal });
+      await writeBodyToFile(response.Body, destinationPath, { signal: r2Attempt.signal });
+      await verifyDownloadedFile(destinationPath, expectedSizeBytes);
+      overall.cleanup();
       return destinationPath;
     } catch (error) {
       errors.push(error.message);
+      await fsp.unlink(destinationPath).catch(() => null);
+    } finally {
+      r2Attempt.cleanup();
     }
   }
 
   const readUrl = url || (provider === 'r2' ? buildPublicUrl(storageKey) : '');
   if (!readUrl) {
-    const failure = new Error(errors[0] || 'Unable to download stored reel.');
-    failure.code = 'STORAGE_FAILURE';
-    throw failure;
+    overall.cleanup();
+    throw normalizeDownloadError(new Error(errors[0] || 'Unable to download stored reel.'), errors);
   }
 
-  const response = await fetch(readUrl, { signal: AbortSignal.timeout(120000) });
-  if (!response.ok) {
-    const failure = new Error(errors[0] || 'The stored reel could not be downloaded from cloud storage.');
-    failure.code = 'STORAGE_FAILURE';
-    throw failure;
+  try {
+    const response = await fetch(readUrl, { signal: overall.signal });
+    if (!response.ok) throw new Error(`Storage returned HTTP ${response.status}.`);
+    await writeBodyToFile(response.body, destinationPath, { signal: overall.signal });
+    await verifyDownloadedFile(destinationPath, expectedSizeBytes);
+    return destinationPath;
+  } catch (error) {
+    errors.push(error.message);
+    await fsp.unlink(destinationPath).catch(() => null);
+    throw normalizeDownloadError(error, errors);
+  } finally {
+    overall.cleanup();
   }
-  await fsp.mkdir(path.dirname(destinationPath), { recursive: true });
-  await fsp.writeFile(destinationPath, Buffer.from(await response.arrayBuffer()));
-  return destinationPath;
 }
 
 async function deleteObject({ provider, storageKey }) {

@@ -10,6 +10,7 @@ const { assertStoreOwned } = require('../middleware/storeMiddleware');
 const { logAudit } = require('../services/auditService');
 const { analyzeQuickAddImage, getQuickAddVisionStatus } = require('../services/quickAddVision.service');
 const { wantsPagination, readPagination, buildPaginatedResponse } = require('../utils/validators');
+const { normalizeProductSizing, validateProductSizing } = require('../services/productSizingService');
 
 function catalogQuery(req, extra = {}) {
   return andFilter(extra, req.tenantFilter);
@@ -20,6 +21,17 @@ function withStoreId(payload, req) {
   delete next.storeId;
   if (req.store?._id) next.storeId = req.store._id;
   return next;
+}
+
+async function getCategoryName(categoryId) {
+  if (!categoryId || !mongoose.Types.ObjectId.isValid(categoryId)) return '';
+  const category = await Category.findById(categoryId).select('name').lean();
+  return category?.name || '';
+}
+
+function normalizeProductResponse(product, req) {
+  const data = normalizeProductImages(product, req);
+  return normalizeProductSizing(data, data.category?.name || '');
 }
 
 exports.getProducts = async (req, res) => {
@@ -78,10 +90,10 @@ exports.getProducts = async (req, res) => {
       Product.find(query).populate('category').sort(sort).skip(skip).limit(limit),
       Product.countDocuments(query),
     ]);
-    return res.json(buildPaginatedResponse(items.map((product) => normalizeProductImages(product, req)), { page, limit, total }));
+    return res.json(buildPaginatedResponse(items.map((product) => normalizeProductResponse(product, req)), { page, limit, total }));
   }
   const products = await Product.find(query).populate('category').sort(sort);
-  res.json(products.map((product) => normalizeProductImages(product, req)));
+  res.json(products.map((product) => normalizeProductResponse(product, req)));
 };
 
 function escapeRegex(value = '') {
@@ -90,17 +102,23 @@ function escapeRegex(value = '') {
 
 exports.getProductBySlug = async (req, res) => {
   const scoped = catalogQuery(req, { isArchived: { $ne: true } });
-  const product = mongoose.Types.ObjectId.isValid(req.params.slug)
-    ? await Product.findOne(andFilter({ _id: req.params.slug }, scoped)).populate('category')
-    : await Product.findOne(andFilter({ slug: req.params.slug }, scoped)).populate('category');
+  const productKey = String(req.params.slug || '').trim();
+  let product = mongoose.Types.ObjectId.isValid(productKey)
+    ? await Product.findOne(andFilter({ _id: productKey }, scoped)).populate('category')
+    : await Product.findOne(andFilter({ slug: productKey }, scoped)).populate('category');
+  if (!product && productKey && !mongoose.Types.ObjectId.isValid(productKey)) {
+    product = await Product.findOne(andFilter({
+      slug: { $regex: `^\\s*${escapeRegex(productKey)}\\s*$`, $options: 'i' },
+    }, scoped)).populate('category');
+  }
   if (!product) return res.status(404).json({ message: 'Product not found' });
-  res.json(normalizeProductImages(product, req));
+  res.json(normalizeProductResponse(product, req));
 };
 
 exports.getProductById = async (req, res) => {
   const product = await Product.findOne(catalogQuery(req, { _id: req.params.id })).populate('category');
   if (!product) return res.status(404).json({ message: 'Product not found' });
-  res.json(normalizeProductImages(product, req));
+  res.json(normalizeProductResponse(product, req));
 };
 
 exports.getQuickAddVisionStatus = async (_req, res) => {
@@ -121,25 +139,38 @@ exports.analyzeQuickAdd = async (req, res) => {
 };
 
 exports.createProduct = async (req, res) => {
-  const payload = applyVariantPayload(withStoreId({ ...req.body, images: sanitizeProductImages(req.body.images) }, req));
+  const basePayload = withStoreId({ ...req.body, images: sanitizeProductImages(req.body.images) }, req);
+  const categoryName = await getCategoryName(basePayload.category);
+  const payload = applyVariantPayload(normalizeProductSizing(basePayload, categoryName));
   const error = validateProduct(payload);
   if (error) return res.status(400).json({ message: error });
-  const product = await Product.create(normalizeProductPayload({ ...payload, slug: payload.slug || slugify(payload.name) }));
+  const sizingError = validateProductSizing(payload, categoryName);
+  if (sizingError) return res.status(400).json({ message: sizingError });
+  const product = await Product.create(normalizeProductPayload({ ...payload, slug: slugify(payload.slug || payload.name) }));
   logAudit({ req, action: 'PRODUCT_CREATE', entityType: 'Product', entityId: product._id, after: { name: product.name, price: product.price, stock: product.stock } });
-  res.status(201).json(normalizeProductImages(product, req));
+  res.status(201).json(normalizeProductResponse(product, req));
 };
 
 exports.updateProduct = async (req, res) => {
   const existingProduct = await Product.findOne(catalogQuery(req, { _id: req.params.id }));
   if (!existingProduct) return res.status(404).json({ message: 'Product not found' });
   assertStoreOwned(existingProduct, req);
-  const payload = applyVariantPayload(withStoreId({ ...req.body, images: sanitizeProductImages(req.body.images) }, req));
+  const basePayload = withStoreId({ ...req.body, images: sanitizeProductImages(req.body.images) }, req);
+  const categoryName = await getCategoryName(basePayload.category || existingProduct.category);
+  const payload = applyVariantPayload(normalizeProductSizing(basePayload, categoryName));
   const error = validateProduct(payload, false);
   if (error) return res.status(400).json({ message: error });
+  const sizingError = validateProductSizing(payload, categoryName);
+  if (sizingError) return res.status(400).json({ message: sizingError });
   const nextImages = Array.isArray(payload.images) && payload.images.length ? payload.images : existingProduct.images || [];
   const product = await Product.findByIdAndUpdate(
     req.params.id,
-    normalizeProductPayload({ ...payload, images: nextImages, storeId: existingProduct.storeId }),
+    normalizeProductPayload({
+      ...payload,
+      slug: slugify(payload.slug || existingProduct.slug || payload.name || existingProduct.name),
+      images: nextImages,
+      storeId: existingProduct.storeId,
+    }),
     { new: true, runValidators: true },
   );
   await cleanupRemovedProductImages(existingProduct.images || [], product.images || []);
@@ -151,7 +182,7 @@ exports.updateProduct = async (req, res) => {
     before: { price: existingProduct.price, stock: existingProduct.stock },
     after: { price: product.price, stock: product.stock },
   });
-  res.json(normalizeProductImages(product, req));
+  res.json(normalizeProductResponse(product, req));
 };
 
 exports.deleteProduct = async (req, res) => {

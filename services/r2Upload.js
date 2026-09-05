@@ -1,5 +1,6 @@
 const crypto = require('crypto');
 const fs = require('fs/promises');
+const fsSync = require('fs');
 const path = require('path');
 const { DeleteObjectCommand, S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
 
@@ -91,15 +92,31 @@ async function uploadImageToR2(file, options = {}) {
 async function uploadFileToR2(file, options = {}) {
   const extension = resolveFileExtension(file);
   const objectKey = buildObjectKey(file, { ...options, extension });
-  const buffer = await fs.readFile(file.path);
+  const stream = fsSync.createReadStream(file.path);
+  const controller = new AbortController();
+  const isVideo = String(file.mimetype || '').toLowerCase().startsWith('video/');
+  const timeout = setTimeout(() => controller.abort(), (isVideo ? 10 : 2) * 60 * 1000);
 
-  await getR2Client().send(new PutObjectCommand({
-    Bucket: process.env.R2_BUCKET_NAME,
-    Key: objectKey,
-    Body: buffer,
-    ContentType: file.mimetype || 'application/octet-stream',
-    CacheControl: 'public, max-age=31536000, immutable',
-  }));
+  try {
+    await getR2Client().send(new PutObjectCommand({
+      Bucket: process.env.R2_BUCKET_NAME,
+      Key: objectKey,
+      Body: stream,
+      ContentLength: Number(file.size || 0) || undefined,
+      ContentType: file.mimetype || 'application/octet-stream',
+      CacheControl: 'public, max-age=31536000, immutable',
+    }), { abortSignal: controller.signal });
+  } catch (error) {
+    if (controller.signal.aborted) {
+      const timeoutError = new Error(`${isVideo ? 'Uploading the reel' : 'Saving a product photo'} to storage timed out. Please try again.`);
+      timeoutError.code = 'STORAGE_UPLOAD_TIMEOUT';
+      throw timeoutError;
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+    stream.destroy();
+  }
 
   return {
     url: buildPublicUrl(objectKey),

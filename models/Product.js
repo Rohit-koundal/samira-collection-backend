@@ -12,6 +12,20 @@ const variantSchema = new mongoose.Schema({
   isActive: { type: Boolean, default: true },
 }, { _id: true });
 
+const sizeChartRowSchema = new mongoose.Schema({
+  size: { type: String, required: true, trim: true },
+  acrossShoulder: { type: Number, min: 0 },
+  sleeveLength: { type: Number, min: 0 },
+  bust: { type: Number, min: 0 },
+  chest: { type: Number, min: 0 },
+  waist: { type: Number, min: 0 },
+  frontLength: { type: Number, min: 0 },
+  bottomLength: { type: Number, min: 0 },
+  hips: { type: Number, min: 0 },
+  outseamLength: { type: Number, min: 0 },
+  inseamLength: { type: Number, min: 0 },
+}, { _id: false });
+
 const productSchema = new mongoose.Schema({
   name: { type: String, required: true },
   slug: { type: String, required: true, unique: true },
@@ -26,6 +40,18 @@ const productSchema = new mongoose.Schema({
   images: [{ url: String, publicId: String, primary: { type: Boolean, default: false } }],
   videos: [{ url: String, publicId: String, thumbnail: String }],
   sizes: [String],
+  sizingMode: { type: String, enum: ['auto', 'sized', 'free-size'], default: 'auto' },
+  sizeChartProfile: {
+    type: String,
+    enum: ['auto', 'free-size', 'kurta-set', 'kurti', 'dress', 'top-shirt', 'bottom', 'skirt-lehenga', 'jumpsuit', 'apparel'],
+    default: 'auto',
+  },
+  sizeChart: {
+    unit: { type: String, enum: ['in', 'cm'], default: 'in' },
+    columns: { type: [String], default: [] },
+    rows: { type: [sizeChartRowSchema], default: [] },
+  },
+  sizeFitNotes: String,
   colors: [String],
   fabric: String,
   occasion: String,

@@ -53,6 +53,7 @@ const uploadLimiter = rateLimit({
 });
 
 router.use(protect, adminOnly, standardLimiter);
+router.get('/capabilities', controller.getUploadCapabilities);
 router.post('/upload-url', controller.getUploadCapabilities);
 router.post('/', uploadLimiter, upload.single('video'), controller.createImport);
 router.get('/', controller.listImports);
@@ -62,6 +63,7 @@ router.post('/:jobId/retry', controller.retryImport);
 router.post('/:jobId/cancel', controller.cancelImport);
 router.delete('/:jobId', controller.deleteImport);
 router.patch('/:jobId/candidates/:candidateId', controller.updateCandidate);
+router.post('/:jobId/candidates/:candidateId/analyze', controller.analyzeCandidate);
 router.post('/:jobId/candidates/merge', controller.mergeCandidates);
 router.post('/:jobId/candidates/:candidateId/split', controller.splitCandidate);
 router.post('/:jobId/candidates/:candidateId/move-frame', controller.moveFrame);

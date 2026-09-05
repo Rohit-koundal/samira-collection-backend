@@ -1,4 +1,9 @@
 const { spawn } = require('child_process');
+const bundledFfprobePath = require('ffprobe-static').path;
+
+function resolveFfprobePath() {
+  return String(process.env.FFPROBE_PATH || bundledFfprobePath || 'ffprobe');
+}
 
 function inspectVideo(filePath, timeoutMs = 30000) {
   return new Promise((resolve, reject) => {
@@ -9,7 +14,7 @@ function inspectVideo(filePath, timeoutMs = 30000) {
       '-of', 'json',
       filePath,
     ];
-    const child = spawn(process.env.FFPROBE_PATH || 'ffprobe', args, {
+    const child = spawn(resolveFfprobePath(), args, {
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -60,4 +65,4 @@ function safeVideoError(code, message) {
   return error;
 }
 
-module.exports = { inspectVideo, safeVideoError };
+module.exports = { inspectVideo, resolveFfprobePath, safeVideoError };

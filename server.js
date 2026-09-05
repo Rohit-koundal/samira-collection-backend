@@ -9,6 +9,9 @@ const connectDB = require('./config/db');
 const { isR2Configured } = require('./services/r2Upload');
 const { isCloudinaryConfigured } = require('./services/cloudinaryUpload');
 const { assertProductionSecrets, getOtpMode, isProduction } = require('./config/env');
+const mongoose = require('mongoose');
+const { resumePendingReelImports } = require('./queues/reelImport.queue');
+const { startReelImportWatchdog } = require('./services/reelImportProgress.service');
 
 async function startServer() {
   try {
@@ -23,6 +26,15 @@ async function startServer() {
   }
 
   await connectDB();
+
+  if (mongoose.connection.readyState === 1) {
+    const recovery = await resumePendingReelImports().catch((error) => {
+      console.error(`Reel import recovery failed: ${error.message}`);
+      return { resumed: 0 };
+    });
+    if (recovery.resumed) console.log(`Resumed ${recovery.resumed} pending reel import job(s).`);
+    startReelImportWatchdog();
+  }
 
   const PORT = process.env.SERVER_PORT || process.env.PORT || 5000;
   const persistentImageStorageConfigured = isR2Configured() || isCloudinaryConfigured();

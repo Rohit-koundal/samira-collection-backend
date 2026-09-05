@@ -5,6 +5,7 @@ const ProductDraft = require('../models/ProductDraft');
 const { isR2Configured, uploadImageToR2 } = require('../services/r2Upload');
 const { isCloudinaryConfigured, uploadImage: uploadImageToCloudinary } = require('../services/cloudinaryUpload');
 const { buildUploadFileResponse, isLocalRequest, normalizeProductImages, normalizeProductPayload, sanitizeProductImages } = require('../utils/imageUtils');
+const { normalizeProductSizing, validateProductSizing } = require('../services/productSizingService');
 
 exports.bulkUploadMiddleware = multer({
   storage: multer.diskStorage({
@@ -43,6 +44,10 @@ exports.bulkUpload = async (req, res, next) => {
       sellingPrice: 0,
       stock: 0,
       sizes: [],
+      sizingMode: 'auto',
+      sizeChartProfile: 'auto',
+      sizeChart: { unit: 'in', columns: [], rows: [] },
+      sizeFitNotes: '',
       colors: [],
       fabric: '',
       occasion: '',
@@ -146,6 +151,7 @@ function normalizeDraftPayload(body = {}) {
   if (payload.originalPrice !== undefined) payload.originalPrice = Number(payload.originalPrice);
   if (payload.sellingPrice !== undefined) payload.sellingPrice = Number(payload.sellingPrice);
   if (payload.stock !== undefined) payload.stock = Number(payload.stock);
+  if (payload.sizeChart) payload.sizeChart = normalizeSizeChart(payload.sizeChart);
   return payload;
 }
 
@@ -153,7 +159,7 @@ function buildProductPayloadFromDraft(draft) {
   const data = typeof draft.toObject === 'function' ? draft.toObject() : { ...draft };
   const sellingPrice = Number(data.sellingPrice ?? data.price ?? 0);
   const originalPrice = Number(data.originalPrice ?? sellingPrice);
-  return {
+  return normalizeProductSizing({
     name: data.name,
     slug: data.slug || slugify(data.name || 'product'),
     sku: data.sku,
@@ -168,6 +174,10 @@ function buildProductPayloadFromDraft(draft) {
     images: data.images || (data.image ? [{ url: data.image, primary: true }] : []),
     videos: data.videos || [],
     sizes: data.sizes || [],
+    sizingMode: data.sizingMode || 'auto',
+    sizeChartProfile: data.sizeChartProfile || 'auto',
+    sizeChart: normalizeSizeChart(data.sizeChart),
+    sizeFitNotes: data.sizeFitNotes || '',
     colors: data.colors || [],
     fabric: data.fabric || '',
     occasion: data.occasion || '',
@@ -186,7 +196,7 @@ function buildProductPayloadFromDraft(draft) {
     showInTrending: Boolean(data.showInTrending),
     showInFestive: Boolean(data.showInFestive),
     isActive: true,
-  };
+  }, data.category?.name || '');
 }
 
 function validatePublishDraft(draft) {
@@ -198,6 +208,8 @@ function validatePublishDraft(draft) {
   if (Number(draft.stock) < 0) return `Draft "${draft.name}" has invalid stock`;
   if (!Array.isArray(draft.images) || !draft.images.length) return `Draft "${draft.name}" needs at least one image`;
   if (sellingPrice > originalPrice) return `Draft "${draft.name}" selling price cannot exceed original price`;
+  const sizingError = validateProductSizing(buildProductPayloadFromDraft(draft), draft.category?.name || '');
+  if (sizingError) return `Draft "${draft.name}": ${sizingError}`;
   return '';
 }
 
@@ -229,6 +241,20 @@ function uniqueDraftSlug(value, draftId) {
 
 function splitList(value) {
   return String(value || '').split(',').map((item) => item.trim()).filter(Boolean);
+}
+
+function normalizeSizeChart(value = {}) {
+  const allowedFields = ['acrossShoulder', 'sleeveLength', 'bust', 'chest', 'waist', 'frontLength', 'bottomLength', 'hips', 'outseamLength', 'inseamLength'];
+  const columns = (Array.isArray(value?.columns) ? value.columns : []).filter((field) => allowedFields.includes(field));
+  const rows = (Array.isArray(value?.rows) ? value.rows : []).map((row) => {
+    const next = { size: String(row?.size || '').trim() };
+    columns.forEach((field) => {
+      const measurement = Number(row?.[field]);
+      if (Number.isFinite(measurement) && measurement > 0) next[field] = measurement;
+    });
+    return next;
+  }).filter((row) => row.size);
+  return { unit: value?.unit === 'cm' ? 'cm' : 'in', columns, rows };
 }
 
 async function uploadDraftImages(req, files) {

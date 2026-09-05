@@ -77,6 +77,12 @@ function razorpayUsable(settings, { razorpayConfigured }) {
   return Boolean(settings?.razorpayEnabled) && Boolean(razorpayConfigured);
 }
 
+function razorpayDisabledReason(settings, { razorpayConfigured }) {
+  if (!settings?.razorpayEnabled) return 'Online payments are turned off by the store';
+  if (!razorpayConfigured) return 'Online payment setup is incomplete';
+  return '';
+}
+
 function buildPaymentOptions(settings, { razorpayConfigured, orderAmount = null, pincode = '', userId = null } = {}) {
   const online = razorpayUsable(settings, { razorpayConfigured });
   const maxCod = codMaxAmount(settings);
@@ -94,7 +100,7 @@ function buildPaymentOptions(settings, { razorpayConfigured, orderAmount = null,
       label: option.label,
       enabled: online,
       provider: 'Razorpay',
-      disabledReason: online ? '' : 'Online payment is not available right now',
+      disabledReason: online ? '' : razorpayDisabledReason(settings, { razorpayConfigured }),
       prepaidDiscount: resolvePrepaidDiscount(option.key, amount || 0, settings),
     }));
 
@@ -183,4 +189,6 @@ module.exports = {
   resolveCodCharge,
   resolveDeliveryCharge,
   resolvePrepaidDiscount,
+  razorpayDisabledReason,
+  razorpayUsable,
 };

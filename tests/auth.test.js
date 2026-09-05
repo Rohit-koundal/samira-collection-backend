@@ -156,23 +156,15 @@ test('production OTP mode never reveals a code to the client', async () => {
   }
 });
 
-test('an admin login attempt with wrong credentials is rejected', async () => {
-  await createAdmin({ email: 'realadmin@test.local', password: 'CorrectHorse1' });
-  const { status } = await request('/api/admin/login', { method: 'POST', body: { email: 'realadmin@test.local', password: 'wrong-password' } });
-  assert.equal(status, 401);
-});
-
-test('an admin can sign in through the separate admin password endpoint', async () => {
-  await createAdmin({ email: 'adminlogin@test.local', password: 'CorrectHorse1' });
+test('the legacy admin password endpoint requires mobile OTP instead', async () => {
   const { status, data } = await request('/api/admin/login', {
     method: 'POST',
     body: { email: 'adminlogin@test.local', password: 'CorrectHorse1' },
   });
 
-  assert.equal(status, 200);
-  assert.equal(data.user.role, 'admin');
-  assert.equal(data.user.activeMode, 'admin');
-  assert.ok(data.token);
+  assert.equal(status, 410);
+  assert.equal(data.code, 'OTP_REQUIRED');
+  assert.match(String(data.message), /mobile number and otp only/i);
 });
 
 test('customer password login is disabled because storefront login is OTP-only', async () => {
@@ -187,20 +179,4 @@ test('customer password login is disabled because storefront login is OTP-only',
     body: { email: 'shopper@test.local', password: 'CorrectHorse1' },
   });
   assert.equal(byEmail.status, 404);
-});
-
-test('a customer account cannot use the admin password login', async () => {
-  await createCustomer({ email: 'shopper@test.local', phone: '9812345698', password: 'CorrectHorse1' });
-  const { status, data } = await request('/api/admin/login', {
-    method: 'POST',
-    body: { email: 'shopper@test.local', password: 'CorrectHorse1' },
-  });
-  assert.equal(status, 403);
-  assert.match(String(data.message), /admin/i);
-});
-
-test('a blocked admin cannot log in with a password', async () => {
-  await createAdmin({ email: 'blockedadmin@test.local', password: 'CorrectHorse1', isBlocked: true });
-  const { status } = await request('/api/admin/login', { method: 'POST', body: { email: 'blockedadmin@test.local', password: 'CorrectHorse1' } });
-  assert.equal(status, 403);
 });

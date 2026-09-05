@@ -8,7 +8,14 @@ const ReelImport = require('../../models/ReelImport');
 const { getReelImportConfig } = require('../../config/reelImport');
 const { enqueueReelImport, removeQueuedReelImport } = require('../../queues/reelImport.queue');
 const { deleteObject, getStorageProvider, objectExists, uploadOriginalVideo } = require('../../services/mediaStorage.service');
+const { analyzeCandidateImages, isVisionEnabled } = require('../../services/reelCandidateVision.service');
 const { inspectVideo } = require('../../services/videoMetadata.service');
+const { isLocalReelProcessorAvailable } = require('../../services/localReelProcessor.service');
+const {
+  failStalledJob,
+  publicHealth,
+  saveProgress,
+} = require('../../services/reelImportProgress.service');
 const slugify = require('../../utils/slugify');
 const {
   escapeRegExp,
@@ -27,6 +34,7 @@ async function createImport(req, res, next) {
     const fileError = validateVideoFile(file);
     if (fileError) throw fileError;
     const config = getReelImportConfig();
+    if (!config.enabled) throw serviceUnavailable('REEL_IMPORT_DISABLED', 'Reel Product Import is currently disabled.');
     const metadata = await inspectVideo(file.path);
     if (metadata.durationSeconds > config.maxDurationSeconds) {
       throw validationError('VIDEO_TOO_LONG', `Video duration must be ${config.maxDurationSeconds} seconds or less.`);
@@ -47,7 +55,14 @@ async function createImport(req, res, next) {
           ...metadata,
         },
         status: 'uploaded',
-        progress: { percentage: 5, currentStep: 'Validating video', message: 'Video uploaded and validated.' },
+        progress: {
+          percentage: 5,
+          stage: 'validating_video',
+          currentStep: 'Validating video',
+          message: 'Video uploaded and validated.',
+          startedAt: new Date(),
+          updatedAt: new Date(),
+        },
         processingConfig: {
           framesPerSecond: config.framesPerSecond,
           sceneThreshold: config.sceneThreshold,
@@ -56,15 +71,36 @@ async function createImport(req, res, next) {
         },
         retentionExpiresAt,
       });
-      await enqueueReelImport({ jobId: reelImport._id, storageKey: stored.storageKey });
       reelImport.status = 'queued';
-      reelImport.progress = { percentage: 8, currentStep: 'Queued', message: 'The reel is waiting for the processing worker.' };
-      await reelImport.save();
+      await saveProgress(reelImport, {
+        stage: 'queued',
+        percentage: 8,
+        currentStep: 'Queued',
+        message: 'The reel is waiting for the processing worker.',
+      });
+      const queued = await enqueueReelImport({
+        jobId: reelImport._id,
+        storageKey: stored.storageKey,
+        attemptNumber: 1,
+      });
+      if (queued.queueJobId) {
+        reelImport.queueJobId = queued.queueJobId;
+        await ReelImport.updateOne({ _id: reelImport._id }, { $set: { queueJobId: queued.queueJobId } });
+      }
     } catch (error) {
       if (reelImport) {
         reelImport.status = 'failed';
+        reelImport.activeRunId = null;
+        reelImport.queueJobId = null;
         reelImport.error = { code: error.code || 'REEL_QUEUE_UNAVAILABLE', safeMessage: error.message };
-        await reelImport.save().catch(() => null);
+        await saveProgress(reelImport, {
+          stage: reelImport.progress?.stage || 'queued',
+          percentage: reelImport.progress?.percentage || 5,
+          currentStep: 'Processing unavailable',
+          message: error.message,
+          stageStatus: 'failed',
+          errorCode: error.code || 'REEL_QUEUE_UNAVAILABLE',
+        }).catch(() => null);
       } else {
         await deleteObject(stored).catch(() => null);
       }
@@ -83,6 +119,7 @@ async function createImportFromStoredVideo(req, res, next) {
   try {
     const source = req.body.sourceVideo || {};
     const config = getReelImportConfig();
+    if (!config.enabled) throw serviceUnavailable('REEL_IMPORT_DISABLED', 'Reel Product Import is currently disabled.');
     const provider = getStorageProvider();
     const sizeBytes = Number(source.sizeBytes || 0);
     if (!provider) {
@@ -127,7 +164,14 @@ async function createImportFromStoredVideo(req, res, next) {
         durationSeconds: 0,
       },
       status: 'uploaded',
-      progress: { percentage: 5, currentStep: 'Validating video', message: 'R2 upload verified. Preparing background processing.' },
+      progress: {
+        percentage: 5,
+        stage: 'validating_video',
+        currentStep: 'Validating video',
+        message: 'Cloud upload verified. Preparing background processing.',
+        startedAt: new Date(),
+        updatedAt: new Date(),
+      },
       processingConfig: {
         framesPerSecond: config.framesPerSecond,
         sceneThreshold: config.sceneThreshold,
@@ -137,18 +181,38 @@ async function createImportFromStoredVideo(req, res, next) {
       retentionExpiresAt: new Date(Date.now() + config.originalRetentionDays * 86400000),
     });
     try {
-      await enqueueReelImport({ jobId: reelImport._id, storageKey: storedVideo.storageKey });
       reelImport.status = 'queued';
-      reelImport.progress = { percentage: 8, currentStep: 'Queued', message: 'The reel is waiting for the processing worker.' };
-      await reelImport.save();
+      await saveProgress(reelImport, {
+        stage: 'queued',
+        percentage: 8,
+        currentStep: 'Queued',
+        message: 'The reel is waiting for the processing worker.',
+      });
+      const queued = await enqueueReelImport({
+        jobId: reelImport._id,
+        storageKey: storedVideo.storageKey,
+        attemptNumber: 1,
+      });
+      if (queued.queueJobId) {
+        reelImport.queueJobId = queued.queueJobId;
+        await ReelImport.updateOne({ _id: reelImport._id }, { $set: { queueJobId: queued.queueJobId } });
+      }
     } catch (error) {
       reelImport.status = 'failed';
-      reelImport.progress = { percentage: 5, currentStep: 'Processing unavailable', message: 'The video is safely stored in R2 and can be retried.' };
+      reelImport.activeRunId = null;
+      reelImport.queueJobId = null;
       reelImport.error = {
         code: error.code || 'REEL_QUEUE_UNAVAILABLE',
         safeMessage: 'The video was uploaded, but background processing is not available yet. Configure the worker and retry.',
       };
-      await reelImport.save();
+      await saveProgress(reelImport, {
+        stage: reelImport.progress?.stage || 'queued',
+        percentage: reelImport.progress?.percentage || 5,
+        currentStep: 'Processing unavailable',
+        message: reelImport.error.safeMessage,
+        stageStatus: 'failed',
+        errorCode: reelImport.error.code,
+      });
       return res.status(202).json({
         success: true,
         data: formatJob(reelImport),
@@ -165,10 +229,20 @@ async function createImportFromStoredVideo(req, res, next) {
 async function getUploadCapabilities(req, res) {
   const config = getReelImportConfig();
   const storageProvider = getStorageProvider();
+  const remoteWorkerConfigured = Boolean(String(process.env.AI_VIDEO_WORKER_URL || '').trim())
+    && Boolean(String(process.env.AI_VIDEO_WORKER_SERVICE_TOKEN || '').trim());
+  const localProcessorAvailable = isLocalReelProcessorAvailable();
+  const processingConfigured = remoteWorkerConfigured || localProcessorAvailable;
+  const issues = [];
+  if (!config.enabled) issues.push('Reel Product Import is disabled on the server.');
+  if (!storageProvider) issues.push('Connect Cloudflare R2 or Cloudinary before uploading reels.');
+  if (!processingConfigured) issues.push('No video-processing worker or local FFmpeg runtime is available.');
   res.json({
     success: true,
     data: {
-      directUploadSupported: false,
+      enabled: config.enabled,
+      ready: config.enabled && Boolean(storageProvider) && processingConfigured,
+      directUploadSupported: true,
       uploadEndpoint: '/api/admin/reel-imports',
       formats: ['MP4', 'MOV', 'WebM'],
       maxDurationSeconds: config.maxDurationSeconds,
@@ -176,9 +250,39 @@ async function getUploadCapabilities(req, res) {
       storageConfigured: Boolean(storageProvider),
       storageProvider: storageProvider || null,
       queueConfigured: Boolean(String(process.env.REDIS_URL || '').trim()),
-      workerConfigured: Boolean(String(process.env.AI_VIDEO_WORKER_URL || '').trim()),
+      queueMode: process.env.REDIS_URL ? 'redis' : 'in-process',
+      workerConfigured: processingConfigured,
+      processingMode: remoteWorkerConfigured ? 'remote-worker' : (localProcessorAvailable ? 'local-ffmpeg' : null),
+      remoteWorkerConfigured,
+      localProcessorAvailable,
+      smartSuggestionsEnabled: isVisionEnabled(),
+      smartSuggestionsMessage: isVisionEnabled()
+        ? 'Smart Reel Assistant can identify catalog details from candidate photos.'
+        : 'Smart Reel Assistant is unavailable, but reels can still be grouped and reviewed manually.',
+      progressTracking: true,
+      processingTimeoutMinutes: config.timeoutMinutes,
+      trackedStages: [
+        'Queued',
+        'Preparing video',
+        'Downloading video',
+        'Reading video',
+        'Extracting frames',
+        'Grouping products',
+        'Smart product details',
+        'Saving product photos',
+        'Finalizing results',
+        'Ready for review',
+      ],
+      issues,
     },
   });
+}
+
+function serviceUnavailable(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  error.statusCode = 503;
+  return error;
 }
 
 async function listImports(req, res) {
@@ -189,10 +293,11 @@ async function listImports(req, res) {
   if (req.query.search) {
     query['sourceVideo.originalFilename'] = { $regex: escapeRegExp(req.query.search).slice(0, 100), $options: 'i' };
   }
-  const [items, total] = await Promise.all([
+  const [foundItems, total] = await Promise.all([
     ReelImport.find(query).sort({ createdAt: -1 }).skip(skip).limit(limit),
     ReelImport.countDocuments(query),
   ]);
+  const items = await Promise.all(foundItems.map((job) => failStalledJob(job)));
   res.json({
     success: true,
     data: items.map(formatJob),
@@ -201,8 +306,9 @@ async function listImports(req, res) {
 }
 
 async function getImport(req, res) {
-  const job = await findOwnedJob(req);
+  let job = await findOwnedJob(req);
   if (!job) return res.status(404).json({ success: false, message: 'Reel import not found.' });
+  job = await failStalledJob(job);
   res.json({ success: true, data: formatJob(job) });
 }
 
@@ -215,23 +321,46 @@ async function listCandidates(req, res) {
 
 async function retryImport(req, res, next) {
   try {
-    const job = await findOwnedJob(req, '+sourceVideo.url');
+    let job = await findOwnedJob(req, '+sourceVideo.url +activeRunId');
     if (!job) return res.status(404).json({ success: false, message: 'Reel import not found.' });
+    job = await failStalledJob(job);
     if (!['failed', 'cancelled'].includes(job.status)) {
-      return res.status(409).json({ success: false, message: 'Only failed or cancelled imports can be retried.' });
+      return res.status(409).json({ success: false, message: 'This import is still active. Cancel it before starting a new attempt.' });
     }
     job.status = 'queued';
     job.cancellationRequested = false;
     job.completedAt = undefined;
+    job.activeRunId = null;
+    job.queueJobId = null;
     job.error = undefined;
-    job.progress = { percentage: 8, currentStep: 'Queued', message: 'Retry queued.' };
-    await job.save();
+    await saveProgress(job, {
+      stage: 'queued',
+      percentage: 8,
+      currentStep: 'Queued',
+      message: `Retry attempt ${Number(job.attemptCount || 0) + 1} is waiting for the processing worker.`,
+    });
     try {
-      await enqueueReelImport({ jobId: job._id, storageKey: job.sourceVideo.storageKey });
+      const queued = await enqueueReelImport({
+        jobId: job._id,
+        storageKey: job.sourceVideo.storageKey,
+        attemptNumber: Number(job.attemptCount || 0) + 1,
+      });
+      if (queued.queueJobId) {
+        job.queueJobId = queued.queueJobId;
+        await ReelImport.updateOne({ _id: job._id }, { $set: { queueJobId: queued.queueJobId } });
+      }
     } catch (error) {
       job.status = 'failed';
+      job.queueJobId = null;
       job.error = { code: error.code || 'REEL_QUEUE_UNAVAILABLE', safeMessage: error.message };
-      await job.save();
+      await saveProgress(job, {
+        stage: 'queued',
+        percentage: 8,
+        currentStep: 'Retry unavailable',
+        message: error.message,
+        stageStatus: 'failed',
+        errorCode: job.error.code,
+      });
       throw error;
     }
     res.status(202).json({ success: true, data: formatJob(job) });
@@ -242,17 +371,24 @@ async function retryImport(req, res, next) {
 }
 
 async function cancelImport(req, res) {
-  const job = await findOwnedJob(req);
+  const job = await findOwnedJob(req, '+activeRunId');
   if (!job) return res.status(404).json({ success: false, message: 'Reel import not found.' });
   if (['completed', 'review_required'].includes(job.status)) {
     return res.status(409).json({ success: false, message: 'This import has already finished processing.' });
   }
-  await removeQueuedReelImport(job._id).catch(() => false);
+  await removeQueuedReelImport(job.queueJobId || job._id).catch(() => false);
   job.cancellationRequested = true;
   job.status = 'cancelled';
-  job.progress = { percentage: job.progress?.percentage || 0, currentStep: 'Cancelled', message: 'Processing was cancelled.' };
+  job.activeRunId = null;
+  job.queueJobId = null;
   job.completedAt = new Date();
-  await job.save();
+  await saveProgress(job, {
+    stage: job.progress?.stage || 'processing_reel',
+    percentage: job.progress?.percentage || 0,
+    currentStep: 'Cancelled',
+    message: 'Processing was cancelled.',
+    stageStatus: 'cancelled',
+  });
   res.json({ success: true, data: formatJob(job) });
 }
 
@@ -295,6 +431,59 @@ async function updateCandidate(req, res) {
   res.json({ success: true, data: formatCandidate(candidate) });
 }
 
+async function analyzeCandidate(req, res, next) {
+  try {
+    if (!isVisionEnabled()) {
+      throw serviceUnavailable(
+        'SMART_SUGGESTIONS_UNAVAILABLE',
+        'Smart Reel Assistant is not configured on the server. You can still complete the product details manually.',
+      );
+    }
+    const context = await findOwnedCandidate(req);
+    if (!context) return res.status(404).json({ success: false, message: 'Candidate not found.' });
+    const { candidate } = context;
+    if (['merged', 'draft_created'].includes(candidate.status)) {
+      return res.status(409).json({ success: false, message: 'This candidate can no longer be analyzed.' });
+    }
+    if (Array.isArray(req.body?.selectedFrameIds)) {
+      const selected = new Set(req.body.selectedFrameIds.map(String));
+      candidate.frames.forEach((frame) => { frame.selected = selected.has(String(frame._id)); });
+    }
+    const rankedFrames = [...candidate.frames].sort((left, right) => {
+      if (Boolean(left.selected) !== Boolean(right.selected)) return left.selected ? -1 : 1;
+      return Number(right.qualityScore || 0) - Number(left.qualityScore || 0);
+    });
+    const imageUrls = rankedFrames.map((frame) => frame.url).filter(Boolean).slice(0, 3);
+    if (!imageUrls.length) {
+      return res.status(400).json({ success: false, message: 'Select at least one saved candidate photo first.' });
+    }
+    const categories = await Category.find({ isActive: { $ne: false } }).select('_id name').lean();
+    const result = await analyzeCandidateImages({
+      groupNumber: candidate.groupNumber,
+      imageUrls,
+      categories,
+      subcategories: [],
+    });
+    candidate.suggestions = result.suggestions;
+    candidate.confidence = result.confidence;
+    candidate.analysis = result.analysis;
+    candidate.audit.push({
+      action: result.analysis.status === 'completed' ? 'smart_analyzed' : 'smart_analysis_failed',
+      by: req.user._id,
+      details: { photoCount: imageUrls.length, source: result.analysis.source, error: result.analysis.error },
+    });
+    await candidate.save();
+    res.json({
+      success: true,
+      data: formatCandidate(candidate),
+      warning: result.analysis.status === 'failed' ? result.analysis.error : undefined,
+    });
+  } catch (error) {
+    if (error.statusCode) res.status(error.statusCode);
+    next(error);
+  }
+}
+
 async function mergeCandidates(req, res) {
   const ids = uniqueIds(req.body?.candidateIds);
   if (ids.length < 2) return res.status(400).json({ success: false, message: 'Select at least two candidates to merge.' });
@@ -316,6 +505,7 @@ async function mergeCandidates(req, res) {
     frames,
     suggestions: best.suggestions,
     confidence: best.confidence,
+    analysis: best.analysis,
     adminOverrides: Object.assign({}, ...candidates.map((item) => item.adminOverrides || {})),
     mergedFrom: candidates.map((item) => item._id),
     audit: [{ action: 'merged', by: req.user._id, details: { sources: candidates.map((item) => String(item._id)) } }],
@@ -356,6 +546,7 @@ async function splitCandidate(req, res) {
     frames: selectBestFrames(moved),
     suggestions: candidate.suggestions,
     confidence: candidate.confidence,
+    analysis: candidate.analysis,
     adminOverrides: {},
     audit: [{ action: 'split_created', by: req.user._id, details: { source: String(candidate._id) } }],
   });
@@ -385,8 +576,9 @@ async function moveFrame(req, res) {
 }
 
 async function createDrafts(req, res, next) {
+  let job;
   try {
-    const job = await findOwnedJob(req);
+    job = await findOwnedJob(req);
     if (!job) return res.status(404).json({ success: false, message: 'Reel import not found.' });
     const requested = uniqueIds(req.body?.candidateIds);
     const query = {
@@ -397,8 +589,13 @@ async function createDrafts(req, res, next) {
     const candidates = await ReelCandidate.find(query);
     if (!candidates.length) return res.status(400).json({ success: false, message: 'Select at least one candidate.' });
     job.status = 'creating_drafts';
-    job.progress = { percentage: 95, currentStep: 'Creating product drafts', message: 'Saving selected candidates as drafts.' };
-    await job.save();
+    job.error = undefined;
+    await saveProgress(job, {
+      stage: 'creating_drafts',
+      percentage: 95,
+      currentStep: 'Creating product drafts',
+      message: 'Saving selected candidates as drafts.',
+    });
     const drafts = [];
     for (const candidate of candidates) {
       const draft = await createDraftForCandidate(job, candidate, req.user._id);
@@ -406,11 +603,31 @@ async function createDrafts(req, res, next) {
     }
     job.statistics.createdDrafts = await ReelCandidate.countDocuments({ job: job._id, productDraft: { $ne: null } });
     job.status = 'completed';
-    job.progress = { percentage: 100, currentStep: 'Completed', message: 'Selected product drafts were created.' };
     job.completedAt = new Date();
-    await job.save();
+    await saveProgress(job, {
+      stage: 'drafts_created',
+      percentage: 100,
+      currentStep: 'Completed',
+      message: 'Selected product drafts were created.',
+      stageStatus: 'completed',
+    });
     res.status(201).json({ success: true, data: { drafts: drafts.map(formatDraftReference), job: formatJob(job) } });
   } catch (error) {
+    if (job?.status === 'creating_drafts') {
+      job.status = 'review_required';
+      job.error = {
+        code: error.code || 'DRAFT_CREATION_FAILED',
+        safeMessage: 'Some product drafts could not be created. Your review is saved; please try creating the drafts again.',
+      };
+      await saveProgress(job, {
+        stage: 'creating_drafts',
+        percentage: 95,
+        currentStep: 'Draft creation needs attention',
+        message: job.error.safeMessage,
+        stageStatus: 'failed',
+        errorCode: job.error.code,
+      }).catch(() => null);
+    }
     next(error);
   }
 }
@@ -432,8 +649,9 @@ async function createDraftForCandidate(job, candidate, userId) {
   const name = String(overrides.name || suggestions.name || `Reel product ${candidate.groupNumber}`).trim();
   const selectedFrames = candidate.frames.filter((frame) => frame.selected);
   const frames = (selectedFrames.length ? selectedFrames : candidate.frames.slice(0, 4));
-  const category = await resolveCategory(overrides.category || suggestions.category);
-  const colors = listValue(overrides.colors || overrides.primaryColor || suggestions.primaryColor);
+  const category = await resolveCategory(overrides.category || suggestions.category || suggestions.categoryName);
+  const suggestedColors = listValue(suggestions.primaryColor).concat(listValue(suggestions.secondaryColors));
+  const colors = listValue(overrides.colors || overrides.primaryColor || suggestedColors);
   const sizes = listValue(overrides.sizes);
   const tags = listValue(overrides.tags || suggestions.tags);
   const price = numberOrZero(overrides.price || overrides.sellingPrice);
@@ -452,11 +670,12 @@ async function createDraftForCandidate(job, candidate, userId) {
     sellingPrice: price,
     stock: numberOrZero(overrides.stock),
     sizes,
+    sizingMode: normalizeSizingMode(overrides.sizingMode || suggestions.sizingMode),
     colors,
-    fabric: '',
+    fabric: String(overrides.fabric || suggestions.fabric || ''),
     occasion: listValue(overrides.occasion || suggestions.occasion).join(', '),
     tags,
-    description: String(overrides.description || ''),
+    description: String(overrides.description || suggestions.description || suggestions.shortDescription || ''),
     highlights: [],
     status: 'draft',
     createdBy: userId,
@@ -465,12 +684,12 @@ async function createDraftForCandidate(job, candidate, userId) {
     sourceCandidateId: candidate._id,
     storeId: job.storeId,
     confidence: Number(candidate.confidence?.overall || 0),
-    detectedColors: listValue(suggestions.primaryColor).concat(listValue(suggestions.secondaryColors)),
+    detectedColors: suggestedColors,
     detectedPattern: suggestions.pattern || '',
-    suggestedCategory: suggestions.category || '',
+    suggestedCategory: suggestions.category || suggestions.categoryName || '',
     suggestedTags: tags,
     draftTitle: name,
-    draftDescription: String(overrides.description || suggestions.altText || ''),
+    draftDescription: String(overrides.description || suggestions.description || suggestions.shortDescription || suggestions.altText || ''),
   });
   candidate.productDraft = draft._id;
   candidate.status = 'draft_created';
@@ -522,11 +741,17 @@ function calculateRange(frames) {
 }
 
 function pickSuggestions(value) {
-  return pick(value, ['name', 'category', 'subcategory', 'primaryColor', 'secondaryColors', 'pattern', 'occasion', 'tags', 'altText']);
+  return pick(value, [
+    'name', 'category', 'categoryName', 'subcategory', 'primaryColor', 'secondaryColors',
+    'pattern', 'fabric', 'occasion', 'tags', 'altText', 'shortDescription', 'description', 'sizingMode',
+  ]);
 }
 
 function pickAdminOverrides(value) {
-  return pick(value, ['name', 'category', 'subCategory', 'primaryColor', 'colors', 'pattern', 'occasion', 'tags', 'description', 'price', 'originalPrice', 'sellingPrice', 'sizes', 'stock']);
+  return pick(value, [
+    'name', 'category', 'subCategory', 'primaryColor', 'colors', 'pattern', 'fabric', 'occasion',
+    'tags', 'description', 'price', 'originalPrice', 'sellingPrice', 'sizes', 'sizingMode', 'stock',
+  ]);
 }
 
 function pick(source, keys) {
@@ -547,10 +772,16 @@ function numberOrZero(value) {
   return Number.isFinite(number) && number >= 0 ? number : 0;
 }
 
+function normalizeSizingMode(value) {
+  return ['sized', 'free-size'].includes(value) ? value : 'auto';
+}
+
 function formatJob(job) {
   const data = job.toObject ? job.toObject() : { ...job };
   delete data.sourceVideo?.url;
+  delete data.activeRunId;
   data.id = String(data._id);
+  data.health = publicHealth(job);
   return data;
 }
 
@@ -565,6 +796,7 @@ function formatDraftReference(draft) {
 }
 
 module.exports = {
+  analyzeCandidate,
   cancelImport,
   createDrafts,
   createImport,

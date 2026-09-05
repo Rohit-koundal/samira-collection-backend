@@ -1,6 +1,14 @@
+const crypto = require('crypto');
+const Category = require('../models/Category');
 const ReelCandidate = require('../models/ReelCandidate');
 const ReelImport = require('../models/ReelImport');
 const { getReelImportConfig } = require('../config/reelImport');
+const { analyzeCandidateImages, isVisionEnabled } = require('../services/reelCandidateVision.service');
+const {
+  heartbeatActiveRun,
+  saveProgress,
+  updateActiveRunProgress,
+} = require('../services/reelImportProgress.service');
 
 async function processReelImportJob({ jobId, storageKey }) {
   const job = await ReelImport.findOne({ _id: jobId, 'sourceVideo.storageKey': storageKey }).select('+sourceVideo.url');
@@ -9,17 +17,36 @@ async function processReelImportJob({ jobId, storageKey }) {
   if (job.status === 'review_required' || job.status === 'completed') return { idempotent: true };
 
   const started = Date.now();
+  const runId = crypto.randomUUID();
   job.status = 'processing';
+  job.activeRunId = runId;
   job.startedAt = job.startedAt || new Date();
   job.attemptCount += 1;
   job.error = undefined;
-  job.progress = { percentage: 10, currentStep: 'Preparing video', message: 'The worker is validating and preparing the reel.' };
-  await job.save();
+  await saveProgress(job, {
+    stage: 'preparing_video',
+    percentage: 10,
+    currentStep: 'Preparing video',
+    message: `Processing attempt ${job.attemptCount} started.`,
+  });
 
   try {
-    const result = await requestAiWorker(job);
-    const refreshed = await ReelImport.findById(jobId);
-    if (!refreshed || refreshed.status === 'cancelled' || refreshed.cancellationRequested) return { cancelled: true };
+    const result = await requestAiWorker(job, runId);
+    result.candidates = await enrichCandidatesWithSmartDetails(job, runId, result.candidates || []);
+    const refreshed = await ReelImport.findOne({
+      _id: jobId,
+      status: 'processing',
+      activeRunId: runId,
+      cancellationRequested: { $ne: true },
+    }).select('+activeRunId');
+    if (!refreshed) return { superseded: true };
+
+    await saveProgress(refreshed, {
+      stage: 'finalizing_results',
+      percentage: 94,
+      currentStep: 'Finalizing results',
+      message: 'Saving detected products and preparing the review screen.',
+    });
 
     await persistCandidates(refreshed, result.candidates || []);
     if (result.metadata) {
@@ -34,23 +61,42 @@ async function processReelImportJob({ jobId, storageKey }) {
       detectedProducts: (result.candidates || []).length,
     };
     refreshed.status = 'review_required';
-    refreshed.progress = { percentage: 100, currentStep: 'Ready for review', message: 'Possible products are ready for admin review.' };
+    refreshed.activeRunId = null;
+    refreshed.queueJobId = null;
     refreshed.completedAt = new Date();
     refreshed.error = undefined;
-    await refreshed.save();
+    await saveProgress(refreshed, {
+      stage: 'ready_for_review',
+      percentage: 100,
+      currentStep: 'Ready for review',
+      message: 'Possible products are ready for admin review.',
+      stageStatus: 'completed',
+    });
     structuredLog('reel_import_completed', jobId, {
       durationMs: Date.now() - started,
       candidates: result.candidates?.length || 0,
     });
     return result;
   } catch (error) {
-    const failed = await ReelImport.findById(jobId);
-    if (failed && failed.status !== 'cancelled') {
+    if (error.code === 'REEL_PROCESSING_SUPERSEDED') {
+      structuredLog('reel_import_run_superseded', jobId, { runId });
+      return { superseded: true };
+    }
+    const failed = await ReelImport.findOne({ _id: jobId, activeRunId: runId }).select('+activeRunId');
+    if (failed && failed.status === 'processing' && !failed.cancellationRequested) {
       failed.status = 'failed';
-      failed.progress = { percentage: failed.progress?.percentage || 10, currentStep: 'Processing failed', message: safeProcessingMessage(error) };
+      failed.activeRunId = null;
+      failed.queueJobId = null;
       failed.error = { code: error.code || 'REEL_PROCESSING_FAILED', safeMessage: safeProcessingMessage(error) };
       failed.completedAt = new Date();
-      await failed.save();
+      await saveProgress(failed, {
+        stage: failed.progress?.stage || 'processing_reel',
+        percentage: failed.progress?.percentage || 10,
+        currentStep: 'Processing failed',
+        message: safeProcessingMessage(error),
+        stageStatus: 'failed',
+        errorCode: error.code || 'REEL_PROCESSING_FAILED',
+      });
     }
     structuredLog('reel_import_failed', jobId, {
       durationMs: Date.now() - started,
@@ -61,7 +107,7 @@ async function processReelImportJob({ jobId, storageKey }) {
   }
 }
 
-async function requestAiWorker(job) {
+async function requestAiWorker(job, runId) {
   const config = getReelImportConfig();
   const configuredUrl = String(process.env.AI_VIDEO_WORKER_URL || '').replace(/\/$/, '');
   const baseUrl = configuredUrl && !/^https?:\/\//i.test(configuredUrl)
@@ -72,16 +118,23 @@ async function requestAiWorker(job) {
   if (!baseUrl || !token) {
     // Local/dev path: process with bundled ffmpeg when the Python worker is not configured.
     try {
-      job.progress = { percentage: 25, currentStep: 'Extracting frames', message: 'Reading the reel and preparing product photos.' };
-      await job.save().catch(() => null);
-      return await require('../services/localReelProcessor.service').processReelLocally(job);
+      return await require('../services/localReelProcessor.service').processReelLocally(job, { runId });
     } catch (error) {
       throw processingError(error.code || 'REEL_PROCESSING_FAILED', error.message || 'Video processing failed.');
     }
   }
 
+  await updateActiveRunProgress(job._id, runId, {
+    stage: 'remote_processing',
+    percentage: 20,
+    currentStep: 'Analyzing reel',
+    message: 'The video worker is extracting, checking, and grouping product frames.',
+  });
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), config.timeoutMinutes * 60 * 1000);
+  const heartbeat = setInterval(() => {
+    heartbeatActiveRun(job._id, runId).catch(() => null);
+  }, 15000);
   try {
     const response = await fetch(`${baseUrl}/internal/reel-processing/jobs`, {
       method: 'POST',
@@ -112,6 +165,7 @@ async function requestAiWorker(job) {
     throw processingError('AI_WORKER_UNAVAILABLE', 'The video processing worker could not be reached.');
   } finally {
     clearTimeout(timeout);
+    clearInterval(heartbeat);
   }
 }
 
@@ -130,8 +184,60 @@ async function persistCandidates(job, candidates) {
     })),
     suggestions: candidate.suggestions || {},
     confidence: candidate.confidence || {},
+    analysis: candidate.analysis || {},
     adminOverrides: {},
   })));
+}
+
+async function enrichCandidatesWithSmartDetails(job, runId, candidates) {
+  if (!isVisionEnabled() || !candidates.some((candidate) => !candidate.analysis)) return candidates;
+  const categories = await Category.find({ isActive: { $ne: false } }).select('_id name').lean();
+  const enriched = [];
+  for (let index = 0; index < candidates.length; index += 1) {
+    const candidate = candidates[index];
+    if (candidate.analysis) {
+      enriched.push(candidate);
+      continue;
+    }
+    await updateActiveRunProgress(job._id, runId, {
+      stage: 'analyzing_details',
+      percentage: 82 + Math.round((index / Math.max(1, candidates.length)) * 10),
+      currentStep: 'Smart product details',
+      message: `Identifying catalog details for product ${index + 1} of ${candidates.length}.`,
+    });
+    const rankedFrames = [...(candidate.frames || [])].sort((left, right) => {
+      if (Boolean(left.selected) !== Boolean(right.selected)) return left.selected ? -1 : 1;
+      return Number(right.qualityScore || 0) - Number(left.qualityScore || 0);
+    });
+    const smart = await analyzeCandidateImages({
+      groupNumber: candidate.groupNumber || index + 1,
+      imageUrls: rankedFrames.map((frame) => frame.url).filter(Boolean).slice(0, 3),
+      categories,
+      subcategories: [],
+    });
+    enriched.push({
+      ...candidate,
+      suggestions: mergeExistingSuggestions(smart.suggestions, candidate.suggestions),
+      confidence: mergeConfidence(smart.confidence, candidate.confidence),
+      analysis: smart.analysis,
+    });
+  }
+  return enriched;
+}
+
+function mergeExistingSuggestions(smart = {}, existing = {}) {
+  const merged = { ...smart };
+  Object.entries(existing || {}).forEach(([key, value]) => {
+    const isGenericName = key === 'name' && /^product\s+\d+$/i.test(String(value || '').trim());
+    const hasValue = Array.isArray(value) ? value.length > 0 : String(value || '').trim().length > 0;
+    if (hasValue && !isGenericName) merged[key] = value;
+  });
+  return merged;
+}
+
+function mergeConfidence(smart = {}, existing = {}) {
+  const keys = new Set([...Object.keys(smart || {}), ...Object.keys(existing || {})]);
+  return Object.fromEntries([...keys].map((key) => [key, Math.max(Number(smart?.[key] || 0), Number(existing?.[key] || 0))]));
 }
 
 function safeProcessingMessage(error) {
@@ -143,6 +249,9 @@ function safeProcessingMessage(error) {
     'INVALID_VIDEO',
     'FFMPEG_UNAVAILABLE',
     'STORAGE_FAILURE',
+    'STORAGE_DOWNLOAD_TIMEOUT',
+    'STORAGE_DOWNLOAD_INCOMPLETE',
+    'STORAGE_UPLOAD_TIMEOUT',
     'REEL_JOB_NOT_FOUND',
   ]);
   if (safeCodes.has(error.code) && error.message) return error.message;
