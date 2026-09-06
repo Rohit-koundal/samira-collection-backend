@@ -160,7 +160,7 @@ test('new orders snapshot only invoice seller fields and keep original prices an
 test('closing a refunded request preserves its financial resolution', async (t) => {
   const request = { _id: productId, order: orderId, orderItemId: first._id, quantity: 2, type: 'return', status: 'Refunded', inventoryRestored: true, save: async () => {} };
   const order = { ...delivered(), orderItems: [first] };
-  t.mock.method(ReturnExchange, 'findById', async () => request);
+  t.mock.method(ReturnExchange, 'findOne', async () => request);
   t.mock.method(ReturnExchange, 'find', async () => [request]);
   t.mock.method(Order, 'findById', async () => order);
   const { error } = await invoke(returns.updateReturnStatus, { params: { id: productId }, body: { status: 'Closed' }, user: { _id: userId } });

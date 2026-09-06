@@ -10,6 +10,7 @@ const { sendOtpEmail } = require('../services/emailService');
 const { getDemoOtp, getJwtRefreshSecret, getJwtSecret, getOtpMode, isDemoOtpMode } = require('../config/env');
 const { ApiError } = require('../utils/apiError');
 const { listMemberships } = require('../services/storeService');
+const { normalizeIndianMobile } = require('../utils/phoneUtils');
 
 const otpRateLimit = new Map();
 const offlineProfiles = new Map();
@@ -247,7 +248,7 @@ exports.logout = async (req, res) => {
 };
 
 exports.refresh = async (req, res) => {
-  const token = req.body.refreshToken;
+  const token = req.body?.refreshToken;
   if (!token) return res.status(401).json({ message: 'Refresh token required' });
 
   try {
@@ -265,7 +266,10 @@ exports.refresh = async (req, res) => {
 
     res.json({ success: true, ...authPayload(user) });
   } catch (error) {
-    res.status(401).json({ message: 'Refresh token expired. Please login again.' });
+    if (['JsonWebTokenError', 'TokenExpiredError', 'NotBeforeError'].includes(error.name)) {
+      return res.status(401).json({ message: 'Refresh token expired. Please login again.' });
+    }
+    return res.status(503).json({ code: 'SERVICE_UNAVAILABLE', message: 'Unable to restore your session right now. Please retry shortly.' });
   }
 };
 
@@ -484,7 +488,7 @@ function normalizeProfilePhone(value, { allowEmpty = false } = {}) {
     return '';
   }
 
-  const local = raw.replace(/^91/, '');
+  const local = normalizeIndianMobile(raw);
   if (!/^[6-9]\d{9}$/.test(local)) throw new Error('Please enter a valid 10-digit mobile number');
   return local;
 }

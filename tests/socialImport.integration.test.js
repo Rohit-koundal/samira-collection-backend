@@ -163,7 +163,7 @@ test('social link import uses real media processing, draft persistence and publi
       assert.equal((await request(`/social-imports/${id}/draft`, { method: 'POST', body: { name: 'Do not publish' } })).status, 409);
       assert.equal(await Product.countDocuments(), 2);
     });
-    await t.test('uploaded reel drafts respect the chosen cover and reject an empty photo selection',async()=>{
+    await t.test('uploaded reel drafts respect the chosen cover and reject an empty photo selection',async(st)=>{
       const ReelImport=require('../models/ReelImport');const ReelCandidate=require('../models/ReelCandidate');
       const reel=await ReelImport.create({createdBy:manager._id,sourceVideo:{provider:'r2',storageKey:'fixture/reel.mp4',originalFilename:'reel.mp4',mimeType:'video/mp4',sizeBytes:10,durationSeconds:5},status:'review_required'});
       const candidate=await ReelCandidate.create({job:reel._id,groupNumber:1,frames:[{provider:'r2',storageKey:'fixture/a.jpg',url:'https://example.test/a.jpg',selected:true,qualityScore:.9,timestampSeconds:1,selectionVersion:'quality-v1'},{provider:'r2',storageKey:'fixture/b.jpg',url:'https://example.test/b.jpg',selected:true,qualityScore:.85,timestampSeconds:3,viewType:'back',selectionVersion:'quality-v1'}],suggestions:{name:'Editable uploaded reel',sizingMode:'free-size'}});
@@ -186,6 +186,24 @@ test('social link import uses real media processing, draft persistence and publi
       const draftForPublish = await ProductDraft.findById(draft._id);
       assert.equal(draftForPublish.name, 'Ready Reel Saree'); assert.equal(draftForPublish.price, 899);
       assert.equal(draftForPublish.images.length, 2); assert.equal(draftForPublish.images[1].url, '/uploads/reel-added-later.webp');
+      process.env.GEMINI_API_KEY = 'isolated-reel-analysis-key';
+      st.after(() => { delete process.env.GEMINI_API_KEY; });
+      const realFetch = global.fetch;
+      st.mock.method(global, 'fetch', async (url, options) => String(url).startsWith('https://example.test/') ? new Response(photo, { headers: { 'Content-Type': 'image/jpeg' } }) : realFetch(url, options));
+      st.mock.method(require('../services/mediaStorage.service'), 'downloadObject', async () => { throw new Error('Fixture original unavailable'); });
+      const context = st.mock.method(require('../services/productImportContext.service'), 'analyzeProductContext', async () => ({ contextStatus: 'failed', contextErrorCode: 'AI_QUOTA_EXCEEDED', contextError: 'The Gemini quota is currently exhausted.' }));
+      const analyzed = await request(`/reel-imports/${reel._id}/candidates/${candidate._id}/analyze`, { method: 'POST', body: { selectedFrameIds: [photoId] } });
+      assert.equal(analyzed.status, 200, analyzed.data.message);
+      assert.equal(analyzed.data.data.analysis.errorCode, 'AI_QUOTA_EXCEEDED');
+      assert.equal(analyzed.data.data.suggestions.name, 'Editable uploaded reel');
+      assert.equal(analyzed.data.data.adminOverrides.name, 'Ready Reel Saree');
+      assert.equal(analyzed.data.data.adminOverrides.price, 899);
+      assert.equal(analyzed.data.data.savedDraft.name, 'Ready Reel Saree');
+      const failedRefresh = await ReelCandidate.findById(candidate._id);
+      assert.equal(failedRefresh.analysis.errorCode, 'AI_QUOTA_EXCEEDED');
+      assert.equal(failedRefresh.audit.at(-1).details.errorCode, 'AI_QUOTA_EXCEEDED');
+      assert.equal(context.mock.callCount(), 1);
+      assert.equal((await ProductDraft.findById(draft._id)).price, 899);
       const publish = await request('/product-drafts/publish-selected', { method: 'POST', body: { ids: [String(draft._id)] } });
       assert.equal(publish.status, 200, publish.data.message);
       const again = await request('/product-drafts/publish-selected', { method: 'POST', body: { ids: [String(draft._id)] } });

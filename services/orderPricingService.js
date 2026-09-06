@@ -120,7 +120,7 @@ async function loadOrderItems(orderItems, { tenantFilter = {} } = {}) {
 async function buildOrderDraft({ orderItems, couponCode, paymentMethod, settings, userId, shippingAddress, tenantFilter } = {}) {
   const storeSettings = settings || await getStoreSettings();
   const method = normalizeMethod(paymentMethod);
-  const { items, totalMRP, sellingTotal } = await loadOrderItems(orderItems);
+  const { items, totalMRP, sellingTotal } = await loadOrderItems(orderItems, { tenantFilter });
 
   let coupon = null;
   let couponDiscount = 0;
@@ -149,8 +149,17 @@ async function buildOrderDraft({ orderItems, couponCode, paymentMethod, settings
   const taxableAmount = Math.max(0, sellingTotal - couponDiscount);
   const taxAmount = taxRate > 0 ? round((taxableAmount * taxRate) / (100 + taxRate)) : 0;
   if (taxAmount > 0 && taxableAmount > 0) {
-    items.forEach((item) => {
-      item.tax = round((Number(item.lineTotal || 0) / taxableAmount) * taxAmount);
+    let allocatedTax = 0;
+    let allocatedSales = 0;
+    items.forEach((item, index) => {
+      // Allocate the discounted tax by the original line weights. Using the
+      // discounted subtotal as the denominator overstates every invoice row.
+      allocatedSales += Number(item.lineTotal || 0);
+      const cumulativeTax = index === items.length - 1
+        ? taxAmount
+        : round((allocatedSales / sellingTotal) * taxAmount);
+      item.tax = round(cumulativeTax - allocatedTax);
+      allocatedTax = cumulativeTax;
     });
   }
   const payableBeforeCod = round(Math.max(0, sellingTotal - couponDiscount - prepaidDiscount + deliveryCharge + platformFee));

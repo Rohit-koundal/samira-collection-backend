@@ -10,6 +10,9 @@ const { availableStock, hasManagedVariants, requireVariant, variantId } = requir
 const { notifyLater } = require('../services/notificationService');
 const { recordEventLater } = require('../services/analyticsService');
 const { returnEligibility, returnOrderStatus } = require('../services/returnEligibilityService');
+const { runInTransaction } = require('../utils/transaction');
+const { andFilter } = require('../services/storeService');
+const withSession = (query, session) => session ? query.session(session) : query;
 
 const RETURN_STATUSES = require('../models/ReturnExchange').RETURN_STATUSES;
 const STOCK_RESTORE_STATUSES = ['Received', 'Exchanged', 'Refunded'];
@@ -190,13 +193,16 @@ exports.updateReturnStatus = asyncHandler(async (req, res) => {
   const status = requireEnum(req.body?.status, RETURN_STATUSES, 'status');
   const adminComment = optionalString(req.body?.adminComment, 'adminComment', { max: 1000 });
 
-  const request = await ReturnExchange.findById(req.params.id);
+  const result = await runInTransaction(async (session) => {
+  const request = await withSession(ReturnExchange.findOne(andFilter({ _id: req.params.id }, req.tenantFilter)), session);
   if (!request) throw notFound('Return request not found');
+  if (request.status === status && (!adminComment || request.adminComment === adminComment)) return { request, changed: false };
 
   if (status === 'Pickup Scheduled') request.pickupScheduledAt = request.pickupScheduledAt || new Date();
 
   if (STOCK_RESTORE_STATUSES.includes(status) && !request.inventoryRestored) {
-    await inventoryService.restoreStockForOrder([{
+    const claim = await ReturnExchange.findOneAndUpdate({ _id: request._id, inventoryRestored: { $ne: true } }, { $set: { inventoryRestored: true, inventoryRestoredAt: new Date() } }, { new: true, session });
+    if (claim) try { await inventoryService.restoreStockForOrder([{
       product: request.product,
       quantity: request.quantity,
       variantId: request.variantId,
@@ -205,13 +211,17 @@ exports.updateReturnStatus = asyncHandler(async (req, res) => {
       userId: req.user._id,
       type: 'RETURN',
       reason: `Return ${status.toLowerCase()}`,
-    });
+      session,
+    }); } catch (error) {
+      if (!session) await ReturnExchange.updateOne({ _id: request._id }, { $set: { inventoryRestored: false }, $unset: { inventoryRestoredAt: 1 } });
+      throw error;
+    }
     request.inventoryRestored = true;
     request.inventoryRestoredAt = new Date();
   }
 
   if (status === 'Exchanged' && request.type === 'exchange' && !request.exchangeDeducted) {
-    const product = await Product.findById(request.product);
+    const product = await withSession(Product.findById(request.product), session);
     const selection = {
       product: request.product,
       quantity: request.quantity,
@@ -223,11 +233,16 @@ exports.updateReturnStatus = asyncHandler(async (req, res) => {
       const variant = requireVariant(product, { size: request.exchangeSize, color: request.exchangeColor });
       selection.variantId = variantId(variant);
     }
-    await inventoryService.deductStockForOrder([selection], {
+    const claim = await ReturnExchange.findOneAndUpdate({ _id: request._id, exchangeDeducted: { $ne: true } }, { $set: { exchangeDeducted: true } }, { new: true, session });
+    if (claim) try { await inventoryService.deductStockForOrder([selection], {
       orderId: request.order,
       userId: req.user._id,
       reason: 'Exchange fulfilment',
-    });
+      session,
+    }); } catch (error) {
+      if (!session) await ReturnExchange.updateOne({ _id: request._id }, { $set: { exchangeDeducted: false } });
+      throw error;
+    }
     request.exchangeDeducted = true;
   }
 
@@ -235,17 +250,20 @@ exports.updateReturnStatus = asyncHandler(async (req, res) => {
   request.status = status;
   if (['Refunded', 'Exchanged'].includes(status)) request.resolutionStatus = status;
   if (adminComment) request.adminComment = adminComment;
-  await request.save();
+  await request.save(session ? { session } : {});
 
-  const order = await Order.findById(request.order);
+  const order = await withSession(Order.findById(request.order), session);
   if (order && order.orderStatus !== 'Cancelled') {
-    const requests = await ReturnExchange.find({ order: request.order });
+    const requests = await withSession(ReturnExchange.find({ order: request.order }), session);
     order.orderStatus = returnOrderStatus(order, requests);
     order.statusTimeline.push({ status: order.orderStatus, date: new Date(), note: `${request.type === 'exchange' ? 'Exchange' : 'Return'} request marked ${status}` });
-    await order.save();
+    await order.save(session ? { session } : {});
   }
+  return { request, changed: true };
+  });
+  const { request } = result;
 
-  notifyLater({
+  if (result.changed) notifyLater({
     userId: request.user,
     storeId: request.storeId,
     event: 'RETURN_UPDATED',

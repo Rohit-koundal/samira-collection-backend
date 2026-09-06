@@ -3,12 +3,13 @@ const assert = require('node:assert/strict');
 
 const { request, resetDatabase, startTestEnvironment, stopTestEnvironment } = require('./helpers');
 const { createAdmin, createCustomer } = require('./factories');
+const { createMasterOwner } = require('./accessFixtures');
 
 test.before(startTestEnvironment);
 test.after(stopTestEnvironment);
 test.beforeEach(resetDatabase);
 
-test('website customization is admin-only and publishing controls the public theme', async () => {
+test('website customization is master-only and publishing controls the public theme', async () => {
   const anonymous = await request('/api/admin/customization');
   assert.equal(anonymous.status, 401);
 
@@ -16,7 +17,9 @@ test('website customization is admin-only and publishing controls the public the
   const customer = await request('/api/admin/customization', { token: customerToken });
   assert.equal(customer.status, 403);
 
-  const { token: adminToken } = await createAdmin();
+  const regularAdmin = await createAdmin();
+  assert.equal((await request('/api/admin/customization', { token: regularAdmin.token })).status, 403);
+  const { token: adminToken } = await createMasterOwner();
   const workspace = await request('/api/admin/customization', { token: adminToken });
   assert.equal(workspace.status, 200);
   assert.equal(workspace.data.themes.length, 1);
@@ -55,6 +58,9 @@ test('website customization is admin-only and publishing controls the public the
   assert.equal(beforePublish.status, 200);
   assert.notEqual(beforePublish.data.config.colors.primary, '#123456');
 
+  const lockedPublish = await request(`/api/admin/customization/themes/${created.data._id}/publish`, { method: 'POST', token: adminToken });
+  assert.equal(lockedPublish.status, 403);
+  assert.equal((await request('/api/master/configuration', { method: 'PUT', token: adminToken, body: { revision: 0, locked: false } })).status, 200);
   const published = await request(`/api/admin/customization/themes/${created.data._id}/publish`, {
     method: 'POST',
     token: adminToken,
@@ -72,7 +78,8 @@ test('website customization is admin-only and publishing controls the public the
 });
 
 test('theme history can restore a version to draft without silently changing the live store', async () => {
-  const { token } = await createAdmin();
+  const { token } = await createMasterOwner();
+  assert.equal((await request('/api/master/configuration', { method: 'PUT', token, body: { revision: 0, locked: false } })).status, 200);
   const workspace = await request('/api/admin/customization', { token });
   const theme = workspace.data.selectedTheme;
 
@@ -97,7 +104,7 @@ test('theme history can restore a version to draft without silently changing the
 });
 
 test('active themes are protected from deletion and unused themes can be removed', async () => {
-  const { token } = await createAdmin();
+  const { token } = await createMasterOwner();
   const workspace = await request('/api/admin/customization', { token });
   const activeTheme = workspace.data.selectedTheme;
 

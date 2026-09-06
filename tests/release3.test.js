@@ -8,6 +8,7 @@ const Order = require('../models/Order');
 const AuditLog = require('../models/AuditLog');
 const Store = require('../models/Store');
 const InventoryTransaction = require('../models/InventoryTransaction');
+const { createProvisionedSeller } = require('./accessFixtures');
 
 test.before(startTestEnvironment);
 test.after(stopTestEnvironment);
@@ -17,17 +18,10 @@ test.beforeEach(async () => {
 });
 
 async function createSellerStore(name = 'Riya Fashion') {
-  const { user, token } = await createCustomer();
-  const created = await request('/api/stores', {
-    method: 'POST',
-    token,
-    body: { name, whatsappNumber: user.phone, instagramHandle: 'riya.styles' },
-  });
-  assert.equal(created.status, 201);
-  return { user, token, store: created.data.store };
+  return createProvisionedSeller(name);
 }
 
-test('seller onboarding creates a store without changing platform admin role', async () => {
+test('provisioned seller membership does not grant platform admin role', async () => {
   const { user, token, store } = await createSellerStore();
   assert.equal(store.slug.includes('riya'), true);
   assert.equal(store.status, 'ONBOARDING');
@@ -38,6 +32,14 @@ test('seller onboarding creates a store without changing platform admin role', a
   const stored = await require('../models/User').findById(user._id);
   assert.equal(stored.role, 'customer');
   assert.ok(stored.availableModes.includes('seller'));
+});
+
+test('customers and ordinary admins cannot provision their own stores', async () => {
+  for (const account of [await createCustomer(), await createAdmin()]) {
+    const denied = await request('/api/stores', { method: 'POST', token: account.token, body: { name: 'Unapproved Store' } });
+    assert.equal(denied.status, 403);
+  }
+  assert.equal(await Store.countDocuments({ name: 'Unapproved Store' }), 0);
 });
 
 test('seller A cannot read seller B products', async () => {

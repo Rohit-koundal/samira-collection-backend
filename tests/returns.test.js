@@ -93,3 +93,13 @@ test('completing a return restores stock once', async () => {
   assert.equal((await Product.findById(product._id)).stock, 3);
   assert.equal((await ReturnExchange.findById(created.data._id)).inventoryRestored, true);
 });
+
+test('simultaneous return completion restores the returned unit exactly once', async () => {
+  const { token } = await createCustomer();
+  const product = await createProduct({ stock: 3 });
+  const { orderId, adminToken } = await deliveredOrder(token, product);
+  const created = await request('/api/returns', { method: 'POST', token, body: { order: orderId, product: String(product._id), type: 'return', reason: 'Damaged' } });
+  const results = await Promise.all([1,2].map(() => request(`/api/admin/returns/${created.data._id}/status`, { method: 'PUT', token: adminToken, body: { status: 'Received' } })));
+  assert.ok(results.every(result => result.status === 200));
+  assert.equal((await Product.findById(product._id)).stock, 3);
+});

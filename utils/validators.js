@@ -1,5 +1,6 @@
 const mongoose = require('mongoose');
 const { ApiError } = require('./apiError');
+const { normalizeIndianMobile } = require('./phoneUtils');
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const INDIAN_MOBILE_PATTERN = /^[6-9]\d{9}$/;
@@ -47,7 +48,7 @@ function optionalEmail(value, field = 'email') {
 }
 
 function requireIndianMobile(value, field = 'phone') {
-  const local = String(value || '').replace(/\D/g, '').replace(/^91/, '');
+  const local = normalizeIndianMobile(value);
   if (!INDIAN_MOBILE_PATTERN.test(local)) fail('Please enter a valid 10-digit mobile number', field);
   return local;
 }

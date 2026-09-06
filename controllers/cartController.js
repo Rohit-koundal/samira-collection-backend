@@ -1,9 +1,11 @@
 const Cart = require('../models/Cart');
 const Product = require('../models/Product');
-const mongoose = require('mongoose');
 const { asyncHandler } = require('../middleware/validate');
 const { ApiError, notFound } = require('../utils/apiError');
-const { availableStock, hasManagedVariants, requireVariant, variantId, variantUnitPrice } = require('../services/variantService');
+const { availableStock, findVariant, requireVariant, variantId, variantUnitPrice, variantUnitMrp } = require('../services/variantService');
+const { requireQuantity, requireObjectId } = require('../utils/validators');
+const { andFilter } = require('../services/storeService');
+const { normalizeProductImages } = require('../utils/imageUtils');
 
 function readSessionId(req) {
   const raw = String(req.headers['x-session-id'] || '').trim();
@@ -35,6 +37,12 @@ async function mergeSessionCartIntoUser(userId, sessionId) {
     return;
   }
 
+  // A retried sign-in request must not transfer the same guest bag twice.
+  if (userCart.mergedGuestCarts.some(id => String(id) === String(guest._id))) {
+    await guest.deleteOne();
+    return;
+  }
+
   for (const line of guest.items || []) {
     const existing = userCart.items.find((entry) => sameCartLine(
       entry,
@@ -54,10 +62,12 @@ async function mergeSessionCartIntoUser(userId, sessionId) {
         variantId: line.variantId,
         quantity: line.quantity,
         price: line.price,
+        selected: line.selected !== false,
       });
     }
   }
 
+  userCart.mergedGuestCarts.push(guest._id);
   await userCart.save();
   await guest.deleteOne();
 }
@@ -82,112 +92,122 @@ async function findCart(req, { create = false } = {}) {
   return null;
 }
 
-exports.getCart = asyncHandler(async (req, res) => {
-  const cart = await findCart(req);
-  if (!cart) return res.json({ items: [] });
-  await cart.populate('items.product');
-  res.json(cart);
-});
 
-exports.addToCart = asyncHandler(async (req, res) => {
+async function presentCart(cart, req) {
+  if (!cart) return { items: [] };
+  const products = await Product.find(andFilter({ _id: { $in: cart.items.map(item => item.product) } }, req.tenantFilter));
+  const lookup = new Map(products.map(product => [String(product._id), product]));
+  return { _id: cart._id, items: cart.items.map(line => {
+    const product = lookup.get(String(line.product));
+    const visible = product && product.isActive !== false && !product.isArchived;
+    const managed = Boolean(product?.variants?.length);
+    const variant = visible && managed ? findVariant(product, line) : null;
+    const unavailable = !visible || (managed && !variant);
+    const stock = unavailable ? 0 : availableStock(product, line);
+    const price = visible ? variantUnitPrice(product, variant) : Number(line.price || 0);
+    return {
+      ...line.toObject(), productId: String(line.product), selected: line.selected !== false,
+      product: visible ? normalizeProductImages(product, req) : { _id: String(line.product), name: 'This product is no longer available', isActive: false, unavailable: true, images: [], stock: 0 },
+      price, originalPrice: visible ? Math.max(price, variantUnitMrp(product, variant)) : price,
+      previousPrice: Number(line.price || 0), availableStock: stock, unavailable,
+      issue: unavailable ? 'This item or selection is no longer available.' : stock < line.quantity ? (stock ? 'Only ' + stock + ' left. Reduce the quantity to continue.' : 'This selection is out of stock.') : '',
+    };
+  }) };
+}
+async function changeCart(req, operation, { create = false } = {}) {
   requireCartIdentity(req);
-  const productId = req.body.product || req.body.productId;
-  if (!productId) throw new ApiError('VALIDATION_ERROR', 'Product is required');
-  if (!mongoose.Types.ObjectId.isValid(productId)) throw new ApiError('VALIDATION_ERROR', 'Valid product is required');
-
-  const product = await Product.findById(productId);
-  if (!product) throw notFound('Product not found');
-  if (product.isActive === false || product.isArchived) {
-    throw new ApiError('NOT_FOUND', 'This product is no longer available');
-  }
-
-  const requestedQuantity = Math.max(1, Number(req.body.quantity || 1));
-  const size = req.body.size || '';
-  const color = req.body.color || '';
-  const variant = hasManagedVariants(product)
-    ? requireVariant(product, { variantId: req.body.variantId || req.body.selectedVariant, size, color })
-    : null;
-  const resolvedVariantId = variant ? variantId(variant) : (req.body.variantId || req.body.selectedVariant || '');
-  const stock = availableStock(product, { variantId: resolvedVariantId, size: variant?.size || size, color: variant?.color || color });
-  const unitPrice = variant ? variantUnitPrice(product, variant) : Number(product.price);
-
-  const cart = await findCart(req, { create: true });
-
-  const item = cart.items.find((entry) => sameCartLine(entry, productId, variant?.size || size, variant?.color || color, resolvedVariantId));
-  if (item) {
-    const nextQuantity = Number(item.quantity || 0) + requestedQuantity;
-    if (nextQuantity > stock) {
-      throw new ApiError('OUT_OF_STOCK', `Only ${stock} item${stock === 1 ? '' : 's'} available in stock`, { details: { available: stock } });
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    try {
+      const cart = await findCart(req, { create });
+      if (!cart) return { items: [] };
+      await operation(cart); await cart.save();
+      return presentCart(cart, req);
+    } catch (error) {
+      // Retry concurrent changes against the newest document instead of overwriting it.
+      if ((error.name === 'VersionError' || error.code === 11000) && attempt < 3) continue;
+      throw error;
     }
-    item.quantity = nextQuantity;
-    item.price = unitPrice;
-    item.variantId = resolvedVariantId;
+  }
+}
+async function resolveSelection(productId, input, req) {
+  const product = await Product.findOne(andFilter({ _id: requireObjectId(String(productId), 'product') }, req.tenantFilter));
+  if (!product || product.isActive === false || product.isArchived) throw notFound('This product is no longer available');
+  const size = String(input.size || '').trim(), color = String(input.color || '').trim();
+  if (size.length > 60 || color.length > 100) throw new ApiError('VALIDATION_ERROR', 'Please choose a valid size and colour');
+  let variant = null;
+  if (product.variants?.length) {
+    variant = requireVariant(product, input);
+    if (!variant) throw new ApiError('VARIANT_UNAVAILABLE', 'This selection is no longer available');
   } else {
-    if (requestedQuantity > stock) {
-      throw new ApiError('OUT_OF_STOCK', `Only ${stock} item${stock === 1 ? '' : 's'} available in stock`, { details: { available: stock } });
-    }
-    cart.items.push({
-      product: productId,
-      size: variant?.size || size,
-      color: variant?.color || color,
-      variantId: resolvedVariantId,
-      quantity: requestedQuantity,
-      price: unitPrice,
-    });
+    if (product.sizingMode !== 'free-size' && product.sizes?.length && !product.sizes.includes(size)) throw new ApiError('VARIANT_UNAVAILABLE', 'Please choose an available size');
+    if (product.colors?.length && !product.colors.includes(color)) throw new ApiError('VARIANT_UNAVAILABLE', 'Please choose an available colour');
   }
-
-  await cart.save();
-  await cart.populate('items.product');
-  res.status(201).json(cart);
+  const selection = { size: variant?.size ?? size, color: variant?.color ?? color, variantId: variant ? variantId(variant) : '' };
+  return { product, ...selection, stock: availableStock(product, selection), price: variantUnitPrice(product, variant) };
+}
+function checkQuantity(quantity, stock) {
+  requireQuantity(quantity);
+  if (quantity > stock) throw new ApiError('OUT_OF_STOCK', 'Only ' + stock + ' item' + (stock === 1 ? '' : 's') + ' available in stock', { details: { available: stock } });
+}
+function readIds(req) {
+  const ids = req.body?.itemIds;
+  if (!Array.isArray(ids) || !ids.length || ids.length > 200) throw new ApiError('VALIDATION_ERROR', 'Choose up to 200 bag items');
+  return new Set(ids.map(id => String(requireObjectId(id, 'itemId'))));
+}
+exports.getCart = asyncHandler(async (req, res) => {
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    try { return res.json(await presentCart(await findCart(req), req)); }
+    catch (error) { if ((error.name === 'VersionError' || error.code === 11000) && attempt < 3) continue; throw error; }
+  }
 });
-
+exports.addToCart = asyncHandler(async (req, res) => {
+  const productId = req.body.product || req.body.productId;
+  const quantity = requireQuantity(req.body.quantity ?? 1);
+  res.status(201).json(await changeCart(req, async cart => {
+    const next = await resolveSelection(productId, { ...req.body, variantId: req.body.variantId || req.body.selectedVariant }, req);
+    const existing = cart.items.find(item => sameCartLine(item, productId, next.size, next.color, next.variantId));
+    const total = quantity + Number(existing?.quantity || 0);
+    checkQuantity(total, next.stock);
+    if (existing) { existing.quantity = total; existing.price = next.price; existing.selected = true; }
+    else cart.items.push({ product: productId, size: next.size, color: next.color, variantId: next.variantId, quantity, price: next.price, selected: true });
+  }, { create: true }));
+});
 exports.updateCartItem = asyncHandler(async (req, res) => {
-  requireCartIdentity(req);
-  const nextQuantity = Number(req.body.quantity || 0);
-  const cart = await findCart(req);
-  if (!cart) throw notFound('Cart not found');
-  await cart.populate('items.product');
-  const item = cart.items.id(req.params.itemId);
-  if (!item) throw notFound('Cart item not found');
-
-  if (nextQuantity <= 0) {
-    item.deleteOne();
-    await cart.save();
-    return res.json(cart);
-  }
-
-  const product = item.product;
-  const stock = availableStock(product, { variantId: item.variantId, size: item.size, color: item.color });
-  if (nextQuantity > stock) {
-    throw new ApiError('OUT_OF_STOCK', `Only ${stock} item${stock === 1 ? '' : 's'} available in stock`, { details: { available: stock } });
-  }
-  item.quantity = nextQuantity;
-  await cart.save();
-  res.json(cart);
+  const id = requireObjectId(req.params.itemId, 'itemId');
+  res.json(await changeCart(req, async cart => {
+    const item = cart.items.id(id);
+    if (!item) throw notFound('Bag item not found. Refresh your bag.');
+    const quantity = requireQuantity(req.body.quantity ?? item.quantity, 'quantity', { min: 0 });
+    if (!quantity) { item.deleteOne(); return; }
+    const changedOptions = ['size', 'color', 'variantId'].some(key => Object.prototype.hasOwnProperty.call(req.body, key));
+    const next = await resolveSelection(item.product, {
+      size: req.body.size ?? item.size, color: req.body.color ?? item.color,
+      variantId: changedOptions ? req.body.variantId || '' : item.variantId,
+    }, req);
+    const duplicate = cart.items.find(row => String(row._id) !== String(item._id) && sameCartLine(row, item.product, next.size, next.color, next.variantId));
+    const total = quantity + Number(duplicate?.quantity || 0);
+    checkQuantity(total, next.stock);
+    // Validate first, then save the replacement and any duplicate merge together.
+    item.size = next.size; item.color = next.color; item.variantId = next.variantId; item.quantity = total; item.price = next.price;
+    if (duplicate) { item.selected = item.selected !== false || duplicate.selected !== false; duplicate.deleteOne(); }
+  }));
 });
-
+exports.selectCartItems = asyncHandler(async (req, res) => {
+  const ids = readIds(req);
+  if (typeof req.body.selected !== 'boolean') throw new ApiError('VALIDATION_ERROR', 'Selection must be true or false');
+  res.json(await changeCart(req, cart => { cart.items.forEach(item => { if (ids.has(String(item._id))) item.selected = req.body.selected; }); }));
+});
+exports.removeCartItems = asyncHandler(async (req, res) => {
+  const ids = readIds(req);
+  res.json(await changeCart(req, cart => { cart.items = cart.items.filter(item => !ids.has(String(item._id))); }));
+});
 exports.removeCartItem = asyncHandler(async (req, res) => {
-  requireCartIdentity(req);
-  const cart = await findCart(req);
-  if (!cart) return res.json({ items: [] });
-  cart.items.pull({ _id: req.params.itemId });
-  await cart.save();
-  await cart.populate('items.product');
-  res.json(cart);
+  const id = requireObjectId(req.params.itemId, 'itemId');
+  res.json(await changeCart(req, cart => { cart.items.pull({ _id: id }); }));
 });
-
-exports.clearCart = asyncHandler(async (req, res) => {
-  requireCartIdentity(req);
-  const userId = req.user?._id;
-  const sessionId = readSessionId(req);
-  if (userId) await Cart.findOneAndDelete({ user: userId });
-  else if (sessionId) await Cart.findOneAndDelete({ sessionId });
-  res.json({ message: 'Cart cleared' });
-});
-
+exports.clearCart = asyncHandler(async (req, res) => res.json(await changeCart(req, cart => { cart.items = []; })));
 function sameCartLine(item, productId, size, color, variantIdValue) {
-  return String(item.product) === String(productId)
-    && String(item.size || '') === String(size || '')
-    && String(item.color || '') === String(color || '')
+  return String(item.product?._id || item.product) === String(productId)
+    && String(item.size || '') === String(size || '') && String(item.color || '') === String(color || '')
     && String(item.variantId || '') === String(variantIdValue || '');
 }

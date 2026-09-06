@@ -11,7 +11,7 @@ const makeUser = (addresses = []) => {
 async function call(method, path, user, body = {}, addressId) {
   const handler = router.stack.find((layer) => layer.route?.path === path && layer.route.methods[method]).route.stack[0].handle;
   const res = { statusCode: 200, status(code) { this.statusCode = code; return this; }, json(data) { this.body = data; return this; } };
-  await handler({ user, body, params: { addressId } }, res);
+  await handler({ user, body, params: { addressId } }, res, (error) => { res.error = error; });
   return res;
 }
 test('first address is default, switching default is exclusive, and deleting it promotes the remaining address', async () => {
@@ -38,4 +38,24 @@ test('default selection cannot access an address belonging to someone else', asy
   const res = await call('patch', '/:addressId/default', user, {}, '000000000000000000000001');
   assert.equal(res.statusCode, 404);
   assert.equal(user.addresses[0].isDefault, true);
+});
+
+test('addresses trim required fields, accept formatted Indian numbers, and reject whitespace-only details', async () => {
+  const user = makeUser();
+  const created = await call('post', '/', user, { ...address, fullName: ' Test Recipient ', mobile: '+91 91234 56789' });
+  assert.equal(created.statusCode, 201);
+  assert.equal(user.addresses[0].mobile, '9123456789');
+  assert.equal(user.addresses[0].fullName, 'Test Recipient');
+  const invalid = await call('post', '/', user, { ...address, area: '   ' });
+  assert.equal(invalid.statusCode, 400);
+  assert.equal(user.addresses.length, 1);
+});
+
+test('address validation and persistence failures return through the API error handler', async () => {
+  const user = makeUser();
+  const invalid = await call('post', '/', user, { ...address, addressType: 'Unsupported' });
+  assert.equal(invalid.statusCode, 400);
+  user.save = async () => { throw new Error('Database unavailable'); };
+  const failed = await call('post', '/', user, address);
+  assert.match(failed.error.message, /Database unavailable/);
 });

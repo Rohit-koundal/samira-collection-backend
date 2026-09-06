@@ -1,4 +1,5 @@
 const { asyncHandler } = require('../middleware/validate');
+const { requireObjectId } = require('../utils/validators');
 const { applyProductStructure } = require('../services/masterConfigurationService');
 const multer = require('multer');
 const slugify = require('../utils/slugify');
@@ -60,50 +61,58 @@ exports.bulkUpload = async (req, res, next) => {
       createdBy: req.user?._id,
     })));
 
-    cleanupTempFiles(req.files);
+    // With local storage the uploaded file is the draft's durable image.
+    // Only cloud-backed uploads leave a disposable local staging copy.
+    if (isR2Configured() || isCloudinaryConfigured()) await cleanupTempFiles(req.files);
     res.status(201).json({ success: true, message: 'Drafts created successfully', data: { drafts: drafts.map(formatDraft) } });
   } catch (error) {
-    cleanupTempFiles(req.files);
+    await cleanupTempFiles(req.files);
     next(error);
   }
 };
 
-exports.listDrafts = async (req, res) => {
+exports.listDrafts = asyncHandler(async (req, res) => {
   const drafts = await ProductDraft.find().populate('category').sort('-updatedAt');
   res.json({ success: true, data: drafts.map(formatDraft) });
-};
+});
 
-exports.getDraft = async (req, res) => {
+exports.getDraft = asyncHandler(async (req, res) => {
+  requireObjectId(req.params.id, 'draft id');
   const draft = await ProductDraft.findById(req.params.id).populate('category');
   if (!draft) return res.status(404).json({ success: false, message: 'Draft not found' });
   res.json({ success: true, data: formatDraft(draft) });
-};
+});
 
-exports.updateDraft = async (req, res) => {
+exports.updateDraft = asyncHandler(async (req, res) => {
+  requireObjectId(req.params.id, 'draft id');
   const draft = await ProductDraft.findById(req.params.id);
   if (!draft) return res.status(404).json({ success: false, message: 'Draft not found' });
+  if (draft.status === 'published') return res.status(409).json({ success: false, message: 'This draft is already published. Open the published product to edit its details.' });
   const payload = normalizeDraftPayload(req.body);
-  // Imported provenance and publication state are controlled by the server.
-  if (['social-import', 'reel-import'].includes(draft.sourceType)) {
-    for (const key of ['sourceType', 'sourceSocialImportId', 'sourceJobId', 'sourceCandidateId', 'sourceUrl', 'sourcePlatform', 'createdBy', 'storeId', 'status', 'publishedProductId', 'importContext']) delete payload[key];
-  }
+  // Publication state, identity and source provenance are never client-editable.
+  for (const key of ['_id', 'id', '__v', 'createdAt', 'updatedAt', 'sourceType', 'sourceSocialImportId', 'sourceJobId', 'sourceCandidateId', 'sourceUrl', 'sourcePlatform', 'createdBy', 'storeId', 'status', 'publishedProductId', 'importContext']) delete payload[key];
+  if (payload.stock !== undefined && (!Number.isSafeInteger(payload.stock) || payload.stock < 0)) return res.status(400).json({ success: false, message: 'Stock must be a whole number of 0 or more' });
+  for (const key of ['price', 'sellingPrice', 'originalPrice']) if (payload[key] !== undefined && (!Number.isFinite(payload[key]) || payload[key] < 0)) return res.status(400).json({ success: false, message: 'Product prices must be finite amounts of 0 or more' });
   if (payload.name && !payload.slug) payload.slug = uniqueDraftSlug(payload.name, draft._id);
   Object.assign(draft, payload);
   await draft.save();
   await draft.populate('category');
   res.json({ success: true, message: 'Draft updated successfully', data: formatDraft(draft) });
-};
+});
 
-exports.deleteDraft = async (req, res) => {
-  await ProductDraft.findByIdAndDelete(req.params.id);
+exports.deleteDraft = asyncHandler(async (req, res) => {
+  requireObjectId(req.params.id, 'draft id');
+  const deleted = await ProductDraft.findByIdAndDelete(req.params.id);
+  if (!deleted) return res.status(404).json({ success: false, message: 'Draft not found' });
   res.json({ success: true, message: 'Draft deleted successfully' });
-};
+});
 
 exports.publishSelected = asyncHandler(async (req, res) => {
-  const ids = Array.isArray(req.body.ids) ? req.body.ids.filter(Boolean) : [];
+  const ids = Array.isArray(req.body.ids) ? [...new Set(req.body.ids.filter(Boolean).map(id => String(requireObjectId(id, 'draft id'))))] : [];
   if (!ids.length) return res.status(400).json({ success: false, message: 'Please select at least one draft' });
 
   const drafts = await ProductDraft.find({ _id: { $in: ids } }).populate('category');
+  if (drafts.length !== ids.length) return res.status(404).json({ success: false, message: 'One or more selected drafts no longer exist. Refresh the list before publishing.' });
   const payloads = new Map();
   for (const draft of drafts) if (!(draft.status === 'published' && draft.publishedProductId)) payloads.set(String(draft._id), await applyProductStructure(buildProductPayloadFromDraft(draft)));
   const errors = drafts.filter((draft) => !(draft.status === 'published' && draft.publishedProductId)).map((draft) => validatePublishDraft(draft, payloads.get(String(draft._id)))).filter(Boolean);
@@ -129,14 +138,13 @@ async function publishPreparedDraft(draft, prepared) {
     if (productPayload.sku) {
       productPayload.sku = await ensureUniqueSku(productPayload.sku, draft._id);
     }
-    let product;
-    if (['social-import', 'reel-import'].includes(draft.sourceType)) {
-      product = await Product.findOne({ sourceDraftId: draft._id });
-      if (!product) {
-        try { product = await Product.create({ ...normalizeProductPayload(productPayload), sourceDraftId: draft._id }); }
-        catch (error) { if (error.code !== 11000) throw error; product = await Product.findOne({ sourceDraftId: draft._id }); if (!product) throw error; }
-      }
-    } else product = await Product.create(normalizeProductPayload(productPayload));
+    // The unique sourceDraftId index makes retries and concurrent publication
+    // converge on one product for ordinary uploads as well as imported drafts.
+    let product = await Product.findOne({ sourceDraftId: draft._id });
+    if (!product) {
+      try { product = await Product.create({ ...normalizeProductPayload(productPayload), sourceDraftId: draft._id }); }
+      catch (error) { if (error.code !== 11000) throw error; product = await Product.findOne({ sourceDraftId: draft._id }); if (!product) throw error; }
+    }
     draft.status = 'published';
     draft.publishedProductId = product._id;
     await draft.save();
@@ -237,13 +245,14 @@ function buildProductPayloadFromDraft(draft) {
 }
 
 function validatePublishDraft(draft, prepared) {
-  if (['social-import', 'reel-import'].includes(draft.sourceType) && (!Number.isFinite(draft.stock) || !Number.isInteger(draft.stock) || draft.stock < 0)) return `Draft "${draft.name}" needs a whole-number stock quantity`;
+  if (!Number.isSafeInteger(draft.stock) || draft.stock < 0) return `Draft "${draft.name}" needs a whole-number stock quantity`;
   if (draft.sourceType === 'social-import' && (!Number.isFinite(draft.sellingPrice ?? draft.price) || (draft.sellingPrice ?? draft.price) <= 0)) return `Draft "${draft.name}" needs a valid selling price`;
   if (!draft?.name || String(draft.name).trim().length < 3) return `Draft "${draft?.slug || draft?._id}" needs a product name`;
   if (!draft.category) return `Draft "${draft.name}" needs a category`;
   const sellingPrice = Number(draft.sellingPrice ?? draft.price);
   const originalPrice = Number(draft.originalPrice ?? sellingPrice);
-  if (!sellingPrice) return `Draft "${draft.name}" needs a selling price`;
+  if (!Number.isFinite(sellingPrice) || sellingPrice <= 0) return `Draft "${draft.name}" needs a selling price`;
+  if (!Number.isFinite(originalPrice) || originalPrice < 0) return `Draft "${draft.name}" needs a valid original price`;
   if (Number(draft.stock) < 0) return `Draft "${draft.name}" has invalid stock`;
   if (!Array.isArray(draft.images) || !draft.images.length) return `Draft "${draft.name}" needs at least one image`;
   if (sellingPrice > originalPrice) return `Draft "${draft.name}" selling price cannot exceed original price`;

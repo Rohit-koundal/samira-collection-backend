@@ -18,6 +18,7 @@ const { andFilter } = require('../services/storeService');
 const { readAttribution } = require('../utils/attribution');
 const { logAudit } = require('../services/auditService');
 const { recordEventLater } = require('../services/analyticsService');
+const { normalizeIndianMobile } = require('../utils/phoneUtils');
 
 const ORDER_STATUSES = ['Pending', 'Confirmed', 'Packed', 'Shipped', 'Out for Delivery', 'Delivered', 'Cancelled', 'Return Requested', 'Exchange Requested', 'Returned', 'Refunded'];
 const PAYMENT_STATUSES = ['Pending', 'Paid', 'Failed', 'Refunded'];
@@ -36,7 +37,7 @@ function assertShippingAddress(address) {
   const pincode = String(address.pincode || '').replace(/\D/g, '');
   if (!/^\d{6}$/.test(pincode)) throw new ApiError('VALIDATION_ERROR', 'Please select an address with a valid 6-digit pincode');
   if (!String(address.fullName || '').trim()) throw new ApiError('VALIDATION_ERROR', 'Delivery address needs a contact name');
-  if (!/^[6-9]\d{9}$/.test(String(address.mobile || address.phone || '').replace(/\D/g, '').replace(/^91/, ''))) {
+  if (!/^[6-9]\d{9}$/.test(normalizeIndianMobile(address.mobile || address.phone))) {
     throw new ApiError('VALIDATION_ERROR', 'Delivery address needs a valid 10-digit mobile number');
   }
   return address;

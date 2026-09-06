@@ -5,25 +5,35 @@
  * routing and auth guards are covered, not just the controllers.
  *
  * Database selection, in order of preference:
- *  1. TEST_MONGO_URI, if you point it somewhere yourself.
+ *  1. TEST_MONGO_URI, explicitly configured for automated tests.
  *  2. An in-memory MongoDB replica set, when the binary is available locally.
- *  3. A dedicated *test* database on the cluster in MONGO_URI.
  *
- * Option 3 never touches application data: the database name is rewritten to
- * TEST_DB_NAME and startup aborts if the connection lands anywhere else.
+ * The application .env and MONGO_URI are never used. Every connection targets
+ * TEST_DB_NAME, and destructive cleanup verifies that name independently.
  */
-process.env.NODE_ENV = process.env.NODE_ENV || 'test';
-process.env.JWT_SECRET = process.env.JWT_SECRET || 'test_jwt_secret';
-process.env.JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || 'test_jwt_refresh_secret';
-process.env.OTP_MODE = process.env.OTP_MODE || 'demo';
-process.env.DEMO_OTP = process.env.DEMO_OTP || '123456';
-process.env.OTP_RESEND_COOLDOWN_SECONDS = '0';
-
-const dns = require('node:dns');
+const fs = require('node:fs');
 const path = require('node:path');
 const mongoose = require('mongoose');
 
-require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
+// Tests may deliberately override these after importing the harness. Never
+// inherit production delivery/storage credentials from the caller's shell.
+for (const key of Object.keys(process.env)) {
+  if (/^(MONGO_URI|JWT|OTP|SMS|TWILIO|BREVO|RAZORPAY|R2_|CLOUDINARY|REDIS|GEMINI|AI_|SOCIAL_|META_|INSTAGRAM|FACEBOOK|SHIPROCKET|SHIPPING_|WHATSAPP|PUSH_|PAYMENTS_|ADMIN_PHONE|MASTER_OWNER)/i.test(key)) delete process.env[key];
+}
+Object.assign(process.env, {
+  NODE_ENV: 'test',
+  JWT_SECRET: 'test_jwt_secret',
+  JWT_REFRESH_SECRET: 'test_jwt_refresh_secret',
+  OTP_MODE: 'demo', DEMO_OTP: '123456', OTP_RESEND_COOLDOWN_SECONDS: '0',
+  OTP_PROVIDER: 'mock', SMS_PROVIDER: 'mock', EMAIL_OTP_PROVIDER: 'mock',
+  RAZORPAY_MOCK: '1', SHIPPING_PROVIDER: 'disabled',
+});
+const cachedMongoBinary = path.join(__dirname, '../node_modules/.cache/mongodb-binaries/mongod-x64-win32-7.0.14.exe');
+if (!process.env.MONGOMS_SYSTEM_BINARY && process.platform === 'win32' && fs.existsSync(cachedMongoBinary)) {
+  process.env.MONGOMS_SYSTEM_BINARY = cachedMongoBinary;
+  process.env.MONGOMS_VERSION = '7.0.14';
+}
+process.env.MONGOMS_RUNTIME_DOWNLOAD = process.env.MONGOMS_RUNTIME_DOWNLOAD || 'false';
 
 const TEST_DB_NAME = 'samira_collection_automated_tests';
 
@@ -48,7 +58,7 @@ async function tryInMemoryMongo() {
   try {
     const { MongoMemoryReplSet } = require('mongodb-memory-server');
     replSet = await MongoMemoryReplSet.create({ replSet: { count: 1, storageEngine: 'wiredTiger' } });
-    return replSet.getUri();
+    return replSet.getUri(TEST_DB_NAME);
   } catch {
     if (replSet) await replSet.stop().catch(() => null);
     replSet = undefined;
@@ -57,18 +67,12 @@ async function tryInMemoryMongo() {
 }
 
 async function resolveTestUri() {
-  if (process.env.TEST_MONGO_URI) return process.env.TEST_MONGO_URI;
+  if (process.env.TEST_MONGO_URI) return toTestUri(process.env.TEST_MONGO_URI);
 
   const inMemory = await tryInMemoryMongo();
   if (inMemory) return inMemory;
 
-  if (!process.env.MONGO_URI) {
-    throw new Error('No test database available. Set TEST_MONGO_URI or MONGO_URI.');
-  }
-
-  // Some local resolvers refuse the SRV lookup Atlas needs.
-  dns.setServers(['8.8.8.8', '1.1.1.1']);
-  return toTestUri(process.env.MONGO_URI);
+  throw new Error('No isolated test database available. Install a local MongoDB test binary or explicitly set TEST_MONGO_URI. Application MONGO_URI is never used.');
 }
 
 async function startTestEnvironment() {
@@ -76,8 +80,7 @@ async function startTestEnvironment() {
   await mongoose.connect(uri, { serverSelectionTimeoutMS: 20000 });
 
   const connectedDb = mongoose.connection.name;
-  const isEphemeral = Boolean(replSet) || Boolean(process.env.TEST_MONGO_URI);
-  if (!isEphemeral && connectedDb !== TEST_DB_NAME) {
+  if (connectedDb !== TEST_DB_NAME) {
     await mongoose.disconnect();
     throw new Error(`Refusing to run tests against database "${connectedDb}". Expected "${TEST_DB_NAME}".`);
   }
@@ -101,6 +104,9 @@ async function stopTestEnvironment() {
 
 async function resetDatabase() {
   if (mongoose.connection.readyState !== 1) return;
+  if (mongoose.connection.name !== TEST_DB_NAME) {
+    throw new Error('Refusing test cleanup outside the dedicated automated-test database.');
+  }
   const { collections } = mongoose.connection;
   await Promise.all(Object.values(collections).map((collection) => collection.deleteMany({})));
 }

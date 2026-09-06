@@ -1,8 +1,8 @@
 const fs = require('fs');
 const path = require('path');
+const { generateGeminiJson } = require('./geminiJson.service');
 
 const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
-const FALLBACK_MODELS = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash'];
 
 function isVisionEnabled() {
   return Boolean(String(process.env.GEMINI_API_KEY || '').trim());
@@ -65,18 +65,6 @@ async function readImage(imageUrl = '') {
   return { mimeType, data: buffer.toString('base64') };
 }
 
-function parseModelJson(text = '') {
-  const cleaned = String(text).replace(/```json|```/g, '').trim();
-  const start = cleaned.indexOf('{');
-  const end = cleaned.lastIndexOf('}');
-  if (start === -1 || end === -1) return {};
-  try {
-    return JSON.parse(cleaned.slice(start, end + 1));
-  } catch {
-    return {};
-  }
-}
-
 function clip(value, max) {
   return String(value || '').replace(/\s+/g, ' ').trim().slice(0, max);
 }
@@ -84,11 +72,6 @@ function clip(value, max) {
 function asList(value) {
   const items = Array.isArray(value) ? value : String(value || '').split(',');
   return items.map((item) => clip(item, 40)).filter(Boolean).slice(0, 8);
-}
-
-function modelsToTry() {
-  const preferred = clip(process.env.GEMINI_MODEL, 80) || 'gemini-2.0-flash';
-  return [...new Set([preferred, ...FALLBACK_MODELS])];
 }
 
 function buildPrompt(categories, subcategories, imageCount = 1) {
@@ -116,65 +99,13 @@ function buildPrompt(categories, subcategories, imageCount = 1) {
   ].join(' ');
 }
 
-async function callGeminiModel(model, { images, categories, subcategories }) {
-  const key = String(process.env.GEMINI_API_KEY || '').trim();
+async function callGemini({ images, categories, subcategories }) {
   const safeImages = (Array.isArray(images) ? images : []).filter(Boolean).slice(0, 3);
   const prompt = buildPrompt(categories, subcategories, safeImages.length);
-
-  const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(key)}`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      signal: AbortSignal.timeout(25000),
-      body: JSON.stringify({
-        contents: [{
-          parts: [
-            { text: prompt },
-            ...safeImages.map((image) => ({ inline_data: { mime_type: image.mimeType, data: image.data } })),
-          ],
-        }],
-        generationConfig: { temperature: 0.2, maxOutputTokens: 500 },
-      }),
-    },
-  );
-
-  const payload = await response.json().catch(() => ({}));
-  if (response.status === 404) {
-    const error = new Error(payload?.error?.message || 'Model unavailable');
-    error.retryModel = true;
-    throw error;
-  }
-  if (response.status === 400) {
-    const detail = String(payload?.error?.message || '');
-    const error = new Error(detail || 'Photo analysis is unavailable right now');
-    error.retryModel = /not found|not supported|unknown model|invalid model/i.test(detail);
-    throw error;
-  }
-  if (response.status === 429) {
-    throw new Error('Photo reading is busy right now. You can still add the product, or try again in a minute.');
-  }
-  if (!response.ok) {
-    throw new Error(payload?.error?.message || 'Photo analysis is unavailable right now');
-  }
-  if (payload?.promptFeedback?.blockReason) {
-    throw new Error('This photo could not be analyzed. You can still fill the listing yourself.');
-  }
-  const text = payload?.candidates?.[0]?.content?.parts?.map((part) => part.text).join('\n') || '';
-  return { raw: parseModelJson(text), model };
-}
-
-async function callGemini(input) {
-  let lastError = new Error('Photo analysis is unavailable right now');
-  for (const model of modelsToTry()) {
-    try {
-      return await callGeminiModel(model, input);
-    } catch (error) {
-      lastError = error;
-      if (!error.retryModel) throw error;
-    }
-  }
-  throw lastError;
+  return generateGeminiJson({
+    parts: [{ text: prompt }, ...safeImages.map(image => ({ inlineData: { mimeType: image.mimeType, data: image.data } }))],
+    timeoutMs: 25000, temperature: 0.2,
+  });
 }
 
 function matchCategory(categories, categoryName) {

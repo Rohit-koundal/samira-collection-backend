@@ -4,6 +4,8 @@ const { normalizeVisionSuggestion } = require('../services/quickAddVision.servic
 const {
   defaultCandidateSuggestion,
   toCandidateAnalysis,
+  toContextCandidateAnalysis,
+  analyzeCandidateFiles,
 } = require('../services/reelCandidateVision.service');
 
 test('visual suggestions map a saree to the real category and free-size behavior', () => {
@@ -61,4 +63,38 @@ test('unavailable analysis returns a review-safe candidate instead of failing th
   assert.equal(suggestion.name, 'Product 4');
   assert.equal(suggestion.sizingMode, 'confirm');
   assert.deepEqual(suggestion.tags, ['reel-import']);
+});
+
+test('context failures retain their actionable error code in the candidate response', () => {
+  const result = toContextCandidateAnalysis({ contextStatus: 'failed', contextErrorCode: 'AI_MODEL_UNAVAILABLE', contextError: 'No available Gemini model.' }, 1);
+  assert.equal(result.analysis.status, 'failed');
+  assert.equal(result.analysis.errorCode, 'AI_MODEL_UNAVAILABLE');
+  assert.equal(result.analysis.error, 'No available Gemini model.');
+});
+
+test('photo-only reel analysis uses supported model fallbacks and structured image requests', async (t) => {
+  const previous = { key: process.env.GEMINI_API_KEY, model: process.env.GEMINI_MODEL };
+  process.env.GEMINI_API_KEY = 'fixture-photo-only-key'; process.env.GEMINI_MODEL = 'retired-photo-model';
+  t.after(() => {
+    for (const [key, value] of [['GEMINI_API_KEY', previous.key], ['GEMINI_MODEL', previous.model]]) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+  });
+  const fs = require('node:fs'); const realExists = fs.existsSync; const realRead = fs.readFileSync;
+  t.mock.method(fs, 'existsSync', file => String(file).endsWith('fixture-photo.jpg') || realExists(file));
+  t.mock.method(fs, 'readFileSync', (file, ...args) => String(file).endsWith('fixture-photo.jpg') ? Buffer.from('synthetic image bytes') : realRead(file, ...args));
+  const requested = [];
+  t.mock.method(global, 'fetch', async (url, options) => {
+    requested.push(url);
+    assert.ok(!url.includes('fixture-photo-only-key'));
+    const body = JSON.parse(options.body);
+    assert.equal(body.generationConfig.responseMimeType, 'application/json');
+    assert.equal(body.contents[0].parts[1].inlineData.mimeType, 'image/jpeg');
+    if (url.includes('retired-photo-model')) return { ok: false, status: 404, json: async () => ({}) };
+    return { ok: true, status: 200, json: async () => ({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text: JSON.stringify({ name: 'Blue Saree', categoryName: 'Sarees', colors: ['Blue'] }) }] } }] }) };
+  });
+  const result = await analyzeCandidateFiles({ groupNumber: 1, filePaths: ['fixture-photo.jpg'], categories: [{ _id: 'sarees', name: 'Sarees' }] });
+  assert.equal(result.analysis.status, 'completed'); assert.equal(result.suggestions.name, 'Blue Saree');
+  assert.equal(result.analysis.model, 'gemini-flash-latest'); assert.equal(requested.length, 2);
+  assert.equal(result.suggestions.stock, undefined); assert.equal(result.suggestions.price, undefined);
 });

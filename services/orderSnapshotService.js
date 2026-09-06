@@ -1,8 +1,9 @@
 const mongoose = require('mongoose');
+const { normalizeIndianMobile } = require('../utils/phoneUtils');
 
 function snapshotAddress(address = {}) {
   const source = address && typeof address === 'object' ? address : {};
-  const mobile = String(source.mobile || source.phone || '').replace(/\D/g, '').replace(/^91/, '');
+  const mobile = normalizeIndianMobile(source.mobile || source.phone);
   return {
     fullName: String(source.fullName || '').trim(),
     mobile,

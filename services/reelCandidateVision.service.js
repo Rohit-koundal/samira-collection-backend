@@ -47,7 +47,7 @@ async function analyzeStoredCandidate({ groupNumber, frames, sourceVideo, source
 
 function toContextCandidateAnalysis(context, groupNumber, categories = []) {
   if (context.contextStatus !== 'completed') return context.contextStatus === 'failed'
-    ? failedCandidateAnalysis(groupNumber, new Error(context.contextError || 'The AI service could not read this reel. Check the connection or try again shortly.'))
+    ? failedCandidateAnalysis(groupNumber, Object.assign(new Error(context.contextError || 'The AI service could not read this reel. Check the connection or try again shortly.'), { contextCode: context.contextErrorCode }))
     : unavailableCandidateAnalysis(groupNumber);
   const result = toCandidateAnalysis({ enabled: true, suggestion: { ...context, categoryId: context.category, categoryName: categories.find((item) => String(item._id) === context.category)?.name },
     analysis: { source: 'gemini-reel-context', model: context.contextModel, analyzedAt: new Date() } }, groupNumber);
@@ -109,6 +109,7 @@ function failedCandidateAnalysis(groupNumber, error) {
   const fallback = unavailableCandidateAnalysis(groupNumber, error?.message || 'Product details could not be identified.');
   fallback.analysis.status = 'failed';
   fallback.analysis.analyzedAt = new Date();
+  fallback.analysis.errorCode = clean(error?.contextCode || 'AI_MEDIA_UNAVAILABLE', 80);
   return fallback;
 }
 

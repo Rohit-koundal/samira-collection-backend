@@ -28,8 +28,18 @@ app.post(
   (req, res, next) => require('./controllers/paymentController').razorpayWebhook(req, res).catch(next),
 );
 
+// Meta verifies the exact raw bytes. Keep these routes before JSON parsing.
+const socialOAuth = require('./modules/social-workspace/oauth');
+const socialInbox = require('./modules/social-workspace/inbox');
+app.get('/api/social/webhook', socialInbox.verifyWebhook);
+app.post('/api/social/webhook', express.raw({ type: '*/*', limit: '1mb' }), socialOAuth.wrap(socialInbox.webhook));
+app.get('/api/social/oauth/start', socialOAuth.wrap(socialOAuth.navigate));
+app.get('/api/social/oauth/callback', socialOAuth.wrap(socialOAuth.callback));
+app.post(['/api/social/deauthorize', '/api/social/data-deletion'], express.urlencoded({ extended: false, limit: '16kb' }), socialOAuth.wrap(socialOAuth.deauthorize));
+app.get('/api/social/deletion-status/:code', socialOAuth.wrap(socialOAuth.deletionStatus));
 app.use(express.json({ limit: '30mb' }));
 app.use(require('./middleware/auditMiddleware').auditAdminRequests);
+app.use('/api/social', require('./modules/social-workspace/routes'));
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 app.get('/uploads/:filename', sendImagePlaceholder);
 app.get('/placeholder.jpg', sendImagePlaceholder);

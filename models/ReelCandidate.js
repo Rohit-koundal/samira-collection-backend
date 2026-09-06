@@ -76,6 +76,7 @@ const reelCandidateSchema = new mongoose.Schema({
     model: String,
     analyzedAt: Date,
     error: String,
+    errorCode: String,
   },
   adminOverrides: { type: mongoose.Schema.Types.Mixed, default: {} },
   productDraft: { type: mongoose.Schema.Types.ObjectId, ref: 'ProductDraft', default: null },

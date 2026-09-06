@@ -45,18 +45,18 @@ test('an unauthenticated caller cannot promote a user', async () => {
   assert.equal(status, 401);
 });
 
-test('an admin can promote and demote another user', async () => {
+test('an ordinary admin cannot grant or remove admin access reserved for the master owner', async () => {
   const { token } = await createAdmin();
   await createAdmin(); // keeps a second admin so demotion is permitted
   const { user: customer } = await createCustomer();
 
   const promoted = await request(`/api/admin/customers/${customer._id}/promote-admin`, { method: 'PATCH', token, body: {} });
-  assert.equal(promoted.status, 200);
-  assert.equal(promoted.data.role, 'admin');
+  assert.equal(promoted.status, 403);
+  assert.equal((await User.findById(customer._id)).role, 'customer');
 
   const demoted = await request(`/api/admin/customers/${customer._id}/demote-admin`, { method: 'PATCH', token, body: {} });
-  assert.equal(demoted.status, 200);
-  assert.equal(demoted.data.role, 'customer');
+  assert.equal(demoted.status, 403);
+  assert.equal((await User.findById(customer._id)).role, 'customer');
 });
 
 test('an admin cannot demote themselves', async () => {

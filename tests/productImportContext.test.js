@@ -67,10 +67,10 @@ test('real context preparation retains audio and the AI request uses the video w
   const media = requestBody.contents[0].parts.filter((part) => part.inlineData).map((part) => part.inlineData);
   assert.deepEqual(media.map((item) => item.mimeType), ['video/mp4', 'image/jpeg']); assert.ok(media.every((item) => Buffer.from(item.data, 'base64').length > 0));
   assert.deepEqual((await fs.readdir(directory)).sort(), ['source.jpg', 'source.mp4']);
-  provider.mock.mockImplementation(async () => ({ ok: false, status: 429 }));
+  provider.mock.mockImplementation(async () => ({ ok: false, status: 429, json: async () => ({}) }));
   const quota = await analyzeProductContext({ caption: 'Name: Wine Saree\nPrice: 899', categories });
   assert.equal(quota.contextStatus, 'failed'); assert.equal(quota.contextErrorCode, 'AI_QUOTA_EXCEEDED'); assert.equal(quota.price, 899);
-  provider.mock.mockImplementation(async () => ({ ok: false, status: 403 }));
+  provider.mock.mockImplementation(async () => ({ ok: false, status: 403, json: async () => ({}) }));
   assert.equal((await analyzeProductContext({ caption: 'Wine Saree', categories })).contextErrorCode, 'AI_ACCESS_DENIED');
 });
 

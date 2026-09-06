@@ -11,7 +11,7 @@ async function protect(req, res, next) {
 
   try {
     const decoded = jwt.verify(token, getJwtSecret());
-    if (decoded.tokenType && decoded.tokenType !== 'access') throw new Error('Access token required');
+    if (decoded.tokenType && decoded.tokenType !== 'access') return res.status(401).json({ success: false, code: 'UNAUTHORIZED', message: 'Access token required' });
     if (canUseOfflineSession(decoded)) {
       req.user = buildOfflineUser(decoded);
       return next();
@@ -21,7 +21,10 @@ async function protect(req, res, next) {
     attachMasterSession(req.user, decoded);
     next();
   } catch (error) {
-    res.status(401).json({ success: false, code: 'UNAUTHORIZED', message: 'Token failed' });
+    if (['JsonWebTokenError', 'TokenExpiredError', 'NotBeforeError'].includes(error.name)) {
+      return res.status(401).json({ success: false, code: 'UNAUTHORIZED', message: 'Token failed' });
+    }
+    return res.status(503).json({ success: false, code: 'SERVICE_UNAVAILABLE', message: 'Your account could not be loaded right now. Please retry shortly.' });
   }
 }
 

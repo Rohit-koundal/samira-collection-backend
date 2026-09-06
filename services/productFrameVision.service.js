@@ -1,4 +1,5 @@
 const fs = require('node:fs/promises');
+const { generateGeminiJson } = require('./geminiJson.service');
 const VIEWS = ['front', 'back', 'side', 'detail', 'unknown'];
 
 function normalizeReview(body, frames) {
@@ -25,19 +26,8 @@ async function reviewFrameViews(frames, { signal } = {}) {
       if (bytes.length > 2 * 1024 * 1024) throw new Error('Frame too large for view review');
       parts.push({ text: 'Frame id: ' + frame.id }, { inlineData: { mimeType: 'image/jpeg', data: bytes.toString('base64') } });
     }
-    const models = [...new Set([String(process.env.GEMINI_MODEL || 'gemini-2.5-flash'), 'gemini-2.5-flash'])];
-    for (const model of models) {
-      const timeout = AbortSignal.timeout(25000);
-      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key }, signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
-        body: JSON.stringify({ contents: [{ role: 'user', parts }], generationConfig: { temperature: 0, responseMimeType: 'application/json' } }),
-      });
-      if (response.status === 404) continue;
-      if (!response.ok) throw new Error('View review unavailable');
-      const payload = await response.json();
-      const text = payload.candidates?.[0]?.content?.parts?.map((part) => part.text || '').join('') || '';
-      return { status: 'completed', frames: normalizeReview(JSON.parse(text), frames) };
-    }
+    const { raw } = await generateGeminiJson({ parts, signal, timeoutMs: 25000 });
+    return { status: 'completed', frames: normalizeReview(raw, frames) };
   } catch { if (signal?.aborted) throw new Error('Frame selection cancelled.'); }
   return { status: 'failed', frames: [] };
 }

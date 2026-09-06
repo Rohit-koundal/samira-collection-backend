@@ -1,116 +1,66 @@
 const mongoose = require('mongoose');
 const Product = require('../models/Product');
+const User = require('../models/User');
 const { normalizeProductImages } = require('../utils/imageUtils');
+const { andFilter } = require('../services/storeService');
+const { asyncHandler } = require('../middleware/validate');
 
-function serializeWishlistItem(product, req) {
-  if (!product) return null;
-  const normalized = normalizeProductImages(product, req);
-  return {
-    ...normalized,
-    id: normalized._id || normalized.id,
-  };
+function unavailable(id) {
+  return { _id: String(id), id: String(id), name: 'This product is no longer available', images: [], isActive: false, unavailable: true, stock: 0 };
 }
 
-exports.getWishlist = async (req, res) => {
-  if (!canPersistWishlist(req)) {
-    return res.json([]);
-  }
-
-  const { products, changed } = await resolveStoredWishlistProducts(req.user.wishlist);
-  if (changed) {
-    req.user.wishlist = products.map((product) => product._id);
-    await req.user.save();
-  }
-
-  res.json(products.map((product) => serializeWishlistItem(product, req)).filter(Boolean));
-};
-
-exports.addWishlist = async (req, res) => {
-  if (!canPersistWishlist(req)) {
-    return res.status(503).json({ message: 'Wishlist storage is temporarily unavailable.' });
-  }
-
-  const product = await resolveWishlistProduct(req.params.productId);
-  if (!product) {
-    return res.status(404).json({ message: 'Product not found' });
-  }
-
-  await reconcileWishlist(req.user);
-  req.user.wishlist.addToSet(product._id);
-  await req.user.save();
-  await req.user.populate({ path: 'wishlist', populate: { path: 'category', select: 'name slug' } });
-  res.json((req.user.wishlist || []).map((entry) => serializeWishlistItem(entry, req)).filter(Boolean));
-};
-
-exports.removeWishlist = async (req, res) => {
-  if (!canPersistWishlist(req)) {
-    return res.status(503).json({ message: 'Wishlist storage is temporarily unavailable.' });
-  }
-
-  const product = await resolveWishlistProduct(req.params.productId);
-  if (!product) {
-    return res.status(404).json({ message: 'Product not found' });
-  }
-
-  await reconcileWishlist(req.user);
-  req.user.wishlist.pull(product._id);
-  await req.user.save();
-  await req.user.populate({ path: 'wishlist', populate: { path: 'category', select: 'name slug' } });
-  res.json((req.user.wishlist || []).map((entry) => serializeWishlistItem(entry, req)).filter(Boolean));
-};
-
-function canPersistWishlist(req) {
-  return Boolean(req.user && typeof req.user.populate === 'function' && Array.isArray(req.user.wishlist));
+async function resolveProducts(values, req) {
+  const ids = [...new Set(values.map(value => String(value?._id || value || '').trim()).filter(Boolean))];
+  if (!ids.length) return [];
+  const objectIds = ids.filter(id => mongoose.Types.ObjectId.isValid(id));
+  const slugs = ids.filter(id => !mongoose.Types.ObjectId.isValid(id));
+  const products = await Product.find(andFilter({
+    $or: [{ _id: { $in: objectIds } }, { slug: { $in: slugs } }],
+    isActive: { $ne: false }, isArchived: { $ne: true },
+  }, req.tenantFilter)).populate('category', 'name slug');
+  const lookup = new Map();
+  products.forEach(product => { lookup.set(String(product._id), product); lookup.set(product.slug, product); });
+  const seen = new Set();
+  return ids.map(id => {
+    const product = lookup.get(id);
+    const key = String(product?._id || id);
+    if (seen.has(key)) return null;
+    seen.add(key);
+    return product ? { ...normalizeProductImages(product, req), id: key } : unavailable(id);
+  }).filter(Boolean);
 }
 
-async function resolveWishlistProduct(productIdOrSlug) {
-  const value = String(productIdOrSlug || '').trim();
-  if (!value) return null;
+async function readWishlist(req) {
+  const user = await User.findById(req.user._id).select('wishlist').lean();
+  return resolveProducts(user?.wishlist || [], req);
+}
 
-  if (mongoose.Types.ObjectId.isValid(value)) {
-    const byId = await Product.findById(value).populate('category', 'name slug');
-    if (byId) return byId;
+// Refresh guest saves from the public catalogue without exposing unpublished data.
+exports.resolveWishlist = asyncHandler(async (req, res) => {
+  const ids = req.body?.ids;
+  if (!Array.isArray(ids) || ids.length > 200 || ids.some(id => typeof id !== 'string' || !/^[\w-]{1,160}$/.test(id))) {
+    return res.status(400).json({ message: 'Provide up to 200 valid product IDs.' });
   }
+  res.json(await resolveProducts(ids, req));
+});
 
-  return Product.findOne({ slug: value }).populate('category', 'name slug');
-}
+exports.getWishlist = asyncHandler(async (req, res) => {
+  res.json(await readWishlist(req));
+});
 
-async function resolveStoredWishlistProducts(values = []) {
-  const entries = Array.isArray(values) ? values.map((value) => String(value || '').trim()).filter(Boolean) : [];
-  if (!entries.length) return { products: [], changed: false };
+exports.addWishlist = asyncHandler(async (req, res) => {
+  const [product] = await resolveProducts([req.params.productId], req);
+  if (!product || product.unavailable) return res.status(404).json({ message: 'This product is no longer available.' });
+  // Atomic updates prevent simultaneous tabs from overwriting each other's saves.
+  await User.updateOne({ _id: req.user._id }, { $addToSet: { wishlist: product._id } });
+  res.json(await readWishlist(req));
+});
 
-  const validIds = entries.filter((value) => mongoose.Types.ObjectId.isValid(value));
-  const slugs = entries.filter((value) => !mongoose.Types.ObjectId.isValid(value));
-  const query = [];
-  if (validIds.length) query.push({ _id: { $in: validIds } });
-  if (slugs.length) query.push({ slug: { $in: slugs } });
-
-  if (!query.length) return { products: [], changed: true };
-
-  const products = await Product.find({ $or: query }).populate('category', 'name slug');
-  const byId = new Map(products.map((product) => [String(product._id), product]));
-  const bySlug = new Map(products.map((product) => [String(product.slug), product]));
-
-  const ordered = [];
-  let changed = false;
-  for (const value of entries) {
-    const product = byId.get(value) || bySlug.get(value);
-    if (!product) {
-      changed = true;
-      continue;
-    }
-    ordered.push(product);
-    if (!mongoose.Types.ObjectId.isValid(value) || String(product._id) !== value) {
-      changed = true;
-    }
-  }
-
-  return { products: ordered, changed };
-}
-
-async function reconcileWishlist(user) {
-  if (!Array.isArray(user.wishlist) || !user.wishlist.length) return;
-  const { products, changed } = await resolveStoredWishlistProducts(user.wishlist);
-  if (!changed) return;
-  user.wishlist = products.map((product) => product._id);
-}
+exports.removeWishlist = asyncHandler(async (req, res) => {
+  const value = String(req.params.productId || '');
+  let id = mongoose.Types.ObjectId.isValid(value) ? value : null;
+  if (!id) id = (await Product.findOne(andFilter({ slug: value }, req.tenantFilter)).select('_id').lean())?._id;
+  // Deleted or archived products remain removable by their stored ID.
+  if (id) await User.updateOne({ _id: req.user._id }, { $pull: { wishlist: id } });
+  res.json(await readWishlist(req));
+});

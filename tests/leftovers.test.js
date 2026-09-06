@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const { request, resetDatabase, startTestEnvironment, stopTestEnvironment } = require('./helpers');
 const { createCustomer, createProduct, setSettings } = require('./factories');
 const Cart = require('../models/Cart');
+const { createProvisionedSeller } = require('./accessFixtures');
 
 test.before(startTestEnvironment);
 test.after(stopTestEnvironment);
@@ -13,17 +14,11 @@ test.beforeEach(async () => {
 });
 
 async function createPublishedStore(name = 'Riya Fashion') {
-  const { user, token } = await createCustomer();
-  const created = await request('/api/stores', {
-    method: 'POST',
-    token,
-    body: { name, whatsappNumber: user.phone, instagramHandle: 'riya.styles' },
-  });
-  assert.equal(created.status, 201);
+  const { user, token, store } = await createProvisionedSeller(name);
   const published = await request('/api/stores/me/current/publish', {
     method: 'POST',
     token,
-    headers: { 'x-store-id': created.data.store.id },
+    headers: { 'x-store-id': store.id },
   });
   assert.equal(published.status, 200);
   return { user, token, store: published.data.store };
@@ -104,14 +99,14 @@ test('guest session cart merges into the user cart on login', async () => {
   assert.equal(added.status, 201);
   assert.equal(added.data.items.length, 1);
 
-  const { token } = await createCustomer();
+  const { token, user } = await createCustomer();
   const merged = await request('/api/cart', {
     token,
     headers: sessionHeaders,
   });
   assert.equal(merged.status, 200);
   assert.equal(merged.data.items.length, 1);
-  assert.ok(merged.data.user);
+  assert.equal(String((await Cart.findById(merged.data._id)).user), String(user._id));
   assert.equal(await Cart.countDocuments({ sessionId: 'guest-session-abc' }), 0);
 
   const leftover = await request('/api/cart', { headers: sessionHeaders });

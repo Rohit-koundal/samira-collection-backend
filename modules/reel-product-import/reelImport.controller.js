@@ -1,6 +1,7 @@
 const fs = require('fs/promises');
 const mongoose = require('mongoose');
 const path = require('path');
+const { asyncHandler } = require('../../middleware/validate');
 const Category = require('../../models/Category');
 const ProductDraft = require('../../models/ProductDraft');
 const ReelCandidate = require('../../models/ReelCandidate');
@@ -496,13 +497,16 @@ async function analyzeCandidate(req, res, next) {
       categories,
       attributes: configuration.structure.attributes,
     });
-    candidate.suggestions = result.suggestions;
-    candidate.confidence = result.confidence;
+    // A failed refresh must never replace useful suggestions with "Product N".
+    if (result.analysis.status === 'completed') {
+      candidate.suggestions = result.suggestions;
+      candidate.confidence = result.confidence;
+    }
     candidate.analysis = result.analysis;
     candidate.audit.push({
       action: result.analysis.status === 'completed' ? 'smart_analyzed' : 'smart_analysis_failed',
       by: req.user._id,
-      details: { photoCount: imageUrls.length, source: result.analysis.source, error: result.analysis.error },
+      details: { photoCount: imageUrls.length, source: result.analysis.source, error: result.analysis.error, errorCode: result.analysis.errorCode },
     });
     await candidate.save();
     res.json({
@@ -589,6 +593,12 @@ async function moveFrame(req, res) {
   const context = await findOwnedCandidate(req);
   if (!context) return res.status(404).json({ success: false, message: 'Candidate not found.' });
   const { job, candidate: source } = context;
+  if (source.productDraft || ['merged', 'draft_created'].includes(source.status)) {
+    return res.status(409).json({ success: false, message: 'Photos linked to a saved product draft cannot be moved. Edit the saved draft instead.' });
+  }
+  if (String(req.body?.targetCandidateId) === String(source._id)) {
+    return res.status(400).json({ success: false, message: 'Choose another product group to move this photo.' });
+  }
   const target = await ReelCandidate.findOne({ _id: req.body?.targetCandidateId, job: job._id, status: { $nin: ['merged', 'draft_created'] } });
   if (!target) return res.status(404).json({ success: false, message: 'Target candidate not found.' });
   const frame = source.frames.id(req.body?.frameId);
@@ -835,7 +845,7 @@ function formatDraftReference(draft) {
   return { id: String(draft._id), name: draft.name, status: draft.status };
 }
 
-module.exports = {
+module.exports = Object.fromEntries(Object.entries({
   analyzeCandidate,
   cancelImport,
   createDrafts,
@@ -850,4 +860,4 @@ module.exports = {
   retryImport,
   splitCandidate,
   updateCandidate,
-};
+}).map(([name, handler]) => [name, asyncHandler(handler)]));

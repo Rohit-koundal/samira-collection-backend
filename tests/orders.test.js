@@ -317,3 +317,31 @@ test('the quote endpoint returns backend totals and allowed payment methods', as
   assert.equal(data.totals.finalAmount, 500 + 99 + 49);
   assert.ok(data.paymentOptions.some((option) => option.key === 'COD'));
 });
+
+test('coupon-discounted invoice line taxes add up exactly to the charged inclusive GST', async () => {
+  const { token } = await createCustomer();
+  const first = await createProduct({ price: 1050, originalPrice: 1200 });
+  const second = await createProduct({ price: 525, originalPrice: 700 });
+  const coupon = await createCoupon({ discountValue: 175 });
+  await setSettings({ gstRate: 5, deliveryCharge: 0 });
+  const { status, data } = await request('/api/orders/cod', {
+    method: 'POST', token,
+    body: codOrderBody(first, {
+      orderItems: [{ product: String(first._id), quantity: 1 }, { product: String(second._id), quantity: 1 }],
+      coupon: { code: coupon.code },
+    }),
+  });
+  assert.equal(status, 201);
+  assert.equal(data.taxAmount, 66.67);
+  assert.equal(Math.round(data.orderItems.reduce((sum, item) => sum + item.tax, 0) * 100), 6667);
+  assert.ok(data.orderItems.every((item) => item.tax >= 0));
+});
+
+test('checkout honors its resolved store when loading authoritative product rows', async () => {
+  const product = await createProduct();
+  const { buildOrderDraft } = require('../services/orderPricingService');
+  await assert.rejects(buildOrderDraft({
+    orderItems: [{ product: String(product._id), quantity: 1 }],
+    tenantFilter: { storeId: '0123456789abcdef11111111' },
+  }), (error) => error.errorCode === 'NOT_FOUND');
+});

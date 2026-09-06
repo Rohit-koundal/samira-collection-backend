@@ -290,10 +290,11 @@ test('draft publication validates required configured attributes before any prod
   config.structure.attributes = [{ key: 'serial', label: 'Serial number', required: true }];
   stubConfig(t, config);
   const Draft = require('../models/ProductDraft');
-  t.mock.method(Draft, 'find', () => ({ populate: async () => [{ _id: 'draft', name: 'Draft' }] }));
+  const draftId = '64b000000000000000000001';
+  t.mock.method(Draft, 'find', () => ({ populate: async () => [{ _id: draftId, name: 'Draft' }] }));
   const insert = t.mock.method(Product, 'create', async () => { throw new Error('Must not insert'); });
   let error;
-  await require('../controllers/productDraftController').publishSelected({ body: { ids: ['draft'] } }, response(), (err) => { error = err; });
+  await require('../controllers/productDraftController').publishSelected({ body: { ids: [draftId] } }, response(), (err) => { error = err; });
   assert.equal(error?.statusCode, 400);
   assert.match(error.message, /Serial number/);
   assert.equal(insert.mock.callCount(), 0);
