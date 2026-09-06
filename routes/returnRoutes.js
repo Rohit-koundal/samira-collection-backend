@@ -5,6 +5,7 @@ const { adminOnly } = require('../middleware/adminMiddleware');
 router.post('/', protect, returns.createReturn);
 router.get('/', protect, adminOnly, returns.adminReturns);
 router.get('/my-requests', protect, returns.myReturns);
+router.get('/order/:orderId', protect, returns.orderReturns);
 router.get('/admin/all', protect, adminOnly, returns.adminReturns);
 router.put('/admin/:id/status', protect, adminOnly, returns.updateReturnStatus);
 router.put('/:id/status', protect, adminOnly, returns.updateReturnStatus);

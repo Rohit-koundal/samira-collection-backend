@@ -9,9 +9,10 @@ function getProvider() {
   return String(process.env.SMS_PROVIDER || 'mock').toLowerCase();
 }
 
-async function sendOtp(phone, otp) {
+async function sendOtp(phone, otp, { requireReal = false } = {}) {
   try {
-    const provider = getProvider();
+    const provider = requireReal ? String(process.env.SMS_PROVIDER || process.env.OTP_PROVIDER || '').toLowerCase() : getProvider();
+    if (requireReal && !['msg91', 'fast2sms', 'twilio'].includes(provider)) return { success: false, error: 'A real SMS provider is required' };
     if (provider === 'msg91') return await sendViaMSG91(phone, otp);
     if (provider === 'fast2sms') return await sendViaFast2SMS(phone, otp);
     if (provider === 'twilio') return await sendViaTwilioSMS(phone, otp);
@@ -39,6 +40,7 @@ async function sendViaTwilioSMS(phone, otp) {
 }
 
 module.exports = {
+  getProvider,
   sendOtp,
   sendViaMock,
   sendViaMSG91,

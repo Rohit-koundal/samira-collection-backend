@@ -1,4 +1,5 @@
 const crypto = require('crypto');
+const { logAudit } = require('../services/auditService');
 const Order = require('../models/Order');
 const InventoryTransaction = require('../models/InventoryTransaction');
 const couponService = require('../services/couponService');
@@ -34,7 +35,7 @@ function amountToPaise(amount) {
  * update on `paymentStatus` is the guard: whoever gets there first flips the
  * order to Paid, everyone else sees an already-paid order and stops.
  */
-async function finalizePaidOrder(orderId, { razorpayPaymentId, note }) {
+async function finalizePaidOrder(orderId, { razorpayPaymentId, note, req, source = 'SYSTEM' }) {
   return runInTransaction(async (session) => {
     const claimed = await Order.findOneAndUpdate(
       { _id: orderId, paymentStatus: { $ne: 'Paid' } },
@@ -98,8 +99,11 @@ async function finalizePaidOrder(orderId, { razorpayPaymentId, note }) {
     }
 
     const paid = await Order.findById(claimed._id).session(session || null);
-    if (paid) notifyPaid(paid);
     return { order: paid, alreadyPaid: false };
+  }).then((result) => {
+    if (result.order && !result.alreadyPaid) notifyPaid(result.order);
+    if (result.order && !result.alreadyPaid) logAudit({ req, source, action: 'PAYMENT_CAPTURED', entityType: 'Order', entityId: result.order._id, storeId: result.order.storeId, after: { paymentStatus: result.order.paymentStatus, orderStatus: result.order.orderStatus, finalAmount: result.order.finalAmount } });
+    return result;
   });
 }
 
@@ -107,6 +111,7 @@ async function notifyPaid(order) {
   if (!order) return;
   notifyLater({
     userId: order.user,
+    storeId: order.storeId,
     event: 'ORDER_CONFIRMED',
     title: 'Payment received',
     message: `Your order ${order.invoiceNumber || ''} is confirmed.`,
@@ -202,6 +207,8 @@ async function createPaymentOrder(req, res) {
     return created;
   });
 
+  logAudit({ req, action: 'PAYMENT_STARTED', entityType: 'Order', entityId: order._id, storeId: order.storeId, after: { paymentStatus: order.paymentStatus, paymentMethod: order.paymentMethod, finalAmount: order.finalAmount } });
+
   recordEventLater({
     name: 'PAYMENT_STARTED',
     storeId: order.storeId,
@@ -251,7 +258,7 @@ async function verifyPayment(req, res) {
 
   const { order, alreadyPaid } = await finalizePaidOrder(pending._id, {
     razorpayPaymentId,
-    note: 'Payment verified and order placed',
+    note: 'Payment verified and order placed', req, source: 'CUSTOMER',
   });
 
   recordEventLater({
@@ -312,32 +319,41 @@ async function razorpayWebhook(req, res) {
 
   // Always acknowledge: Razorpay retries on any non-2xx, and a retry storm
   // for an event we cannot map to an order helps nobody.
-  if (!razorpayOrderId) return res.json({ success: true, ignored: true });
+  const refundPaymentId = event === 'refund.processed' ? refundEntity?.payment_id : null;
+  if (!razorpayOrderId && !refundPaymentId) return res.json({ success: true, ignored: true });
 
-  const order = await Order.findOne({ razorpayOrderId });
+  const order = await Order.findOne(razorpayOrderId ? { razorpayOrderId } : { razorpayPaymentId: refundPaymentId });
   if (!order) return res.json({ success: true, ignored: true });
 
   try {
     if (event === 'payment.captured' || event === 'order.paid') {
       await finalizePaidOrder(order._id, {
         razorpayPaymentId: paymentEntity?.id || order.razorpayPaymentId,
-        note: 'Payment confirmed by Razorpay webhook',
+        note: 'Payment confirmed by Razorpay webhook', req, source: 'WEBHOOK',
       });
     } else if (event === 'payment.authorized') {
-      await Order.updateOne(
+      const result = await Order.updateOne(
         { _id: order._id, paymentStatus: { $ne: 'Paid' } },
         { $set: { paymentState: 'AUTHORIZED' } },
       );
+      if (result.modifiedCount) logAudit({ req, source: 'WEBHOOK', action: 'PAYMENT_AUTHORIZED', entityType: 'Order', entityId: order._id, storeId: order.storeId, after: { paymentState: 'AUTHORIZED' } });
     } else if (event === 'payment.failed') {
-      await failUnpaidOrder(order, paymentEntity?.error_description || 'Payment failed at gateway');
+      await failUnpaidOrder(order, paymentEntity?.error_description || 'Payment failed at gateway', { req, source: 'WEBHOOK' });
     } else if (event === 'refund.processed') {
       const refunded = Number(refundEntity?.amount || 0) / 100;
       const isFullRefund = refunded >= Number(order.finalAmount || 0);
-      await Order.updateOne({ _id: order._id }, {
+      const result = await Order.updateOne({ _id: order._id }, {
         $set: {
           paymentState: isFullRefund ? 'REFUNDED' : 'PARTIALLY_REFUNDED',
           ...(isFullRefund ? { paymentStatus: 'Refunded' } : {}),
         },
+      });
+      if (result.modifiedCount) logAudit({ req, source: 'WEBHOOK', action: 'PAYMENT_REFUND_PROCESSED', entityType: 'Order', entityId: order._id, storeId: order.storeId, before: { paymentState: order.paymentState }, after: { paymentState: isFullRefund ? 'REFUNDED' : 'PARTIALLY_REFUNDED', refundAmount: refunded } });
+      notifyLater({
+        userId: order.user, storeId: order.storeId, event: 'REFUND_PROCESSED',
+        title: isFullRefund ? 'Refund processed' : 'Partial refund processed',
+        message: `Your refund of Rs. ${refunded.toLocaleString('en-IN')} has been processed by the payment provider. The time it takes to appear depends on your bank.`,
+        metadata: { orderId: String(order._id), refundId: refundEntity?.id, amount: refunded },
       });
     }
   } catch (error) {
@@ -371,7 +387,7 @@ async function recordPaymentFailure(req, res) {
     return res.status(409).json({ success: false, code: 'DUPLICATE_REQUEST', message: 'Order is already paid', order });
   }
 
-  const updated = await failUnpaidOrder(order, reason);
+  const updated = await failUnpaidOrder(order, reason, { req, source: 'CUSTOMER' });
   recordEventLater({
     name: 'PAYMENT_FAILED',
     storeId: order.storeId,
@@ -381,14 +397,14 @@ async function recordPaymentFailure(req, res) {
   return res.status(202).json({ success: false, message: reason, order: updated || order });
 }
 
-async function failUnpaidOrder(order, reason) {
+async function failUnpaidOrder(order, reason, { req, source = 'SYSTEM' } = {}) {
   if (!order || order.paymentStatus === 'Paid') return order;
 
   const cancelled = order.orderStatus === 'Cancelled'
     ? order
-    : await cancelOrderInternal(order, { actor: null, note: reason });
+    : await cancelOrderInternal(order, { req, source, actor: req?.user, note: reason });
 
-  return Order.findOneAndUpdate(
+  const previous = await Order.findOneAndUpdate(
     { _id: order._id, paymentStatus: { $ne: 'Paid' } },
     {
       $set: {
@@ -397,8 +413,20 @@ async function failUnpaidOrder(order, reason) {
         paymentFailureReason: reason,
       },
     },
-    { new: true },
-  ) || cancelled;
+    { new: false },
+  );
+  if (!previous) return cancelled;
+  if (previous.paymentStatus !== 'Failed') notifyLater({
+    userId: order.user, storeId: order.storeId, event: 'PAYMENT_FAILED',
+    title: 'Payment was not completed',
+    message: 'Your payment attempt was unsuccessful. Open your order for details and help with any amount debited.',
+    metadata: { orderId: String(order._id) },
+  });
+  if (previous.paymentStatus !== 'Failed') logAudit({ req, source, action: 'PAYMENT_FAILED', entityType: 'Order', entityId: order._id, storeId: order.storeId, before: { paymentStatus: previous.paymentStatus }, after: { paymentStatus: 'Failed' }, summary: source === 'CUSTOMER' ? 'Customer reported a failed or abandoned payment attempt' : 'Payment gateway reported a failed payment' });
+  previous.paymentStatus = 'Failed';
+  previous.paymentState = 'FAILED';
+  previous.paymentFailureReason = reason;
+  return previous;
 }
 
 module.exports = {

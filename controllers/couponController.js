@@ -15,6 +15,8 @@ const {
 } = require('../utils/validators');
 const { andFilter } = require('../services/storeService');
 const { logAudit } = require('../services/auditService');
+const { auditSnapshot } = require('../utils/auditData');
+const COUPON_AUDIT_FIELDS = ['code', 'type', 'discountValue', 'minOrderAmount', 'maxDiscountAmount', 'validFrom', 'expiryDate', 'usageLimit', 'customerLimit', 'firstOrderOnly', 'isActive', 'isPublic', 'applicablePaymentMethods', 'applicableProducts', 'applicableCategories'];
 
 const PAYMENT_METHODS = ['COD', 'UPI', 'CARD', 'NETBANKING', 'WALLET'];
 
@@ -102,7 +104,7 @@ exports.createCoupon = asyncHandler(async (req, res) => {
   if (req.store?._id) payload.storeId = req.store._id;
   try {
     const coupon = await Coupon.create(payload);
-    logAudit({ req, action: 'COUPON_CREATE', entityType: 'Coupon', entityId: coupon._id, after: { code: coupon.code } });
+    logAudit({ req, action: 'COUPON_CREATE', entityType: 'Coupon', entityId: coupon._id, storeId: coupon.storeId, after: auditSnapshot(coupon, COUPON_AUDIT_FIELDS) });
     res.status(201).json(coupon);
   } catch (error) {
     if (error?.code === 11000) throw new ApiError('DUPLICATE_REQUEST', 'A coupon with this code already exists');
@@ -114,6 +116,7 @@ exports.updateCoupon = asyncHandler(async (req, res) => {
   const couponId = requireObjectId(req.params.id, 'coupon id');
   const coupon = await Coupon.findOne(andFilter({ _id: couponId }, req.tenantFilter));
   if (!coupon) throw notFound('Coupon not found');
+  const before = auditSnapshot(coupon, COUPON_AUDIT_FIELDS);
   const payload = readCouponPayload({ ...coupon.toObject(), ...req.body });
   Object.assign(coupon, payload);
   try {
@@ -122,7 +125,7 @@ exports.updateCoupon = asyncHandler(async (req, res) => {
     if (error?.code === 11000) throw new ApiError('DUPLICATE_REQUEST', 'A coupon with this code already exists');
     throw error;
   }
-  logAudit({ req, action: 'COUPON_UPDATE', entityType: 'Coupon', entityId: coupon._id, after: { code: coupon.code, isActive: coupon.isActive } });
+  logAudit({ req, action: 'COUPON_UPDATE', entityType: 'Coupon', entityId: coupon._id, storeId: coupon.storeId, before, after: auditSnapshot(coupon, COUPON_AUDIT_FIELDS) });
   res.json(coupon);
 });
 
@@ -130,15 +133,16 @@ exports.deleteCoupon = asyncHandler(async (req, res) => {
   const couponId = requireObjectId(req.params.id, 'coupon id');
   const coupon = await Coupon.findOne(andFilter({ _id: couponId }, req.tenantFilter));
   if (!coupon) throw notFound('Coupon not found');
+  const before = auditSnapshot(coupon, COUPON_AUDIT_FIELDS);
   if (Number(coupon.usedCount || 0) > 0) {
     coupon.isActive = false;
     coupon.isPublic = false;
     await coupon.save();
-    logAudit({ req, action: 'COUPON_ARCHIVE', entityType: 'Coupon', entityId: coupon._id, after: { code: coupon.code } });
+    logAudit({ req, action: 'COUPON_ARCHIVE', entityType: 'Coupon', entityId: coupon._id, storeId: coupon.storeId, before, after: auditSnapshot(coupon, COUPON_AUDIT_FIELDS) });
     return res.json({ success: true, archived: true, message: 'Used coupon archived to preserve redemption history', coupon });
   }
   await coupon.deleteOne();
-  logAudit({ req, action: 'COUPON_DELETE', entityType: 'Coupon', entityId: coupon._id, after: { code: coupon.code } });
+  logAudit({ req, action: 'COUPON_DELETE', entityType: 'Coupon', entityId: coupon._id, storeId: coupon.storeId, before });
   return res.json({ success: true, archived: false, message: 'Coupon deleted' });
 });
 

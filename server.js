@@ -28,6 +28,10 @@ async function startServer() {
   await connectDB();
 
   if (mongoose.connection.readyState === 1) {
+    const socialImports = require('./modules/social-product-import/socialImport.service');
+    await socialImports.recoverImports().catch(() => console.error('Social import recovery unavailable'));
+    const socialRecovery = setInterval(() => socialImports.recoverImports().catch(() => {}), 120000);
+    socialRecovery.unref();
     const recovery = await resumePendingReelImports().catch((error) => {
       console.error(`Reel import recovery failed: ${error.message}`);
       return { resumed: 0 };

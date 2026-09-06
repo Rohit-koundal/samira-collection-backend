@@ -109,7 +109,7 @@ async function createTargetOtp(target, { purpose = 'login', req, targetType = 'p
     throw error;
   }
 
-  const otp = generateOtp();
+  const otp = purpose === 'master_login' ? String(crypto.randomInt(100000, 1000000)) : generateOtp();
   if (useMemoryOtpStore()) {
     const record = {
       phone: targetType === 'phone' ? normalizedTarget : undefined,
@@ -195,15 +195,32 @@ async function verifyTargetOtp(target, otp, { targetType = 'phone' } = {}) {
   const matches = compareOtp(normalizedTarget, code, record.otpHash);
 
   if (!matches) {
-    record.attempts += 1;
-    await record.save();
+    if (record.purpose === 'master_login' && !useMemoryOtpStore()) {
+      await Otp.updateOne({ _id: record._id, isUsed: false, attempts: { $lt: record.maxAttempts } }, { $inc: { attempts: 1 } });
+    } else {
+      record.attempts += 1;
+      await record.save();
+    }
     const error = new Error('Invalid OTP');
     error.statusCode = 400;
     throw error;
   }
 
-  record.isUsed = true;
-  await record.save();
+  if (record.purpose === 'master_login' && !useMemoryOtpStore()) {
+    // Atomically redeem once: parallel verify requests cannot reuse an owner OTP.
+    const redeemed = await Otp.findOneAndUpdate({
+      _id: record._id, isUsed: false, trustedDelivery: true, otpHash: record.otpHash,
+      attempts: { $lt: record.maxAttempts }, expiresAt: { $gt: new Date() },
+    }, { $set: { isUsed: true } }, { new: true });
+    if (!redeemed) {
+      const error = new Error('OTP is no longer available. Request a new OTP.');
+      error.statusCode = 400;
+      throw error;
+    }
+  } else {
+    record.isUsed = true;
+    await record.save();
+  }
   return { target: normalizedTarget, targetType, [targetType]: normalizedTarget, record };
 }
 

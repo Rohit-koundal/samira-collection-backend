@@ -1,9 +1,12 @@
+const { isMasterOwner } = require('../config/masterOwner');
+const { readConfiguration } = require('../services/masterConfigurationService');
 const Settings = require('../models/Settings');
 const { asyncHandler } = require('../middleware/validate');
 const { ApiError } = require('../utils/apiError');
 const { buildPaymentOptions, getStoreSettings, razorpayDisabledReason, razorpayUsable } = require('../services/paymentSettingsService');
 const { isRazorpayConfigured } = require('../services/razorpayService');
 const { logAudit } = require('../services/auditService');
+const { auditSnapshot } = require('../utils/auditData');
 
 exports.getSettings = asyncHandler(async (req, res) => {
   res.json((await Settings.findOne()) || await Settings.create({}));
@@ -60,7 +63,26 @@ exports.getPaymentReadiness = asyncHandler(async (req, res) => {
 exports.updateSettings = asyncHandler(async (req, res) => {
   // The admin form round-trips the whole document, so drop the fields Mongo
   // owns before using it as an update.
-  const { _id, __v, createdAt, updatedAt, ...updates } = req.body || {};
+  const { _id, __v, createdAt, updatedAt, storeId, ...updates } = req.body || {};
+  if (storeId && String(storeId) !== String((await getStoreSettings()).storeId || '')) throw new ApiError('FORBIDDEN', 'Store identity cannot be changed here');
+  if (Object.keys(updates).some((key) => !Settings.schema.path(key))) {
+    throw new ApiError('FORBIDDEN', 'Only basic store settings can be changed here');
+  }
+  if (!isMasterOwner(req.user) && !(await readConfiguration()).structure.clientPermissions.payments) {
+    const current = await getStoreSettings();
+    const protectedFields = ['razorpayEnabled', 'upiEnabled', 'cardPaymentEnabled', 'netBankingEnabled', 'walletEnabled', 'codEnabled', 'codCharge', 'codMinAmount', 'codMaxAmount', 'codPincodes', 'prepaidDiscountType', 'prepaidDiscountValue', 'codConfirmationRequired', 'rtoBlockEnabled', 'rtoBlockMinOrders', 'rtoBlockThreshold', 'platformFee', 'gstRate'];
+    if (protectedFields.some((key) => updates[key] !== undefined && JSON.stringify(updates[key]) !== JSON.stringify(current[key]))) {
+      throw new ApiError('FORBIDDEN', 'Payment configuration is managed by the store owner');
+    }
+  }
+
+  if (!isMasterOwner(req.user) && !(await readConfiguration()).structure.clientPermissions.content) {
+    const current = await getStoreSettings();
+    const contentFields = ['storeName', 'contactEmail', 'contactPhone', 'whatsappNumber', 'address', 'socialLinks', 'footerText', 'returnPolicy', 'privacyPolicy', 'termsConditions', 'shippingPolicy', 'cancellationPolicy', 'sizeGuide', 'faqs', 'ourStory', 'appLinks'];
+    if (contentFields.some((key) => updates[key] !== undefined && JSON.stringify(updates[key]) !== JSON.stringify(current[key]))) {
+      throw new ApiError('FORBIDDEN', 'Store content is managed by the store owner');
+    }
+  }
 
   if (!String(updates.storeName || '').trim()) {
     throw new ApiError('VALIDATION_ERROR', 'Store name is required');
@@ -87,7 +109,8 @@ exports.updateSettings = asyncHandler(async (req, res) => {
     throw new ApiError('VALIDATION_ERROR', 'Prepaid discount type must be Percentage or Flat');
   }
 
+  const previous = await Settings.findOne();
   const saved = await Settings.findOneAndUpdate({}, updates, { new: true, upsert: true, runValidators: true });
-  logAudit({ req, action: 'SETTINGS_UPDATE', entityType: 'Settings', entityId: saved._id });
+  logAudit({ req, action: 'SETTINGS_UPDATE', entityType: 'Settings', entityId: saved._id, before: auditSnapshot(previous, Object.keys(updates)), after: auditSnapshot(saved, Object.keys(updates)) });
   res.json(saved);
 });

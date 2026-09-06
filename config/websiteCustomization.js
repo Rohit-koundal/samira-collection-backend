@@ -128,8 +128,18 @@ const DEFAULT_WEBSITE_CONFIG = {
     gridGap: 20,
     productsPerRow: { desktop: 4, tablet: 3, mobile: 2 },
   },
+  mobile: {
+    enabled: false,
+    headerBackground: '#ffffff', headerText: '#334155',
+    pageBackground: '#fcfaf7', gridGap: 12, cardRadius: 14, imageRatio: 'original',
+    columns: 2, useDesktopCatalog: false,
+    sections: ['hero', 'services', 'categories', 'sale', 'promotional', 'trending', 'newArrivals', 'ethnicSets', 'accessories']
+      .map((id, index) => ({ id, visible: true, order: index * 10, heading: '' })),
+  },
+  tablet: { enabled: false, columns: 3, gridGap: 16 },
   theme: {
     preset: 'default',
+    enhancedStyles: false,
   },
 };
 
@@ -160,6 +170,21 @@ const PRESET_OVERRIDES = {
     productCards: { shadow: 'elevated' },
     theme: { preset: 'sale' },
   },
+  sage: {
+    colors: { primary: '#31594c', secondary: '#edf3ed', accent: '#9c8046', background: '#fafbf7' },
+    buttons: { borderRadius: 12 }, productCards: { borderRadius: 16, shadow: 'soft' },
+    theme: { preset: 'sage' },
+  },
+  rose: {
+    colors: { primary: '#823f58', secondary: '#fbecf0', accent: '#a47b43', background: '#fff9fb' },
+    buttons: { borderRadius: 24 }, productCards: { borderRadius: 20, shadow: 'soft' },
+    theme: { preset: 'rose' },
+  },
+  indigo: {
+    colors: { primary: '#333b70', secondary: '#eff0f8', accent: '#a18347', background: '#fafaff' },
+    typography: { headingFont: 'Georgia' }, buttons: { borderRadius: 6 },
+    productCards: { borderRadius: 8, shadow: 'none' }, theme: { preset: 'indigo' },
+  },
   wedding: {
     colors: { primary: '#681b36', secondary: '#f8e9e5', accent: '#b88a44', background: '#fffaf5' },
     typography: { headingFont: 'Playfair Display', headingScale: 1.08 },
@@ -175,6 +200,7 @@ const PRESET_LABELS = {
   festive: 'Festive Theme',
   sale: 'Sale Theme',
   wedding: 'Wedding Theme',
+  sage: 'Botanical Sage', rose: 'Soft Rose', indigo: 'Indigo Heritage',
 };
 
 function clone(value) {
@@ -194,16 +220,16 @@ function mergeKnown(base, incoming) {
 
 function normalizeSections(sections) {
   const source = Array.isArray(sections) ? sections : [];
-  const sourceMap = new Map(source.map((section) => [String(section?.id || ''), section]));
+  const sourceMap = new Map(source.filter((section) => section && typeof section === 'object').map((section) => [String(section.id || ''), section]));
   return SECTION_DEFAULTS.map((fallback, index) => {
     const section = mergeKnown(fallback, sourceMap.get(fallback.id));
     section.id = fallback.id;
     section.label = fallback.label;
     section.visible = typeof section.visible === 'boolean' ? section.visible : true;
-    section.order = Math.max(0, Math.min(1000, Number(section.order || (index + 1) * 10)));
+    section.order = Math.max(0, Math.min(1000, Number(section.order ?? (index + 1) * 10)));
     section.buttonLink = safeInternalPath(section.buttonLink);
-    section.image = cleanText(section.image, 2000);
-    section.backgroundImage = cleanText(section.backgroundImage, 2000);
+    section.image = safeImageUrl(section.image);
+    section.backgroundImage = safeImageUrl(section.backgroundImage);
     return section;
   }).sort((a, b) => a.order - b.order);
 }
@@ -228,8 +254,9 @@ function normalizeWebsiteConfig(input = {}) {
   config.schemaVersion = 2;
   config.branding.websiteName = cleanText(config.branding.websiteName, 120) || DEFAULT_WEBSITE_CONFIG.branding.websiteName;
   config.branding.tagline = cleanText(config.branding.tagline, 240);
-  config.branding.logo = cleanText(config.branding.logo, 2000);
-  config.branding.favicon = cleanText(config.branding.favicon, 2000);
+  config.branding.logo = safeImageUrl(config.branding.logo);
+  config.branding.favicon = safeImageUrl(config.branding.favicon);
+  config.footer.logo = safeImageUrl(config.footer.logo);
   config.homepage.sections = normalizeSections(input?.homepage?.sections || config.homepage.sections);
   config.homepage.featuredCategoryIds = normalizeIds(config.homepage.featuredCategoryIds);
   Object.keys(config.homepage.sectionProductIds).forEach((key) => {
@@ -237,7 +264,7 @@ function normalizeWebsiteConfig(input = {}) {
   });
   config.homepage.categoryImages = (Array.isArray(config.homepage.categoryImages) ? config.homepage.categoryImages : [])
     .slice(0, 50)
-    .map((item) => ({ categoryId: cleanText(item?.categoryId, 100), image: cleanText(item?.image, 2000) }))
+    .map((item) => ({ categoryId: cleanText(item?.categoryId, 100), image: safeImageUrl(item?.image) }))
     .filter((item) => item.categoryId && item.image);
   Object.keys(config.footer.socialLinks).forEach((key) => { config.footer.socialLinks[key] = safeExternalUrl(config.footer.socialLinks[key]); });
   Object.keys(config.footer.menus).forEach((key) => { config.footer.menus[key] = normalizeMenu(config.footer.menus[key]); });
@@ -274,6 +301,19 @@ function normalizeWebsiteConfig(input = {}) {
   config.layout.productsPerRow.desktop = bounded(config.layout.productsPerRow.desktop, 2, 6, 4);
   config.layout.productsPerRow.tablet = bounded(config.layout.productsPerRow.tablet, 2, 5, 3);
   config.layout.productsPerRow.mobile = bounded(config.layout.productsPerRow.mobile, 1, 3, 2);
+  config.mobile.sections = DEFAULT_WEBSITE_CONFIG.mobile.sections.map((fallback) => {
+    const source = (Array.isArray(input?.mobile?.sections) ? input.mobile.sections : []).find((section) => section?.id === fallback.id);
+    const section = mergeKnown(fallback, source);
+    return { ...section, id: fallback.id, order: bounded(section.order, 0, 1000, fallback.order), heading: cleanText(section.heading, 120) };
+  }).sort((a, b) => a.order - b.order);
+  for (const key of ['headerBackground', 'headerText', 'pageBackground']) config.mobile[key] = validColor(config.mobile[key], DEFAULT_WEBSITE_CONFIG.mobile[key]);
+  config.mobile.columns = Math.round(bounded(config.mobile.columns, 1, 2, 2));
+  config.mobile.gridGap = bounded(config.mobile.gridGap, 8, 24, 12);
+  config.mobile.cardRadius = bounded(config.mobile.cardRadius, 0, 24, 14);
+  config.mobile.imageRatio = oneOf(config.mobile.imageRatio, ['original', '1/1', '4/5', '3/4'], 'original');
+  config.tablet.columns = Math.round(bounded(config.tablet.columns, 2, 4, 3));
+  config.tablet.gridGap = bounded(config.tablet.gridGap, 8, 32, 16);
+  config.layout.productsPerRow.desktop = Math.round(config.layout.productsPerRow.desktop);
   config.theme.preset = oneOf(config.theme.preset, Object.keys(PRESET_OVERRIDES), 'default');
   return config;
 }
@@ -286,6 +326,11 @@ function normalizeIds(value) {
   return [...new Set((Array.isArray(value) ? value : []).map((item) => cleanText(item, 100)).filter(Boolean))].slice(0, 100);
 }
 
+function safeImageUrl(value) {
+  const url = cleanText(value, 2000);
+  return /^(https?:\/\/|\/(?!\/))[^\\\s]*$/i.test(url) ? url : '';
+}
+
 function safeExternalUrl(value) {
   const url = cleanText(value, 2000);
   return !url || /^https:\/\//i.test(url) ? url : '';
@@ -293,22 +338,46 @@ function safeExternalUrl(value) {
 
 function safeInternalPath(value) {
   const path = cleanText(value, 500);
-  return !path || /^\/(?!\/)/.test(path) ? path : '';
+  return !path || (/^\/(?!\/)/.test(path) && !/[\\\s]/.test(path)) ? path : '';
 }
 
 function normalizeMenu(value) {
   return (Array.isArray(value) ? value : []).slice(0, 20).map((item) => ({
     label: cleanText(item?.label, 80),
-    path: cleanText(item?.path, 500),
+    path: safeInternalPath(item?.path),
   })).filter((item) => item.label && /^\/(?!\/)/.test(item.path));
 }
 
 function buildPresetConfig(preset = 'default') {
-  return normalizeWebsiteConfig(mergeKnown(DEFAULT_WEBSITE_CONFIG, PRESET_OVERRIDES[preset] || {}));
+  const config = normalizeWebsiteConfig(mergeKnown(DEFAULT_WEBSITE_CONFIG, PRESET_OVERRIDES[preset] || {}));
+  if (preset !== 'default') {
+    config.theme.enhancedStyles = true;
+    config.header.background = config.colors.background;
+    config.header.textColor = config.colors.text;
+    config.header.announcementBackground = config.colors.primary;
+    config.buttons.background = config.colors.primary;
+    config.footer.background = config.colors.primary;
+  }
+  return config;
 }
 
 function getPresetList() {
-  return Object.keys(PRESET_OVERRIDES).map((id) => ({ id, name: PRESET_LABELS[id], config: buildPresetConfig(id) }));
+  const descriptions = {
+    default: 'The original Samira wine and ivory look.',
+    premium: 'Rich wine, warm gold and elevated cards.',
+    minimal: 'Clean monochrome with understated borders.',
+    festive: 'Celebratory ruby and golden accents.',
+    sale: 'A bold berry palette for your offer collections.',
+    wedding: 'Elegant serif headings with rounded buttons.',
+    sage: 'Calm green, warm neutrals and soft corners.',
+    rose: 'Blush tones and softly rounded cards.',
+    indigo: 'Classic blue with subtle gold accents.',
+  };
+  return Object.keys(PRESET_OVERRIDES).map((id) => {
+    const config = buildPresetConfig(id);
+    return { id, name: PRESET_LABELS[id], description: descriptions[id],
+      swatches: { primary: config.colors.primary, secondary: config.colors.secondary, accent: config.colors.accent, background: config.colors.background }, config };
+  });
 }
 
 module.exports = {

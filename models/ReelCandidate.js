@@ -11,6 +11,13 @@ const frameSchema = new mongoose.Schema({
   visibilityScore: Number,
   selected: { type: Boolean, default: false },
   rejectionReasons: [String],
+  recommended: Boolean,
+  recommendedCover: Boolean,
+  viewType: String,
+  qualityWarnings: [String],
+  width: Number,
+  height: Number,
+  selectionVersion: String,
 }, { _id: true });
 
 const reelCandidateSchema = new mongoose.Schema({
@@ -40,6 +47,14 @@ const reelCandidateSchema = new mongoose.Schema({
     altText: String,
     shortDescription: String,
     description: String,
+    price: Number,
+    originalPrice: Number,
+    sizes: [String],
+    sizeChart: mongoose.Schema.Types.Mixed,
+    attributeValues: mongoose.Schema.Types.Mixed,
+    fieldSources: mongoose.Schema.Types.Mixed,
+    multipleProducts: Boolean,
+    priceAmbiguous: Boolean,
     sizingMode: { type: String, enum: ['confirm', 'sized', 'free-size'], default: 'confirm' },
   },
   confidence: {

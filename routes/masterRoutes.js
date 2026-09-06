@@ -1,0 +1,16 @@
+const router = require('express').Router();
+const { protect } = require('../middleware/authMiddleware');
+const { masterOnly } = require('../config/masterOwner');
+const controller = require('../controllers/masterController');
+router.use(protect, masterOnly);
+router.get('/', controller.workspace);
+router.put('/configuration', controller.update);
+router.post('/store/setup', controller.update);
+router.post('/store/convert', controller.update);
+router.get('/export', controller.export);
+router.post('/import', controller.import);
+router.post('/presets', controller.createPreset);
+router.post('/clone', controller.createPreset);
+router.delete('/presets/:id', controller.deletePreset);
+router.post('/client-admins', controller.provisionAdmin);
+module.exports = router;

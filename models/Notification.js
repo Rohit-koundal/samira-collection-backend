@@ -13,12 +13,16 @@ const notificationSchema = new mongoose.Schema({
   status: { type: String, enum: NOTIFICATION_STATUSES, default: 'QUEUED' },
   reason: String,
   metadata: Object,
+  audience: { type: String, enum: ['CUSTOMER', 'ADMIN'], default: 'CUSTOMER' },
+  dedupeKey: String,
   readAt: Date,
 }, { timestamps: true });
 
 notificationSchema.plugin(storeIdPlugin);
 notificationSchema.index({ user: 1, createdAt: -1 });
 notificationSchema.index({ event: 1, createdAt: -1 });
+notificationSchema.index({ user: 1, channel: 1, readAt: 1, createdAt: -1 });
+notificationSchema.index({ dedupeKey: 1 }, { unique: true, sparse: true });
 
 module.exports = mongoose.model('Notification', notificationSchema);
 module.exports.NOTIFICATION_CHANNELS = NOTIFICATION_CHANNELS;

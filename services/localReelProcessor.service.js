@@ -6,10 +6,11 @@ const ffmpegPath = require('ffmpeg-static');
 const ffprobePath = require('ffprobe-static').path;
 const Category = require('../models/Category');
 const { downloadObject, getStorageProvider, uploadGeneratedImage } = require('./mediaStorage.service');
-const { analyzeCandidateFiles, isVisionEnabled } = require('./reelCandidateVision.service');
+const { analyzeCandidateFiles, isVisionEnabled, toContextCandidateAnalysis } = require('./reelCandidateVision.service');
+const { analyzeProductContext } = require('./productImportContext.service');
 const { updateActiveRunProgress } = require('./reelImportProgress.service');
+const { selectProductFrames } = require('./productFrameSelection.service');
 
-const MAX_FRAMES = 24;
 const MAX_PRODUCTS = 8;
 const FRAMES_PER_PRODUCT = 3;
 
@@ -76,30 +77,6 @@ async function probeVideo(filePath, { signal } = {}) {
   };
 }
 
-async function extractFrames(videoPath, outputDir, fps = 0.5, { signal } = {}) {
-  await fsp.mkdir(outputDir, { recursive: true });
-  const safeFps = Math.max(0.4, Math.min(1, Number(fps) || 0.5));
-  const pattern = path.join(outputDir, 'frame-%04d.jpg');
-  await run(ffmpegPath, [
-    '-hide_banner',
-    '-loglevel', 'error',
-    '-y',
-    '-i', videoPath,
-    '-vf', `fps=${safeFps},scale=720:-2`,
-    '-q:v', '4',
-    '-frames:v', String(MAX_FRAMES),
-    pattern,
-  ], { timeoutMs: 4 * 60 * 1000, signal });
-
-  const files = (await fsp.readdir(outputDir))
-    .filter((name) => /^frame-\d+\.jpg$/i.test(name))
-    .sort();
-  return files.map((name, index) => ({
-    path: path.join(outputDir, name),
-    timestampSeconds: index / safeFps,
-  }));
-}
-
 function chunkFrames(frames) {
   if (!frames.length) return [];
   const groups = [];
@@ -124,10 +101,14 @@ async function uploadFrame(frame, jobId, groupNumber) {
     storageKey: stored.storageKey,
     url: stored.url,
     timestampSeconds: Math.round(frame.timestampSeconds * 1000) / 1000,
-    qualityScore: 0.72,
-    sharpnessScore: 0.7,
-    exposureScore: 0.7,
-    visibilityScore: 0.7,
+    qualityScore: frame.qualityScore,
+    sharpnessScore: frame.sharpnessScore,
+    exposureScore: frame.exposureScore,
+    recommended: frame.recommended,
+    recommendedCover: frame.recommendedCover,
+    viewType: frame.viewType,
+    qualityWarnings: frame.qualityWarnings,
+    width: frame.width, height: frame.height, selectionVersion: frame.selectionVersion,
   };
 }
 
@@ -172,16 +153,21 @@ async function processReelLocally(job, { runId } = {}) {
     const metadata = await probeVideo(videoPath);
 
     await updateProgress(job, runId, 'extracting_frames', 45, 'Extracting frames', 'Finding clear product moments throughout the reel.');
-    const frames = await extractFrames(videoPath, framesDir, 0.5);
+    const selection = await selectProductFrames(videoPath, framesDir, { durationSeconds: metadata.durationSeconds, maxFrames: 24, recommendedCount: 24, chronological: true,
+      onProgress: (statistics) => updateProgress(job, runId, 'analyzing_frames', 55, 'Checking photo quality', `Checked ${statistics.analyzedFrames} moments; removed ${statistics.rejectedFrames} unclear and ${statistics.duplicateFrames} repeated frames.`) });
+    const frames = selection.frames;
     if (!frames.length) {
       throw Object.assign(new Error('No usable product frames were detected. Try a clearer, slower reel.'), { code: 'NO_USABLE_FRAMES' });
     }
 
     await updateProgress(job, runId, 'analyzing_frames', 58, 'Grouping products', `Found ${frames.length} possible photos. Grouping nearby product views.`);
-    const groups = chunkFrames(frames);
     const categories = isVisionEnabled()
       ? await Category.find({ isActive: { $ne: false } }).select('_id name').lean()
       : [];
+    const attributes = isVisionEnabled() ? (await require('./masterConfigurationService').readConfiguration()).structure.attributes : [];
+    const context = isVisionEnabled() ? await analyzeProductContext({ videoFiles: [{ path: videoPath }], filePaths: frames.slice(0, 4).map((frame) => frame.path), directory: workspace, categories, attributes }) : null;
+    const singleProduct = context?.contextStatus === 'completed' && !context.multipleProducts && Boolean(context.name);
+    const groups = singleProduct ? [frames.slice(0, 20)] : chunkFrames(frames);
     const smartDetails = [];
     for (let index = 0; index < groups.length; index += 1) {
       const groupNumber = index + 1;
@@ -196,9 +182,10 @@ async function processReelLocally(job, { runId } = {}) {
           ? `Identifying product ${groupNumber} of ${groups.length} from multiple reel views.`
           : 'Preparing product groups for admin confirmation.',
       );
-      smartDetails.push(await analyzeCandidateFiles({
+      smartDetails.push(singleProduct ? toContextCandidateAnalysis(context, groupNumber, categories) : await analyzeCandidateFiles({
         groupNumber,
         filePaths: groups[index].map((frame) => frame.path),
+        videoFiles: [{ path: videoPath, startSeconds: Math.max(0, groups[index][0].timestampSeconds - 2), durationSeconds: Math.min(metadata.durationSeconds, groups[index].at(-1).timestampSeconds - groups[index][0].timestampSeconds + 5) }], directory: workspace, attributes,
         categories,
         subcategories: [],
       }));
@@ -207,7 +194,7 @@ async function processReelLocally(job, { runId } = {}) {
     const candidates = [];
     for (let index = 0; index < groups.length; index += 1) {
       const groupNumber = index + 1;
-      const group = groups[index];
+      const group = [...groups[index]].sort((a, b) => Number(b.recommendedCover) - Number(a.recommendedCover) || Number(b.recommended) - Number(a.recommended) || b.qualityScore - a.qualityScore);
       const percentage = 75 + Math.round((index / Math.max(1, groups.length)) * 14);
       await updateProgress(
         job,
@@ -220,13 +207,13 @@ async function processReelLocally(job, { runId } = {}) {
       const persisted = [];
       for (const frame of group) {
         const uploaded = await uploadFrame(frame, String(job._id), groupNumber);
-        persisted.push({ ...uploaded, selected: persisted.length < 4 });
+        persisted.push({ ...uploaded, selected: frame.recommended !== false && persisted.length < (singleProduct ? 6 : 4) });
       }
       candidates.push({
         groupNumber,
         sourceRange: {
-          startSeconds: Math.round(group[0].timestampSeconds * 1000) / 1000,
-          endSeconds: Math.round(group[group.length - 1].timestampSeconds * 1000) / 1000,
+          startSeconds: Math.round(Math.min(...group.map((frame) => frame.timestampSeconds)) * 1000) / 1000,
+          endSeconds: Math.round(Math.max(...group.map((frame) => frame.timestampSeconds)) * 1000) / 1000,
         },
         frames: persisted,
         ...smartDetails[index],
@@ -240,16 +227,16 @@ async function processReelLocally(job, { runId } = {}) {
       status: 'review_required',
       metadata,
       statistics: {
-        extractedFrames: frames.length,
-        rejectedFrames: 0,
-        duplicateFrames: 0,
+        extractedFrames: selection.statistics.analyzedFrames,
+        rejectedFrames: selection.statistics.rejectedFrames,
+        duplicateFrames: selection.statistics.duplicateFrames,
         candidateFrames: frames.length,
         detectedProducts: candidates.length,
       },
       candidates,
     };
   } finally {
-    await fsp.rm(workspace, { recursive: true, force: true }).catch(() => null);
+    if (path.dirname(path.resolve(workspace)) === path.resolve(os.tmpdir()) && path.basename(workspace).startsWith('samira-reel-')) await fsp.rm(workspace, { recursive: true, force: true }).catch(() => null);
   }
 }
 

@@ -1,5 +1,6 @@
 const router = require('express').Router();
 const rateLimit = require('express-rate-limit');
+const { masterOnly } = require('../config/masterOwner');
 const store = require('../controllers/storeController');
 const { protect } = require('../middleware/authMiddleware');
 const { requireStoreMember, requireStorePermission, stripClientStoreId } = require('../middleware/storeMiddleware');
@@ -12,7 +13,7 @@ const createLimiter = rateLimit({
 });
 
 router.get('/', protect, store.listMine);
-router.post('/', protect, createLimiter, stripClientStoreId, store.createStore);
+router.post('/', protect, masterOnly, createLimiter, stripClientStoreId, store.createStore);
 router.get('/resolve', store.resolveHost);
 router.get('/me/current', protect, requireStoreMember, store.getMine);
 router.put('/me/current', protect, requireStoreMember, requireStorePermission('settings.write'), stripClientStoreId, store.updateMine);

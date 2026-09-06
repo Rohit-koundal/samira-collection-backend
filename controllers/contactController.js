@@ -41,6 +41,7 @@ exports.createMessage = asyncHandler(async (req, res) => {
   }).catch(() => null);
 
   notifyLater({
+    storeId: created.storeId,
     event: 'CONTACT_RECEIVED',
     title: 'New contact message',
     message: `${name}: ${subject}`,
@@ -52,6 +53,7 @@ exports.createMessage = asyncHandler(async (req, res) => {
 
 exports.adminList = asyncHandler(async (req, res) => {
   const extra = {};
+  if (req.query.id) extra._id = requireObjectId(req.query.id, 'message id');
   if (req.query.status) extra.status = requireEnum(req.query.status, CONTACT_STATUSES, 'status');
   const query = andFilter(extra, req.tenantFilter);
   if (wantsPagination(req.query)) {

@@ -29,6 +29,7 @@ app.post(
 );
 
 app.use(express.json({ limit: '30mb' }));
+app.use(require('./middleware/auditMiddleware').auditAdminRequests);
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 app.get('/uploads/:filename', sendImagePlaceholder);
 app.get('/placeholder.jpg', sendImagePlaceholder);
@@ -50,6 +51,8 @@ app.get('/health', async (req, res) => {
   });
 });
 
+app.use('/api/master', require('./routes/masterRoutes'));
+app.get('/api/catalog-configuration', require('./controllers/masterController').publicCatalog);
 app.use('/api/auth', require('./routes/authRoutes'));
 app.use('/api/admin/customers', protect, adminOnly, require('./routes/customerAdminRoutes'));
 app.use('/api/admin/users', protect, adminOnly, require('./routes/customerAdminRoutes'));
@@ -62,11 +65,13 @@ app.use('/api/admin/banners', protect, adminOnly, require('./routes/bannerRoutes
 app.use('/api/admin/reviews', protect, adminOnly, require('./routes/reviewRoutes'));
 app.use('/api/admin/returns', protect, adminOnly, require('./routes/returnRoutes'));
 app.use('/api/admin/settings', protect, adminOnly, require('./routes/settingsRoutes'));
+app.use('/api/admin/store-content', protect, adminOnly, require('./routes/storeContentRoutes'));
 app.use('/api/admin/customization', protect, adminOnly, require('./routes/websiteCustomizationRoutes'));
 app.use('/api/admin/uploads', require('./routes/uploadRoutes'));
 app.use('/api/admin/upload', require('./routes/uploadRoutes'));
 app.use('/api/admin/product-drafts', require('./routes/productDraftRoutes'));
 app.use('/api/admin/reel-imports', require('./modules/reel-product-import/reelImport.routes'));
+app.use('/api/admin/social-imports', require('./modules/social-product-import/socialImport.routes'));
 app.use('/api/admin/variant-groups', protect, adminOnly, require('./routes/variantGroupRoutes'));
 app.use('/api/admin/audit-logs', protect, adminOnly, require('./routes/auditAdminRoutes'));
 app.use('/api/stores', require('./routes/storeRoutes'));

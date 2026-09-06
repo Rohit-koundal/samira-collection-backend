@@ -11,7 +11,7 @@ const websiteThemeSchema = new mongoose.Schema({
   updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   publishedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   publishedAt: Date,
-}, { timestamps: true });
+}, { timestamps: true, optimisticConcurrency: true });
 
 websiteThemeSchema.index({ slug: 1 }, { unique: true });
 websiteThemeSchema.index({ isActive: 1 }, { unique: true, partialFilterExpression: { isActive: true } });

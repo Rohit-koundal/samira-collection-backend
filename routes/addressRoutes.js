@@ -22,6 +22,7 @@ router.put('/:addressId', async (req, res) => {
   if (!address) return res.status(404).json({ message: 'Address not found' });
   if (req.body.isDefault) req.user.addresses.forEach((item) => { item.isDefault = false; });
   Object.assign(address, normalizeAddress(req.body, req.body.isDefault));
+  if (!req.user.addresses.some((item) => item.isDefault)) req.user.addresses[0].isDefault = true;
   await req.user.save();
   res.json(req.user.addresses);
 });
@@ -47,13 +48,13 @@ function normalizeAddress(data, isDefault = false) {
   return {
     fullName: data.fullName,
     mobile: data.mobile || data.phone,
-    phone: data.phone || data.mobile,
+    phone: data.mobile || data.phone,
     alternateMobile: data.alternateMobile,
     pincode: data.pincode,
     state: data.state,
     city: data.city,
     houseNo: data.houseNo || data.houseNumber,
-    houseNumber: data.houseNumber || data.houseNo,
+    houseNumber: data.houseNo || data.houseNumber,
     area: data.area,
     landmark: data.landmark,
     addressType: data.addressType || 'Home',

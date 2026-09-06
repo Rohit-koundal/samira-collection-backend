@@ -1,3 +1,5 @@
+const { asyncHandler } = require('../middleware/validate');
+const { applyProductStructure } = require('../services/masterConfigurationService');
 const multer = require('multer');
 const slugify = require('../utils/slugify');
 const Product = require('../models/Product');
@@ -81,6 +83,10 @@ exports.updateDraft = async (req, res) => {
   const draft = await ProductDraft.findById(req.params.id);
   if (!draft) return res.status(404).json({ success: false, message: 'Draft not found' });
   const payload = normalizeDraftPayload(req.body);
+  // Imported provenance and publication state are controlled by the server.
+  if (['social-import', 'reel-import'].includes(draft.sourceType)) {
+    for (const key of ['sourceType', 'sourceSocialImportId', 'sourceJobId', 'sourceCandidateId', 'sourceUrl', 'sourcePlatform', 'createdBy', 'storeId', 'status', 'publishedProductId', 'importContext']) delete payload[key];
+  }
   if (payload.name && !payload.slug) payload.slug = uniqueDraftSlug(payload.name, draft._id);
   Object.assign(draft, payload);
   await draft.save();
@@ -93,36 +99,65 @@ exports.deleteDraft = async (req, res) => {
   res.json({ success: true, message: 'Draft deleted successfully' });
 };
 
-exports.publishSelected = async (req, res) => {
+exports.publishSelected = asyncHandler(async (req, res) => {
   const ids = Array.isArray(req.body.ids) ? req.body.ids.filter(Boolean) : [];
   if (!ids.length) return res.status(400).json({ success: false, message: 'Please select at least one draft' });
 
   const drafts = await ProductDraft.find({ _id: { $in: ids } }).populate('category');
-  const errors = drafts.map((draft) => validatePublishDraft(draft)).filter(Boolean);
+  const payloads = new Map();
+  for (const draft of drafts) if (!(draft.status === 'published' && draft.publishedProductId)) payloads.set(String(draft._id), await applyProductStructure(buildProductPayloadFromDraft(draft)));
+  const errors = drafts.filter((draft) => !(draft.status === 'published' && draft.publishedProductId)).map((draft) => validatePublishDraft(draft, payloads.get(String(draft._id)))).filter(Boolean);
   if (errors.length) {
     return res.status(400).json({ success: false, message: errors[0], data: { errors } });
   }
 
   const published = [];
   for (const draft of drafts) {
-    const productPayload = buildProductPayloadFromDraft(draft);
+    published.push(await publishPreparedDraft(draft, payloads.get(String(draft._id))));
+  }
+
+  res.json({ success: true, message: 'Selected drafts published successfully', data: { products: published.filter(Boolean) } });
+});
+
+async function publishPreparedDraft(draft, prepared) {
+    if (draft.status === 'published' && draft.publishedProductId) {
+      return Product.findById(draft.publishedProductId);
+    }
+    const productPayload = prepared || await prepareImportedDraft(draft);
+    if (draft.sourceType && !productPayload.sku) productPayload.sku = `IMPORT-${String(draft._id).slice(-10).toUpperCase()}`;
     productPayload.slug = await ensureUniqueProductSlug(productPayload.slug || productPayload.name, draft._id);
     if (productPayload.sku) {
       productPayload.sku = await ensureUniqueSku(productPayload.sku, draft._id);
     }
-    const product = await Product.create(normalizeProductPayload(productPayload));
+    let product;
+    if (['social-import', 'reel-import'].includes(draft.sourceType)) {
+      product = await Product.findOne({ sourceDraftId: draft._id });
+      if (!product) {
+        try { product = await Product.create({ ...normalizeProductPayload(productPayload), sourceDraftId: draft._id }); }
+        catch (error) { if (error.code !== 11000) throw error; product = await Product.findOne({ sourceDraftId: draft._id }); if (!product) throw error; }
+      }
+    } else product = await Product.create(normalizeProductPayload(productPayload));
     draft.status = 'published';
     draft.publishedProductId = product._id;
     await draft.save();
-    published.push(product);
-  }
+    return product;
+}
 
-  res.json({ success: true, message: 'Selected drafts published successfully', data: { products: published } });
-};
+async function prepareImportedDraft(draft) {
+  if (draft.category && !draft.category.name) await draft.populate('category');
+  const payload = await applyProductStructure(buildProductPayloadFromDraft(draft));
+  const message = validatePublishDraft(draft, payload);
+  if (message) throw Object.assign(new Error(message), { statusCode: 400 });
+  return payload;
+}
+
+exports.prepareImportedDraft = prepareImportedDraft;
+exports.publishPreparedDraft = publishPreparedDraft;
 
 function formatDraft(draft) {
   const data = typeof draft.toObject === 'function' ? draft.toObject() : { ...draft };
   data.id = String(data._id || data.id);
+  if (data.attributeValues instanceof Map) data.attributeValues = Object.fromEntries(data.attributeValues);
   return data;
 }
 
@@ -160,7 +195,9 @@ function buildProductPayloadFromDraft(draft) {
   const sellingPrice = Number(data.sellingPrice ?? data.price ?? 0);
   const originalPrice = Number(data.originalPrice ?? sellingPrice);
   return normalizeProductSizing({
+    ...(data.storeId ? { storeId: data.storeId } : {}),
     name: data.name,
+    attributeValues: data.attributeValues,
     slug: data.slug || slugify(data.name || 'product'),
     sku: data.sku,
     brand: data.brand || '',
@@ -199,7 +236,9 @@ function buildProductPayloadFromDraft(draft) {
   }, data.category?.name || '');
 }
 
-function validatePublishDraft(draft) {
+function validatePublishDraft(draft, prepared) {
+  if (['social-import', 'reel-import'].includes(draft.sourceType) && (!Number.isFinite(draft.stock) || !Number.isInteger(draft.stock) || draft.stock < 0)) return `Draft "${draft.name}" needs a whole-number stock quantity`;
+  if (draft.sourceType === 'social-import' && (!Number.isFinite(draft.sellingPrice ?? draft.price) || (draft.sellingPrice ?? draft.price) <= 0)) return `Draft "${draft.name}" needs a valid selling price`;
   if (!draft?.name || String(draft.name).trim().length < 3) return `Draft "${draft?.slug || draft?._id}" needs a product name`;
   if (!draft.category) return `Draft "${draft.name}" needs a category`;
   const sellingPrice = Number(draft.sellingPrice ?? draft.price);
@@ -208,7 +247,7 @@ function validatePublishDraft(draft) {
   if (Number(draft.stock) < 0) return `Draft "${draft.name}" has invalid stock`;
   if (!Array.isArray(draft.images) || !draft.images.length) return `Draft "${draft.name}" needs at least one image`;
   if (sellingPrice > originalPrice) return `Draft "${draft.name}" selling price cannot exceed original price`;
-  const sizingError = validateProductSizing(buildProductPayloadFromDraft(draft), draft.category?.name || '');
+  const sizingError = validateProductSizing(prepared || buildProductPayloadFromDraft(draft), draft.category?.name || '');
   if (sizingError) return `Draft "${draft.name}": ${sizingError}`;
   return '';
 }

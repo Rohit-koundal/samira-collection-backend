@@ -9,16 +9,16 @@ const inventoryService = require('../services/inventoryService');
 const { availableStock, hasManagedVariants, requireVariant, variantId } = require('../services/variantService');
 const { notifyLater } = require('../services/notificationService');
 const { recordEventLater } = require('../services/analyticsService');
+const { returnEligibility, returnOrderStatus } = require('../services/returnEligibilityService');
 
 const RETURN_STATUSES = require('../models/ReturnExchange').RETURN_STATUSES;
-const OPEN_STATUSES = RETURN_STATUSES.filter((status) => !['Rejected', 'Closed'].includes(status));
 const STOCK_RESTORE_STATUSES = ['Received', 'Exchanged', 'Refunded'];
 
 function findOrderItem(order, { productId, variantId, size, color, orderItemId }) {
   const items = order.orderItems || [];
   if (orderItemId) {
     const byId = items.id?.(orderItemId) || items.find((item) => String(item._id) === String(orderItemId));
-    if (byId) return byId;
+    return byId && String(byId.product) === String(productId) ? byId : null;
   }
   return items.find((item) => {
     if (String(item.product) !== String(productId)) return false;
@@ -27,12 +27,6 @@ function findOrderItem(order, { productId, variantId, size, color, orderItemId }
     if (color && item.color && String(item.color) !== String(color)) return false;
     return true;
   });
-}
-
-function deliveredAt(order) {
-  if (order.deliveredAt) return new Date(order.deliveredAt);
-  const entry = [...(order.statusTimeline || [])].reverse().find((item) => item.status === 'Delivered');
-  return entry?.date ? new Date(entry.date) : null;
 }
 
 function readPhotos(value) {
@@ -51,7 +45,7 @@ exports.createReturn = asyncHandler(async (req, res) => {
 
   const order = await Order.findOne({ _id: orderId, user: req.user._id });
   if (!order) throw notFound('Order not found');
-  if (order.orderStatus !== 'Delivered') {
+  if (!['Delivered', 'Return Requested', 'Exchange Requested', 'Returned', 'Refunded'].includes(order.orderStatus)) {
     throw new ApiError('VALIDATION_ERROR', 'Returns can only be requested once the order is delivered');
   }
 
@@ -65,20 +59,13 @@ exports.createReturn = asyncHandler(async (req, res) => {
   if (!orderedItem) throw new ApiError('VALIDATION_ERROR', 'That product is not part of this order');
 
   const settings = await getStoreSettings();
-  const windowDays = Math.max(0, Number(settings.returnWindowDays ?? 7));
-  const delivered = deliveredAt(order);
-  if (delivered && windowDays > 0 && Date.now() - delivered.getTime() > windowDays * 24 * 60 * 60 * 1000) {
-    throw new ApiError('RETURN_WINDOW_EXPIRED', `The ${windowDays}-day return window for this order has closed`);
+  const prior = await ReturnExchange.find({ order: orderId });
+  const eligibility = returnEligibility(order, prior, settings.returnWindowDays);
+  const itemEligibility = eligibility.items.find((item) => item.orderItemId === String(orderedItem._id));
+  if (eligibility.deadline && Date.now() > new Date(eligibility.deadline).getTime()) {
+    throw new ApiError('RETURN_WINDOW_EXPIRED', `The ${eligibility.windowDays}-day return window for this order has closed`);
   }
-
-  const prior = await ReturnExchange.find({
-    order: orderId,
-    product: productId,
-    variantId: orderedItem.variantId || '',
-    status: { $in: OPEN_STATUSES },
-  });
-  const alreadyQty = prior.reduce((sum, item) => sum + Math.max(1, Number(item.quantity || 1)), 0);
-  const remaining = Math.max(0, Number(orderedItem.quantity || 1) - alreadyQty);
+  const remaining = itemEligibility?.remainingQuantity || 0;
   if (quantity > remaining) {
     throw new ApiError(
       remaining ? 'VALIDATION_ERROR' : 'DUPLICATE_REQUEST',
@@ -87,6 +74,7 @@ exports.createReturn = asyncHandler(async (req, res) => {
         : 'A request for this item is already in progress',
     );
   }
+  if (!itemEligibility.canRequest) throw new ApiError('VALIDATION_ERROR', itemEligibility.reason);
 
   let exchangeVariantId = '';
   let exchangeSize = optionalString(req.body?.exchangeSize, 'exchangeSize', { max: 40 });
@@ -94,6 +82,7 @@ exports.createReturn = asyncHandler(async (req, res) => {
   if (type === 'exchange') {
     const product = await Product.findById(productId);
     if (!product) throw notFound('Product not found');
+    if (product.isActive === false || product.isArchived) throw new ApiError('OUT_OF_STOCK', 'This product is unavailable for exchange');
     if (hasManagedVariants(product)) {
       const variant = requireVariant(product, {
         variantId: req.body?.exchangeVariantId,
@@ -106,6 +95,12 @@ exports.createReturn = asyncHandler(async (req, res) => {
       exchangeVariantId = variantId(variant);
       exchangeSize = variant.size;
       exchangeColor = variant.color;
+    } else {
+      if (availableStock(product) < quantity) throw new ApiError('OUT_OF_STOCK', 'This product is not in stock for exchange');
+      exchangeSize = exchangeSize || orderedItem.size;
+      exchangeColor = exchangeColor || orderedItem.color;
+      if (product.sizes?.length && !product.sizes.includes(exchangeSize)) throw new ApiError('VARIANT_UNAVAILABLE', 'Choose an available exchange size');
+      if (product.colors?.length && !product.colors.includes(exchangeColor)) throw new ApiError('VARIANT_UNAVAILABLE', 'Choose an available exchange colour');
     }
   }
 
@@ -148,6 +143,7 @@ exports.createReturn = asyncHandler(async (req, res) => {
 
   notifyLater({
     userId: req.user._id,
+    storeId: order.storeId,
     event: 'RETURN_REQUESTED',
     title: type === 'exchange' ? 'Exchange requested' : 'Return requested',
     message: 'We have received your request and will update you after review.',
@@ -161,10 +157,22 @@ exports.myReturns = asyncHandler(async (req, res) => {
   res.json(await ReturnExchange.find({ user: req.user._id }).populate('product', 'name images sku').sort('-createdAt').limit(200));
 });
 
+exports.orderReturns = asyncHandler(async (req, res) => {
+  const orderId = requireObjectId(req.params.orderId, 'order id');
+  const order = await Order.findOne({ _id: orderId, user: req.user._id });
+  if (!order) throw notFound('Order not found');
+  const [requests, settings] = await Promise.all([
+    ReturnExchange.find({ order: orderId, user: req.user._id }).sort('-createdAt'), getStoreSettings(),
+  ]);
+  res.json({ requests, ...returnEligibility(order, requests, settings.returnWindowDays) });
+});
+
 exports.adminReturns = asyncHandler(async (req, res) => {
   const { andFilter } = require('../services/storeService');
   const { wantsPagination, buildPaginatedResponse } = require('../utils/validators');
-  const filter = andFilter({}, req.tenantFilter);
+  const extra = {};
+  if (req.query.id) extra._id = requireObjectId(req.query.id, 'return id');
+  const filter = andFilter(extra, req.tenantFilter);
   if (wantsPagination(req.query)) {
     const { page, limit, skip } = readPagination(req.query, { defaultLimit: 24, maxLimit: 100 });
     const [items, total] = await Promise.all([
@@ -223,23 +231,23 @@ exports.updateReturnStatus = asyncHandler(async (req, res) => {
     request.exchangeDeducted = true;
   }
 
+  if (['Refunded', 'Exchanged'].includes(request.status)) request.resolutionStatus = request.status;
   request.status = status;
+  if (['Refunded', 'Exchanged'].includes(status)) request.resolutionStatus = status;
   if (adminComment) request.adminComment = adminComment;
   await request.save();
 
-  if (['Refunded', 'Returned', 'Exchanged', 'Closed', 'Rejected'].includes(status)) {
-    const order = await Order.findById(request.order);
-    if (order && !['Cancelled', 'Refunded', 'Returned'].includes(order.orderStatus)) {
-      if (status === 'Refunded') order.orderStatus = 'Refunded';
-      if (status === 'Exchanged') order.orderStatus = 'Delivered';
-      if (status === 'Rejected') order.orderStatus = 'Delivered';
-      order.statusTimeline.push({ status: order.orderStatus, date: new Date(), note: `Return marked ${status}` });
-      await order.save();
-    }
+  const order = await Order.findById(request.order);
+  if (order && order.orderStatus !== 'Cancelled') {
+    const requests = await ReturnExchange.find({ order: request.order });
+    order.orderStatus = returnOrderStatus(order, requests);
+    order.statusTimeline.push({ status: order.orderStatus, date: new Date(), note: `${request.type === 'exchange' ? 'Exchange' : 'Return'} request marked ${status}` });
+    await order.save();
   }
 
   notifyLater({
     userId: request.user,
+    storeId: request.storeId,
     event: 'RETURN_UPDATED',
     title: `Return ${status.toLowerCase()}`,
     message: adminComment || `Your ${request.type} request is now ${status}.`,

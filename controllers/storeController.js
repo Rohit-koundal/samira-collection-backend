@@ -1,3 +1,4 @@
+const { assertMasterOwner } = require('../config/masterOwner');
 const Product = require('../models/Product');
 const Category = require('../models/Category');
 const Store = require('../models/Store');
@@ -43,6 +44,7 @@ exports.listMine = asyncHandler(async (req, res) => {
 });
 
 exports.createStore = asyncHandler(async (req, res) => {
+  assertMasterOwner(req.user);
   const name = requireString(req.body?.name, 'name', { min: 2, max: 80 });
   const slug = await uniqueSlug(req.body?.slug || name);
   const store = await Store.create({

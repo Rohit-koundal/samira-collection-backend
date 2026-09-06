@@ -1,3 +1,4 @@
+const { attachMasterSession } = require('../config/masterOwner');
 const jwt = require('jsonwebtoken');
 const mongoose = require('mongoose');
 const User = require('../models/User');
@@ -10,12 +11,14 @@ async function protect(req, res, next) {
 
   try {
     const decoded = jwt.verify(token, getJwtSecret());
+    if (decoded.tokenType && decoded.tokenType !== 'access') throw new Error('Access token required');
     if (canUseOfflineSession(decoded)) {
       req.user = buildOfflineUser(decoded);
       return next();
     }
-    req.user = await User.findById(decoded.id).select('-password');
+    req.user = await User.findById(decoded.id).select('-password +masterSessionVersion');
     if (!req.user || req.user.isBlocked) return res.status(401).json({ success: false, code: 'UNAUTHORIZED', message: 'Account unavailable' });
+    attachMasterSession(req.user, decoded);
     next();
   } catch (error) {
     res.status(401).json({ success: false, code: 'UNAUTHORIZED', message: 'Token failed' });
@@ -59,12 +62,13 @@ async function optionalProtect(req, res, next) {
 
   try {
     const decoded = jwt.verify(token, getJwtSecret());
+    if (decoded.tokenType && decoded.tokenType !== 'access') throw new Error('Access token required');
     if (canUseOfflineSession(decoded)) {
       req.user = buildOfflineUser(decoded);
       return next();
     }
-    const user = await User.findById(decoded.id).select('-password');
-    if (user && !user.isBlocked) req.user = user;
+    const user = await User.findById(decoded.id).select('-password +masterSessionVersion');
+    if (user && !user.isBlocked) req.user = attachMasterSession(user, decoded);
   } catch {
     // Invalid tokens are ignored here; the caller is still anonymous.
   }

@@ -31,6 +31,7 @@ const returnExchangeSchema = new mongoose.Schema({
   exchangeColor: String,
   adminComment: String,
   status: { type: String, enum: RETURN_STATUSES, default: 'Requested' },
+  resolutionStatus: { type: String, enum: ['Refunded', 'Exchanged'] },
   inventoryRestored: { type: Boolean, default: false },
   inventoryRestoredAt: Date,
   exchangeDeducted: { type: Boolean, default: false },

@@ -1,3 +1,5 @@
+const { asyncHandler } = require('../middleware/validate');
+const { applyProductStructure } = require('../services/masterConfigurationService');
 const Product = require('../models/Product');
 const Category = require('../models/Category');
 const slugify = require('../utils/slugify');
@@ -8,6 +10,8 @@ const { hasManagedVariants, normalizeVariantsPayload, totalVariantStock } = requ
 const { andFilter } = require('../services/storeService');
 const { assertStoreOwned } = require('../middleware/storeMiddleware');
 const { logAudit } = require('../services/auditService');
+const { auditSnapshot } = require('../utils/auditData');
+const PRODUCT_AUDIT_FIELDS = ['name', 'sku', 'slug', 'brand', 'category', 'subCategory', 'price', 'originalPrice', 'stock', 'lowStockAlert', 'isActive', 'isArchived', 'isFeatured', 'isBestSeller', 'isNewArrival', 'showOnHomepage', 'showInTrending', 'showInFestive', 'sizes', 'colors', 'fabric', 'occasion', 'description', 'shortDescription', 'variants', 'variantGroupId', 'sizingMode', 'sizeChartProfile', 'sizeChart', 'sizeFitNotes', 'attributeValues', 'specifications', 'highlights', 'careInstructions', 'returnPolicy', 'tags'];
 const { analyzeQuickAddImage, getQuickAddVisionStatus } = require('../services/quickAddVision.service');
 const { wantsPagination, readPagination, buildPaginatedResponse } = require('../utils/validators');
 const { normalizeProductSizing, validateProductSizing } = require('../services/productSizingService');
@@ -31,6 +35,7 @@ async function getCategoryName(categoryId) {
 
 function normalizeProductResponse(product, req) {
   const data = normalizeProductImages(product, req);
+  if (data.attributeValues instanceof Map) data.attributeValues = Object.fromEntries(data.attributeValues);
   return normalizeProductSizing(data, data.category?.name || '');
 }
 
@@ -84,6 +89,11 @@ exports.getProducts = async (req, res) => {
     rating: '-rating',
   };
   const sort = sortMap[req.query.sort] || '-createdAt';
+  // Admin designer choices need identifiers and labels, not every image,
+  // variant, size chart and description in the catalog.
+  if (String(req.baseUrl || '').startsWith('/api/admin/products') && req.query.customizationOptions === 'true') {
+    return res.json(await Product.find(query).select('_id name slug').sort(sort).lean());
+  }
   if (wantsPagination(req.query)) {
     const { page, limit, skip } = readPagination(req.query, { defaultLimit: 24, maxLimit: 100 });
     const [items, total] = await Promise.all([
@@ -138,8 +148,8 @@ exports.analyzeQuickAdd = async (req, res) => {
   }
 };
 
-exports.createProduct = async (req, res) => {
-  const basePayload = withStoreId({ ...req.body, images: sanitizeProductImages(req.body.images) }, req);
+exports.createProduct = asyncHandler(async (req, res) => {
+  const basePayload = await applyProductStructure(withStoreId({ ...req.body, images: sanitizeProductImages(req.body.images) }, req));
   const categoryName = await getCategoryName(basePayload.category);
   const payload = applyVariantPayload(normalizeProductSizing(basePayload, categoryName));
   const error = validateProduct(payload);
@@ -147,15 +157,15 @@ exports.createProduct = async (req, res) => {
   const sizingError = validateProductSizing(payload, categoryName);
   if (sizingError) return res.status(400).json({ message: sizingError });
   const product = await Product.create(normalizeProductPayload({ ...payload, slug: slugify(payload.slug || payload.name) }));
-  logAudit({ req, action: 'PRODUCT_CREATE', entityType: 'Product', entityId: product._id, after: { name: product.name, price: product.price, stock: product.stock } });
+  logAudit({ req, action: 'PRODUCT_CREATE', entityType: 'Product', entityId: product._id, storeId: product.storeId, after: auditSnapshot(product, PRODUCT_AUDIT_FIELDS) });
   res.status(201).json(normalizeProductResponse(product, req));
-};
+});
 
-exports.updateProduct = async (req, res) => {
+exports.updateProduct = asyncHandler(async (req, res) => {
   const existingProduct = await Product.findOne(catalogQuery(req, { _id: req.params.id }));
   if (!existingProduct) return res.status(404).json({ message: 'Product not found' });
   assertStoreOwned(existingProduct, req);
-  const basePayload = withStoreId({ ...req.body, images: sanitizeProductImages(req.body.images) }, req);
+  const basePayload = await applyProductStructure(withStoreId({ ...req.body, images: sanitizeProductImages(req.body.images) }, req), existingProduct);
   const categoryName = await getCategoryName(basePayload.category || existingProduct.category);
   const payload = applyVariantPayload(normalizeProductSizing(basePayload, categoryName));
   const error = validateProduct(payload, false);
@@ -179,28 +189,36 @@ exports.updateProduct = async (req, res) => {
     action: 'PRODUCT_UPDATE',
     entityType: 'Product',
     entityId: product._id,
-    before: { price: existingProduct.price, stock: existingProduct.stock },
-    after: { price: product.price, stock: product.stock },
+    storeId: product.storeId,
+    before: auditSnapshot(existingProduct, PRODUCT_AUDIT_FIELDS),
+    after: auditSnapshot(product, PRODUCT_AUDIT_FIELDS),
   });
   res.json(normalizeProductResponse(product, req));
-};
+});
 
 exports.deleteProduct = async (req, res) => {
   const product = await Product.findOne(catalogQuery(req, { _id: req.params.id }));
   if (!product) return res.status(404).json({ message: 'Product not found' });
   assertStoreOwned(product, req);
+  const before = auditSnapshot(product, ['isActive', 'isArchived']);
   product.isActive = false;
   product.isArchived = true;
   product.deletedAt = product.deletedAt || new Date();
   await product.save();
-  logAudit({ req, action: 'PRODUCT_ARCHIVE', entityType: 'Product', entityId: product._id });
+  logAudit({ req, action: 'PRODUCT_ARCHIVE', entityType: 'Product', entityId: product._id, storeId: product.storeId, before, after: auditSnapshot(product, ['isActive', 'isArchived']) });
   res.json({ message: 'Product archived', product });
 };
 
-exports.updateStatus = async (req, res) => {
-  const product = await Product.findByIdAndUpdate(req.params.id, { isActive: req.body.isActive }, { new: true });
+exports.updateStatus = asyncHandler(async (req, res) => {
+  if (typeof req.body?.isActive !== 'boolean') return res.status(400).json({ message: 'isActive must be true or false' });
+  const product = await Product.findOne(catalogQuery(req, { _id: req.params.id }));
+  if (!product) return res.status(404).json({ message: 'Product not found' });
+  const before = { isActive: product.isActive };
+  product.isActive = req.body.isActive;
+  await product.save();
+  logAudit({ req, action: 'PRODUCT_VISIBILITY_UPDATE', entityType: 'Product', entityId: product._id, storeId: product.storeId, before, after: { isActive: product.isActive } });
   res.json(product);
-};
+});
 
 exports.updateStock = async (req, res) => {
   if (Number(req.body.stock) < 0) return res.status(400).json({ message: 'Stock cannot be negative' });
@@ -215,7 +233,7 @@ exports.updateStock = async (req, res) => {
     variant.stock = Number(req.body.stock);
     product.stock = totalVariantStock(product);
     await product.save();
-    logAudit({ req, action: 'STOCK_UPDATE', entityType: 'Product', entityId: product._id, before: { stock: previousStock }, after: { stock: product.stock, variantId: req.body.variantId } });
+    logAudit({ req, action: 'STOCK_UPDATE', entityType: 'Product', entityId: product._id, storeId: product.storeId, before: { stock: previousStock }, after: { stock: product.stock, variantId: req.body.variantId } });
     return res.json(product);
   }
 
@@ -228,24 +246,26 @@ exports.updateStock = async (req, res) => {
 
   product.stock = Number(req.body.stock);
   await product.save();
-  logAudit({ req, action: 'STOCK_UPDATE', entityType: 'Product', entityId: product._id, before: { stock: previousStock }, after: { stock: product.stock } });
+  logAudit({ req, action: 'STOCK_UPDATE', entityType: 'Product', entityId: product._id, storeId: product.storeId, before: { stock: previousStock }, after: { stock: product.stock } });
   res.json(product);
 };
 
 exports.markOutOfStock = async (req, res) => {
   const product = await Product.findById(req.params.id);
   if (!product) return res.status(404).json({ message: 'Product not found' });
+  const before = auditSnapshot(product, ['stock', 'variants']);
   if (hasManagedVariants(product)) {
     product.variants.forEach((variant) => { variant.stock = 0; });
   }
   product.stock = 0;
   await product.save();
+  logAudit({ req, action: 'STOCK_UPDATE', entityType: 'Product', entityId: product._id, storeId: product.storeId, before, after: auditSnapshot(product, ['stock', 'variants']) });
   res.json(product);
 };
 
-exports.hideProduct = async (req, res) => {
-  const product = await Product.findByIdAndUpdate(req.params.id, { isActive: false }, { new: true });
-  res.json(product);
+exports.hideProduct = (req, res, next) => {
+  req.body = { ...req.body, isActive: false };
+  return exports.updateStatus(req, res, next);
 };
 
 function applyVariantPayload(data = {}) {

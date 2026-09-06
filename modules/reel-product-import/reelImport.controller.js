@@ -8,7 +8,7 @@ const ReelImport = require('../../models/ReelImport');
 const { getReelImportConfig } = require('../../config/reelImport');
 const { enqueueReelImport, removeQueuedReelImport } = require('../../queues/reelImport.queue');
 const { deleteObject, getStorageProvider, objectExists, uploadOriginalVideo } = require('../../services/mediaStorage.service');
-const { analyzeCandidateImages, isVisionEnabled } = require('../../services/reelCandidateVision.service');
+const { analyzeStoredCandidate, isVisionEnabled } = require('../../services/reelCandidateVision.service');
 const { inspectVideo } = require('../../services/videoMetadata.service');
 const { isLocalReelProcessorAvailable } = require('../../services/localReelProcessor.service');
 const {
@@ -257,8 +257,9 @@ async function getUploadCapabilities(req, res) {
       localProcessorAvailable,
       smartSuggestionsEnabled: isVisionEnabled(),
       smartSuggestionsMessage: isVisionEnabled()
-        ? 'Smart Reel Assistant can identify catalog details from candidate photos.'
-        : 'Smart Reel Assistant is unavailable, but reels can still be grouped and reviewed manually.',
+        ? 'Smart Reel Assistant reads product views, video text and speech. Stated product prices can be filled automatically.'
+        : 'The Gemini API key is missing. Add GEMINI_API_KEY in backend/.env, restart the backend, then check the connection here.',
+      smartSuggestionsReason: isVisionEnabled() ? '' : 'GEMINI_KEY_MISSING',
       progressTracking: true,
       processingTimeoutMinutes: config.timeoutMinutes,
       trackedStages: [
@@ -316,7 +317,8 @@ async function listCandidates(req, res) {
   const job = await findOwnedJob(req);
   if (!job) return res.status(404).json({ success: false, message: 'Reel import not found.' });
   const candidates = await ReelCandidate.find({ job: job._id }).sort({ groupNumber: 1 });
-  res.json({ success: true, data: candidates.map(formatCandidate) });
+  const drafts = await ProductDraft.find({ sourceCandidateId: { $in: candidates.map((item) => item._id) } }).lean();
+  res.json({ success: true, data: candidates.map((candidate) => ({ ...formatCandidate(candidate), savedDraft: drafts.find((draft) => String(draft.sourceCandidateId) === String(candidate._id)) })) });
 }
 
 async function retryImport(req, res, next) {
@@ -415,6 +417,7 @@ async function updateCandidate(req, res) {
   if (!context) return res.status(404).json({ success: false, message: 'Candidate not found.' });
   const { candidate } = context;
   const body = req.body || {};
+  if (candidate.productDraft && await ProductDraft.exists({ _id: candidate.productDraft, status: 'published' })) return res.status(409).json({ success: false, message: 'This product is published. Use Edit product to change its catalog details.' });
   if (body.status && ['suggested', 'approved', 'ignored'].includes(body.status)) candidate.status = body.status;
   if (body.suggestions && typeof body.suggestions === 'object') {
     candidate.suggestions = { ...candidate.suggestions?.toObject?.() || candidate.suggestions || {}, ...pickSuggestions(body.suggestions) };
@@ -428,6 +431,31 @@ async function updateCandidate(req, res) {
   }
   candidate.audit.push({ action: 'updated', by: req.user._id, details: { fields: Object.keys(body) } });
   await candidate.save();
+  if (candidate.productDraft) {
+    const draft = await ProductDraft.findById(candidate.productDraft);
+    if (draft && draft.status !== 'published') {
+      const overrides = pickAdminOverrides(body.adminOverrides || {});
+      for (const key of ['name', 'subCategory', 'fabric', 'description', 'sizeChart', 'sizeChartProfile', 'attributeValues']) if (overrides[key] !== undefined) draft[key] = overrides[key];
+      if (overrides.category !== undefined) draft.category = (await resolveCategory(overrides.category))?._id;
+      if (overrides.primaryColor !== undefined) draft.colors = listValue(overrides.primaryColor);
+      if (overrides.occasion !== undefined) draft.occasion = listValue(overrides.occasion).join(', ');
+      for (const key of ['sizes', 'tags']) if (overrides[key] !== undefined) draft[key] = listValue(overrides[key]);
+      if (overrides.sizingMode !== undefined) draft.sizingMode = normalizeSizingMode(overrides.sizingMode);
+      for (const key of ['price', 'originalPrice', 'stock']) if (overrides[key] !== undefined) draft[key] = overrides[key] === '' ? undefined : overrides[key];
+      if (overrides.price !== undefined) draft.sellingPrice = draft.price;
+      if (draft.originalPrice === 0 && overrides.originalPrice === undefined) draft.originalPrice = undefined;
+      if (Array.isArray(body.selectedFrameIds)) {
+        const frames = candidate.frames.filter((frame) => frame.selected).sort((a, b) => Number(String(b._id) === String(candidate.adminOverrides.primaryFrameId)) - Number(String(a._id) === String(candidate.adminOverrides.primaryFrameId)));
+        const addedPhotos = draft.images.filter((image) => !candidate.frames.some((frame) => frame.url === image.url)).map((image) => image.toObject());
+        const chosenFrame = frames.some((frame) => String(frame._id) === String(candidate.adminOverrides.primaryFrameId));
+        const addedCover = !chosenFrame && addedPhotos.find((image) => image.primary);
+        draft.images = [...frames.map((frame, index) => ({ url: frame.url, publicId: frame.storageKey, primary: !addedCover && index === 0, sourceFrame: { timestampSeconds: frame.timestampSeconds, qualityScore: frame.qualityScore, viewType: frame.viewType, width: frame.width, height: frame.height, selectionVersion: frame.selectionVersion } })), ...addedPhotos.map((image) => ({ ...image, primary: image === addedCover }))];
+        if (draft.images.length && !draft.images.some((image) => image.primary)) draft.images[0].primary = true;
+        draft.image = draft.images.find((image) => image.primary)?.url || '';
+      }
+      await draft.save();
+    }
+  }
   res.json({ success: true, data: formatCandidate(candidate) });
 }
 
@@ -436,20 +464,21 @@ async function analyzeCandidate(req, res, next) {
     if (!isVisionEnabled()) {
       throw serviceUnavailable(
         'SMART_SUGGESTIONS_UNAVAILABLE',
-        'Smart Reel Assistant is not configured on the server. You can still complete the product details manually.',
+        'The Gemini API key is missing. Add GEMINI_API_KEY in backend/.env and restart the backend to enable Smart Reel Assistant.',
       );
     }
     const context = await findOwnedCandidate(req);
     if (!context) return res.status(404).json({ success: false, message: 'Candidate not found.' });
-    const { candidate } = context;
-    if (['merged', 'draft_created'].includes(candidate.status)) {
+    const { candidate, job } = context;
+    const linkedDraft = candidate.productDraft ? await ProductDraft.findById(candidate.productDraft) : null;
+    if (candidate.status === 'merged' || linkedDraft?.status === 'published') {
       return res.status(409).json({ success: false, message: 'This candidate can no longer be analyzed.' });
     }
     if (Array.isArray(req.body?.selectedFrameIds)) {
       const selected = new Set(req.body.selectedFrameIds.map(String));
       candidate.frames.forEach((frame) => { frame.selected = selected.has(String(frame._id)); });
     }
-    const rankedFrames = [...candidate.frames].sort((left, right) => {
+    const rankedFrames = candidate.frames.filter((frame) => frame.selected).sort((left, right) => {
       if (Boolean(left.selected) !== Boolean(right.selected)) return left.selected ? -1 : 1;
       return Number(right.qualityScore || 0) - Number(left.qualityScore || 0);
     });
@@ -458,11 +487,14 @@ async function analyzeCandidate(req, res, next) {
       return res.status(400).json({ success: false, message: 'Select at least one saved candidate photo first.' });
     }
     const categories = await Category.find({ isActive: { $ne: false } }).select('_id name').lean();
-    const result = await analyzeCandidateImages({
+    const configuration = await require('../../services/masterConfigurationService').readConfiguration();
+    const sourceJob = await ReelImport.findById(job._id).select('+sourceVideo.url');
+    const result = await analyzeStoredCandidate({
       groupNumber: candidate.groupNumber,
-      imageUrls,
+      frames: rankedFrames,
+      sourceVideo: sourceJob.sourceVideo, sourceRange: candidate.sourceRange,
       categories,
-      subcategories: [],
+      attributes: configuration.structure.attributes,
     });
     candidate.suggestions = result.suggestions;
     candidate.confidence = result.confidence;
@@ -475,7 +507,7 @@ async function analyzeCandidate(req, res, next) {
     await candidate.save();
     res.json({
       success: true,
-      data: formatCandidate(candidate),
+      data: { ...formatCandidate(candidate), ...(linkedDraft ? { savedDraft: linkedDraft.toObject() } : {}) },
       warning: result.analysis.status === 'failed' ? result.analysis.error : undefined,
     });
   } catch (error) {
@@ -648,20 +680,24 @@ async function createDraftForCandidate(job, candidate, userId) {
   const suggestions = candidate.suggestions || {};
   const name = String(overrides.name || suggestions.name || `Reel product ${candidate.groupNumber}`).trim();
   const selectedFrames = candidate.frames.filter((frame) => frame.selected);
-  const frames = (selectedFrames.length ? selectedFrames : candidate.frames.slice(0, 4));
+  if (!selectedFrames.length) throw validationError('NO_SELECTED_FRAMES', 'Select at least one product photo before creating a draft.');
+  const primaryId = String(overrides.primaryFrameId || '');
+  const frames = [...selectedFrames].sort((a, b) => Number(String(b._id) === primaryId) - Number(String(a._id) === primaryId));
   const category = await resolveCategory(overrides.category || suggestions.category || suggestions.categoryName);
   const suggestedColors = listValue(suggestions.primaryColor).concat(listValue(suggestions.secondaryColors));
   const colors = listValue(overrides.colors || overrides.primaryColor || suggestedColors);
-  const sizes = listValue(overrides.sizes);
+  const sizes = listValue(overrides.sizes ?? suggestions.sizes);
   const tags = listValue(overrides.tags || suggestions.tags);
-  const price = numberOrZero(overrides.price || overrides.sellingPrice);
-  const originalPrice = numberOrZero(overrides.originalPrice || price);
+  const price = numberOrZero(overrides.price ?? overrides.sellingPrice ?? suggestions.price);
+  const statedMrp = overrides.originalPrice ?? suggestions.originalPrice;
+  const originalPrice = Number(statedMrp) > 0 ? Number(statedMrp) : undefined;
   const draft = await ProductDraft.create({
     name,
     slug: `${slugify(name || 'reel-product')}-${String(candidate._id).slice(-6)}`,
-    sku: '',
+    sku: `REEL-${String(candidate._id).slice(-10).toUpperCase()}`,
     image: frames[0]?.url || '',
-    images: frames.map((frame, index) => ({ url: frame.url, publicId: frame.storageKey, primary: index === 0 })),
+    images: frames.map((frame, index) => ({ url: frame.url, publicId: frame.storageKey, primary: index === 0,
+      sourceFrame: { timestampSeconds: frame.timestampSeconds, qualityScore: frame.qualityScore, viewType: frame.viewType || 'unknown', width: frame.width, height: frame.height, selectionVersion: frame.selectionVersion } })),
     videos: [],
     category: category?._id,
     subCategory: overrides.subCategory || suggestions.subcategory || '',
@@ -671,6 +707,10 @@ async function createDraftForCandidate(job, candidate, userId) {
     stock: numberOrZero(overrides.stock),
     sizes,
     sizingMode: normalizeSizingMode(overrides.sizingMode || suggestions.sizingMode),
+    sizeChart: overrides.sizeChart || suggestions.sizeChart,
+    sizeChartProfile: overrides.sizeChartProfile || 'auto',
+    attributeValues: overrides.attributeValues || suggestions.attributeValues,
+    importContext: { fieldSources: suggestions.fieldSources, source: candidate.analysis?.source },
     colors,
     fabric: String(overrides.fabric || suggestions.fabric || ''),
     occasion: listValue(overrides.occasion || suggestions.occasion).join(', '),
@@ -727,8 +767,8 @@ function dedupeFrames(frames) {
 }
 
 function selectBestFrames(frames) {
-  const sorted = [...frames].sort((a, b) => Number(b.qualityScore || 0) - Number(a.qualityScore || 0));
-  const selectedKeys = new Set(sorted.slice(0, 4).map((frame) => String(frame.storageKey || frame.url || frame._id)));
+  const sorted = [...frames].sort((a, b) => Number(b.recommendedCover) - Number(a.recommendedCover) || Number(b.qualityScore || 0) - Number(a.qualityScore || 0));
+  const selectedKeys = new Set(sorted.filter((frame) => frame.recommended !== false).slice(0, 4).map((frame) => String(frame.storageKey || frame.url || frame._id)));
   return sorted.map((frame) => ({
     ...(frame.toObject ? frame.toObject() : frame),
     selected: selectedKeys.has(String(frame.storageKey || frame.url || frame._id)),
@@ -750,7 +790,7 @@ function pickSuggestions(value) {
 function pickAdminOverrides(value) {
   return pick(value, [
     'name', 'category', 'subCategory', 'primaryColor', 'colors', 'pattern', 'fabric', 'occasion',
-    'tags', 'description', 'price', 'originalPrice', 'sellingPrice', 'sizes', 'sizingMode', 'stock',
+    'tags', 'description', 'price', 'originalPrice', 'sellingPrice', 'sizes', 'sizingMode', 'stock', 'primaryFrameId', 'sizeChart', 'sizeChartProfile', 'attributeValues',
   ]);
 }
 

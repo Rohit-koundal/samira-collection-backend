@@ -29,6 +29,8 @@ const userSchema = new mongoose.Schema({
   password: String,
   isPhoneVerified: { type: Boolean, default: false },
   role: { type: String, enum: ['customer', 'admin'], default: 'customer' },
+  systemRole: { type: String, enum: ['USER', 'MASTER_OWNER'], default: 'USER' },
+  masterSessionVersion: { type: String, select: false },
   availableModes: [{ type: String, enum: ['customer', 'admin', 'seller'] }],
   activeMode: { type: String, enum: ['customer', 'admin', 'seller'], default: 'customer' },
   addresses: [addressSchema],

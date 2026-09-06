@@ -11,6 +11,7 @@ function tokenPayload(user) {
     role: user.role,
     activeMode: user.activeMode,
     offlineSession: !!user.offlineSession,
+    ...(user.$locals?.masterAuthenticated && user.masterSessionVersion ? { masterSessionVersion: user.masterSessionVersion } : {}),
   };
 }
 

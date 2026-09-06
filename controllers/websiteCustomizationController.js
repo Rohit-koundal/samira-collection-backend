@@ -50,6 +50,22 @@ function requireThemeId(value) {
   return value;
 }
 
+function requireCurrentRevision(req, theme) {
+  if (req.body?.expectedUpdatedAt === undefined) return; // Compatibility with older admin clients.
+  const expected = new Date(req.body.expectedUpdatedAt).getTime();
+  if (!Number.isFinite(expected) || expected !== new Date(theme.updatedAt).getTime()) {
+    throw new ApiError('DUPLICATE_REQUEST', 'This theme was changed in another session. Export your draft, then reload the theme before saving or publishing.');
+  }
+}
+
+async function saveTheme(theme) {
+  try { return await theme.save(); }
+  catch (error) {
+    if (error.name === 'VersionError') throw new ApiError('DUPLICATE_REQUEST', 'This theme changed while saving. Export your draft and reload before retrying.');
+    throw error;
+  }
+}
+
 async function ensureDefaultTheme(userId) {
   const existing = await WebsiteTheme.findOne().sort({ isActive: -1, createdAt: 1 });
   if (existing) return existing;
@@ -136,7 +152,8 @@ exports.getWorkspace = asyncHandler(async (req, res) => {
   res.json({
     themes: themes.map(themeSummary),
     selectedTheme: selected,
-    presets: getPresetList().map(({ id, name }) => ({ id, name })),
+    configurationLocked: (await require('../services/masterConfigurationService').readConfiguration()).locked,
+    presets: getPresetList(),
   });
 });
 
@@ -193,16 +210,21 @@ exports.duplicateTheme = asyncHandler(async (req, res) => {
 exports.updateDraft = asyncHandler(async (req, res) => {
   const theme = await WebsiteTheme.findById(requireThemeId(req.params.id));
   if (!theme) throw notFound('Theme not found');
+  requireCurrentRevision(req, theme);
+  const incoming = req.body?.config ?? req.body?.draftConfig;
+  if (!incoming || typeof incoming !== 'object' || Array.isArray(incoming)) {
+    throw new ApiError('VALIDATION_ERROR', 'A theme configuration is required. The existing draft has not changed.');
+  }
   const before = clone(theme.draftConfig || {});
   if (req.body?.name !== undefined) {
     theme.name = cleanName(req.body.name, theme.name);
     theme.slug = await uniqueSlug(theme.name, theme._id);
   }
-  theme.draftConfig = normalizeWebsiteConfig(req.body?.config || req.body?.draftConfig || {});
+  theme.draftConfig = normalizeWebsiteConfig(incoming);
   theme.preset = theme.draftConfig.theme.preset;
   theme.updatedBy = req.user._id;
   theme.markModified('draftConfig');
-  await theme.save();
+  await saveTheme(theme);
   logAudit({ req, action: 'WEBSITE_THEME_DRAFT_SAVE', entityType: 'WebsiteTheme', entityId: theme._id, before, after: theme.draftConfig });
   res.json(theme);
 });
@@ -210,10 +232,11 @@ exports.updateDraft = asyncHandler(async (req, res) => {
 exports.discardDraft = asyncHandler(async (req, res) => {
   const theme = await WebsiteTheme.findById(requireThemeId(req.params.id));
   if (!theme) throw notFound('Theme not found');
+  requireCurrentRevision(req, theme);
   theme.draftConfig = normalizeWebsiteConfig(theme.publishedConfig || buildPresetConfig(theme.preset));
   theme.updatedBy = req.user._id;
   theme.markModified('draftConfig');
-  await theme.save();
+  await saveTheme(theme);
   logAudit({ req, action: 'WEBSITE_THEME_DRAFT_DISCARD', entityType: 'WebsiteTheme', entityId: theme._id });
   res.json(theme);
 });
@@ -221,19 +244,13 @@ exports.discardDraft = asyncHandler(async (req, res) => {
 exports.publishTheme = asyncHandler(async (req, res) => {
   const theme = await WebsiteTheme.findById(requireThemeId(req.params.id));
   if (!theme) throw notFound('Theme not found');
+  requireCurrentRevision(req, theme);
   const config = normalizeWebsiteConfig(theme.draftConfig);
   const latest = await WebsiteThemeVersion.findOne({ theme: theme._id }).sort('-version').lean();
   const version = Number(latest?.version || 0) + 1;
-  await WebsiteTheme.updateMany({ _id: { $ne: theme._id }, isActive: true }, { $set: { isActive: false } });
-  theme.publishedConfig = config;
-  theme.draftConfig = config;
-  theme.isActive = true;
-  theme.publishedAt = new Date();
-  theme.publishedBy = req.user._id;
-  theme.updatedBy = req.user._id;
-  theme.markModified('publishedConfig');
-  theme.markModified('draftConfig');
-  await theme.save();
+  // Reserve the history version before altering the live store. A failed
+  // history insert (including a simultaneous publish) must not deactivate it.
+  const previousActive = await WebsiteTheme.findOne({ isActive: true }).lean();
   const history = await WebsiteThemeVersion.create({
     theme: theme._id,
     version,
@@ -241,6 +258,27 @@ exports.publishTheme = asyncHandler(async (req, res) => {
     note: String(req.body?.note || `Published ${theme.name}`).slice(0, 240),
     publishedBy: req.user._id,
   });
+  try {
+    await WebsiteTheme.updateMany({ _id: { $ne: theme._id }, isActive: true }, { $set: { isActive: false } });
+    theme.publishedConfig = config;
+    theme.draftConfig = config;
+    theme.isActive = true;
+    theme.publishedAt = new Date();
+    theme.publishedBy = req.user._id;
+    theme.updatedBy = req.user._id;
+    theme.markModified('publishedConfig');
+    theme.markModified('draftConfig');
+    await saveTheme(theme);
+  } catch (error) {
+    await WebsiteThemeVersion.deleteOne({ _id: history._id }).catch(() => null);
+    // Standalone MongoDB has no multi-document transactions. Restore the
+    // previous selection only if another successful publish has not won.
+    if (previousActive && !await WebsiteTheme.exists({ isActive: true })) {
+      await WebsiteTheme.updateOne({ _id: previousActive._id }, { $set: { isActive: true } }).catch(() => null);
+    }
+    invalidateActiveCache();
+    throw error;
+  }
   invalidateActiveCache();
   logAudit({ req, action: 'WEBSITE_THEME_PUBLISH', entityType: 'WebsiteTheme', entityId: theme._id, after: { version, name: theme.name } });
   res.json({ theme, version: history });
@@ -249,11 +287,21 @@ exports.publishTheme = asyncHandler(async (req, res) => {
 exports.activateTheme = asyncHandler(async (req, res) => {
   const theme = await WebsiteTheme.findById(requireThemeId(req.params.id));
   if (!theme) throw notFound('Theme not found');
+  requireCurrentRevision(req, theme);
   if (!theme.publishedConfig) throw new ApiError('VALIDATION_ERROR', 'Publish this theme before activating it');
-  await WebsiteTheme.updateMany({ _id: { $ne: theme._id }, isActive: true }, { $set: { isActive: false } });
-  theme.isActive = true;
-  theme.updatedBy = req.user._id;
-  await theme.save();
+  const previousActive = await WebsiteTheme.findOne({ isActive: true }).lean();
+  try {
+    await WebsiteTheme.updateMany({ _id: { $ne: theme._id }, isActive: true }, { $set: { isActive: false } });
+    theme.isActive = true;
+    theme.updatedBy = req.user._id;
+    await saveTheme(theme);
+  } catch (error) {
+    if (previousActive && !await WebsiteTheme.exists({ isActive: true })) {
+      await WebsiteTheme.updateOne({ _id: previousActive._id }, { $set: { isActive: true } }).catch(() => null);
+    }
+    invalidateActiveCache();
+    throw error;
+  }
   invalidateActiveCache();
   logAudit({ req, action: 'WEBSITE_THEME_ACTIVATE', entityType: 'WebsiteTheme', entityId: theme._id });
   res.json(theme);
@@ -263,10 +311,9 @@ exports.deleteTheme = asyncHandler(async (req, res) => {
   const theme = await WebsiteTheme.findById(requireThemeId(req.params.id));
   if (!theme) throw notFound('Theme not found');
   if (theme.isActive) throw new ApiError('DUPLICATE_REQUEST', 'The active theme cannot be deleted');
-  await Promise.all([
-    WebsiteTheme.deleteOne({ _id: theme._id }),
-    WebsiteThemeVersion.deleteMany({ theme: theme._id }),
-  ]);
+  const deleted = await WebsiteTheme.deleteOne({ _id: theme._id, isActive: false, __v: theme.__v });
+  if (!deleted.deletedCount) throw new ApiError('DUPLICATE_REQUEST', 'This theme changed or became active. Reload before deleting.');
+  await WebsiteThemeVersion.deleteMany({ theme: theme._id });
   logAudit({ req, action: 'WEBSITE_THEME_DELETE', entityType: 'WebsiteTheme', entityId: theme._id, before: themeSummary(theme) });
   res.json({ success: true, message: 'Theme deleted' });
 });
@@ -274,19 +321,24 @@ exports.deleteTheme = asyncHandler(async (req, res) => {
 exports.getHistory = asyncHandler(async (req, res) => {
   const themeId = requireThemeId(req.params.id);
   if (!await WebsiteTheme.exists({ _id: themeId })) throw notFound('Theme not found');
-  res.json(await WebsiteThemeVersion.find({ theme: themeId }).populate('publishedBy', 'name email phone').sort('-version').limit(100));
+  const versions = WebsiteThemeVersion.find({ theme: themeId }).populate('publishedBy', 'name email phone').sort('-version').limit(100);
+  // Restoring still reads the immutable snapshot on the server. The designer
+  // only needs metadata, not 100 complete theme configurations in memory.
+  if (req.query?.summary === 'true') versions.select('-config');
+  res.json(await versions.lean());
 });
 
 exports.restoreVersion = asyncHandler(async (req, res) => {
   const theme = await WebsiteTheme.findById(requireThemeId(req.params.id));
   if (!theme) throw notFound('Theme not found');
+  requireCurrentRevision(req, theme);
   const versionId = requireThemeId(req.params.versionId);
   const version = await WebsiteThemeVersion.findOne({ _id: versionId, theme: theme._id });
   if (!version) throw notFound('Theme version not found');
   theme.draftConfig = normalizeWebsiteConfig(version.config);
   theme.updatedBy = req.user._id;
   theme.markModified('draftConfig');
-  await theme.save();
+  await saveTheme(theme);
   logAudit({ req, action: 'WEBSITE_THEME_VERSION_RESTORE', entityType: 'WebsiteTheme', entityId: theme._id, after: { restoredVersion: version.version } });
   res.json({ theme, restoredVersion: version.version, message: 'Version restored to draft. Review and publish it when ready.' });
 });

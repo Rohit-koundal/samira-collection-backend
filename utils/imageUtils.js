@@ -137,6 +137,7 @@ function normalizeProductPayload(data = {}) {
       url: image.url,
       publicId: image.publicId,
       primary: Boolean(image.primary),
+      ...(image.sourceFrame ? { sourceFrame: image.sourceFrame } : {}),
     }));
     payload.primaryImage = getPrimaryImageUrl(payload.images);
   }

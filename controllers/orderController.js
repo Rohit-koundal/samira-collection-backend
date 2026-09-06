@@ -45,7 +45,7 @@ function assertShippingAddress(address) {
 function isOwnerOrAdmin(order, user, req) {
   const ownerId = String(order.user?._id || order.user || '');
   if (user.role === 'admin' || ownerId === String(user._id)) return true;
-  if (req?.store?._id && order.storeId && String(order.storeId) === String(req.store._id)) return true;
+  if (req?.storeMember && req?.store?._id && order.storeId && String(order.storeId) === String(req.store._id)) return true;
   return false;
 }
 
@@ -160,6 +160,8 @@ exports.createOrder = asyncHandler(async (req, res) => {
     return created;
   });
 
+  logAudit({ req, action: 'ORDER_CREATE', entityType: 'Order', entityId: order._id, storeId: order.storeId, after: { orderStatus: order.orderStatus, paymentStatus: order.paymentStatus, paymentMethod: order.paymentMethod, finalAmount: order.finalAmount } });
+
   recordEventLater({
     name: 'PURCHASE',
     storeId: order.storeId,
@@ -172,6 +174,7 @@ exports.createOrder = asyncHandler(async (req, res) => {
 
   notifyLater({
     userId: req.user._id,
+    storeId: order.storeId,
     event: 'ORDER_PLACED',
     title: 'Order placed',
     message: `Your order ${order.invoiceNumber || ''} has been placed.`,
@@ -187,8 +190,25 @@ exports.createCodOrder = (req, res, next) => {
 };
 
 exports.myOrders = asyncHandler(async (req, res) => {
-  const orders = await Order.find({ user: req.user._id }).populate('shipment').sort('-createdAt').limit(200);
+  const filter = { user: req.user._id };
+  if (req.query.status) filter.orderStatus = requireEnum(req.query.status, ORDER_STATUSES, 'status');
+  const search = optionalString(req.query.search, 'search', { max: 100 });
+  if (search) {
+    const escaped = search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    filter.$or = [{ 'orderItems.name': { $regex: escaped, $options: 'i' } }, { invoiceNumber: { $regex: escaped, $options: 'i' } }];
+    if (/^[a-f\d]{24}$/i.test(search)) filter.$or.push({ _id: search });
+    else if (/^[a-f\d]{6,23}$/i.test(search)) filter.$or.push({ $expr: { $regexMatch: { input: { $toString: '$_id' }, regex: `${escaped}$`, options: 'i' } } });
+  }
+  if (req.query.days) {
+    const days = Number(req.query.days);
+    if (![30, 180, 365].includes(days)) throw new ApiError('VALIDATION_ERROR', 'Invalid order date filter');
+    filter.createdAt = { $gte: new Date(Date.now() - days * 86400000) };
+  }
+  const paginated = wantsPagination(req.query);
+  const { page, limit, skip } = readPagination(req.query, { defaultLimit: paginated ? 12 : 200, maxLimit: 200 });
+  const orders = await Order.find(filter).populate('shipment').sort('-createdAt').skip(skip).limit(limit);
   await Promise.all(orders.map((order) => syncPaidOnlineOrderStatus(order)));
+  if (paginated) return res.json(buildPaginatedResponse(orders, { page, limit, total: await Order.countDocuments(filter) }));
   res.json(orders);
 });
 
@@ -221,19 +241,22 @@ exports.updateOrderStatus = asyncHandler(async (req, res) => {
   const orderStatus = requireEnum(req.body?.orderStatus, ORDER_STATUSES, 'orderStatus');
   const note = optionalString(req.body?.note, 'note', { max: 300 });
 
-  const order = await Order.findById(req.params.id);
+  const order = await Order.findOne(andFilter({ _id: req.params.id }, req.tenantFilter));
   if (!order) throw notFound('Order not found');
 
   // Cancelling from the admin screen must follow the same restore rules as a
   // customer cancellation, otherwise stock silently disappears.
   if (orderStatus === 'Cancelled') {
-    return res.json(await cancelOrderInternal(order, { actor: req.user, note: note || 'Cancelled by admin', force: true }));
+    return res.json(await cancelOrderInternal(order, { req, actor: req.user, note: note || 'Cancelled by admin', force: true }));
   }
 
+  const before = { orderStatus: order.orderStatus };
   order.orderStatus = orderStatus;
   order.statusTimeline.push({ status: orderStatus, date: new Date(), note });
   if (orderStatus === 'Delivered') order.deliveredAt = order.deliveredAt || new Date();
   await order.save();
+
+  logAudit({ req, action: 'ORDER_STATUS_UPDATE', entityType: 'Order', entityId: order._id, storeId: order.storeId, before, after: { orderStatus: order.orderStatus } });
 
   if (toShipmentStatus(orderStatus)) {
     await upsertShipmentForOrder(order, { status: toShipmentStatus(orderStatus), note: note || `Order marked ${orderStatus}` }).catch(() => null);
@@ -242,6 +265,7 @@ exports.updateOrderStatus = asyncHandler(async (req, res) => {
   if (orderStatus === 'Delivered') {
     notifyLater({
       userId: order.user,
+      storeId: order.storeId,
       event: 'ORDER_DELIVERED',
       title: 'Order delivered',
       message: 'Your order has been delivered. You can now rate products or request a return.',
@@ -257,12 +281,15 @@ exports.updatePaymentStatus = asyncHandler(async (req, res) => {
   const paymentStatus = requireEnum(req.body?.paymentStatus, PAYMENT_STATUSES, 'paymentStatus');
   const paymentState = { Pending: 'PENDING', Paid: 'PAID', Failed: 'FAILED', Refunded: 'REFUNDED' }[paymentStatus];
 
-  const order = await Order.findByIdAndUpdate(
-    req.params.id,
+  const previous = await Order.findOneAndUpdate(
+    andFilter({ _id: req.params.id }, req.tenantFilter),
     { paymentStatus, paymentState },
-    { new: true },
+    { new: false },
   );
-  if (!order) throw notFound('Order not found');
+  if (!previous) throw notFound('Order not found');
+  logAudit({ req, action: 'PAYMENT_STATUS_UPDATE', entityType: 'Order', entityId: previous._id, storeId: previous.storeId, before: { paymentStatus: previous.paymentStatus, paymentState: previous.paymentState }, after: { paymentStatus, paymentState } });
+  // Preserve the existing response shape, using the acknowledged update values.
+  const order = { ...previous.toObject(), paymentStatus, paymentState };
   res.json(order);
 });
 
@@ -271,25 +298,26 @@ exports.updatePaymentStatus = asyncHandler(async (req, res) => {
  */
 exports.deleteOrder = asyncHandler(async (req, res) => {
   requireObjectId(req.params.id, 'order id');
-  const order = await Order.findById(req.params.id);
+  const order = await Order.findOne(andFilter({ _id: req.params.id }, req.tenantFilter));
   if (!order) throw notFound('Order not found');
 
   if (order.orderStatus === 'Cancelled') {
     return res.json({ success: true, message: 'Order is already cancelled', order });
   }
 
-  const cancelled = await cancelOrderInternal(order, { actor: req.user, note: 'Cancelled by admin', force: true });
+  const cancelled = await cancelOrderInternal(order, { req, actor: req.user, note: 'Cancelled by admin', force: true });
   res.json({ success: true, message: 'Order cancelled', order: cancelled });
 });
 
 exports.cancelOrder = asyncHandler(async (req, res) => {
   requireObjectId(req.params.id, 'order id');
-  const order = await Order.findById(req.params.id);
+  const order = await Order.findOne(andFilter({ _id: req.params.id }, req.tenantFilter));
   if (!order) throw notFound('Order not found');
   if (!isOwnerOrAdmin(order, req.user, req)) throw forbidden('Not allowed');
 
-  const note = req.user.role === 'admin' ? 'Cancelled by admin' : 'Cancelled by customer';
-  res.json(await cancelOrderInternal(order, { actor: req.user, note }));
+  const reason = optionalString(req.body?.reason, 'reason', { max: 300 });
+  const note = `${req.user.role === 'admin' ? 'Cancelled by admin' : 'Cancelled by customer'}${reason ? `: ${reason}` : ''}`;
+  res.json(await cancelOrderInternal(order, { req, actor: req.user, note }));
 });
 
 /**
@@ -303,7 +331,7 @@ exports.cancelOrder = asyncHandler(async (req, res) => {
  * either mode: the goods are with the customer, which is a return, not a
  * cancellation, and restocking there would invent inventory.
  */
-async function cancelOrderInternal(order, { actor, note, force = false }) {
+async function cancelOrderInternal(order, { req, actor, note, force = false, source }) {
   if (order.orderStatus === 'Cancelled') return order;
 
   const allowed = force
@@ -344,10 +372,15 @@ async function cancelOrderInternal(order, { actor, note, force = false }) {
       { new: true, session },
     );
 
-    return updated || Order.findById(order._id).session(session || null);
-  }).then((cancelled) => {
-    logAudit({ req: { user: actor }, action: 'ORDER_CANCEL', entityType: 'Order', entityId: order._id, after: { orderStatus: 'Cancelled' }, storeId: order.storeId });
-    return cancelled;
+    return { changed: Boolean(updated), order: updated || await Order.findById(order._id).session(session || null) };
+  }).then((result) => {
+    if (result.changed) logAudit({ req: req || { user: actor }, source, action: 'ORDER_CANCEL', entityType: 'Order', entityId: order._id, before: { orderStatus: order.orderStatus }, after: { orderStatus: 'Cancelled' }, storeId: order.storeId });
+    if (result.changed) notifyLater({
+      userId: result.order.user, storeId: result.order.storeId, event: 'ORDER_CANCELLED',
+      title: 'Order cancelled', message: 'Your order has been cancelled. Check order details for payment and refund updates.',
+      metadata: { orderId: String(result.order._id) },
+    });
+    return result.order;
   });
 }
 
@@ -361,7 +394,14 @@ exports.receipt = asyncHandler(async (req, res) => {
 });
 
 async function buildReceipt(order) {
-  const settings = await Settings.findOne().lean();
+  let settings = order.invoiceSeller?.storeName || order.invoiceSeller?.legalBusinessName
+    ? order.invoiceSeller
+    : await Settings.findOne(order.storeId ? { storeId: order.storeId } : { storeId: null }).lean();
+  if (!settings && order.storeId) {
+    const store = await require('../models/Store').findById(order.storeId).select('name legalName supportEmail supportPhone whatsappNumber isDefault').lean();
+    if (store?.isDefault) settings = await Settings.findOne({ storeId: null }).lean();
+    if (!settings && store) settings = { storeName: store.name, legalBusinessName: store.legalName, contactEmail: store.supportEmail, contactPhone: store.supportPhone, whatsappNumber: store.whatsappNumber };
+  }
   return {
     orderId: order._id,
     orderDate: order.createdAt,
@@ -379,6 +419,10 @@ async function buildReceipt(order) {
     couponDiscount: order.couponDiscount || order.coupon?.discountAmount || 0,
     deliveryCharge: order.deliveryCharge || 0,
     codCharge: order.codCharge || 0,
+    platformFee: order.platformFee || 0,
+    prepaidDiscount: order.prepaidDiscount || 0,
+    taxAmount: order.taxAmount || 0,
+    taxRate: order.taxRate || 0,
     finalAmount: order.finalAmount,
     coupon: order.coupon,
     razorpayOrderId: order.razorpayOrderId,
@@ -406,7 +450,7 @@ async function buildReceipt(order) {
 
 exports.updateShipment = asyncHandler(async (req, res) => {
   requireObjectId(req.params.id, 'order id');
-  const order = await Order.findById(req.params.id);
+  const order = await Order.findOne(andFilter({ _id: req.params.id }, req.tenantFilter));
   if (!order) throw notFound('Order not found');
   const shipment = await upsertShipmentForOrder(order, {
     courierName: optionalString(req.body?.courierName, 'courierName', { max: 80 }) || undefined,
@@ -416,6 +460,7 @@ exports.updateShipment = asyncHandler(async (req, res) => {
     status: req.body?.status,
     note: optionalString(req.body?.note, 'note', { max: 300 }) || 'Shipment updated by admin',
   });
+  logAudit({ req, action: 'SHIPMENT_UPDATE', entityType: 'Order', entityId: order._id, storeId: order.storeId, after: { status: shipment.status, courierName: shipment.courierName, trackingNumber: shipment.trackingNumber } });
   res.json(shipment);
 });
 

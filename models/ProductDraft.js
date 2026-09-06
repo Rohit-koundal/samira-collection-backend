@@ -5,6 +5,7 @@ const imageSchema = new mongoose.Schema({
   url: String,
   publicId: String,
   primary: { type: Boolean, default: false },
+  sourceFrame: { type: new mongoose.Schema({ timestampSeconds: Number, qualityScore: Number, viewType: String, width: Number, height: Number, selectionVersion: String }, { _id: false }), default: undefined },
 }, { _id: false });
 
 const videoSchema = new mongoose.Schema({
@@ -53,12 +54,18 @@ const productDraftSchema = new mongoose.Schema({
   fabric: String,
   occasion: String,
   tags: [String],
+  attributeValues: { type: Map, of: String, default: {} },
   description: String,
+  shortDescription: String,
   highlights: [String],
   status: { type: String, enum: ['draft', 'published'], default: 'draft' },
   createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   publishedProductId: { type: mongoose.Schema.Types.ObjectId, ref: 'Product' },
-  sourceType: { type: String, enum: ['reel-import'], default: undefined },
+  sourceType: { type: String, enum: ['reel-import', 'social-import'], default: undefined },
+  sourceSocialImportId: { type: mongoose.Schema.Types.ObjectId, ref: 'SocialProductImport', unique: true, sparse: true, default: undefined },
+  sourceUrl: String,
+  sourcePlatform: String,
+  importContext: { type: mongoose.Schema.Types.Mixed, default: undefined },
   sourceJobId: { type: mongoose.Schema.Types.ObjectId, ref: 'ReelImport', default: undefined },
   sourceCandidateId: { type: mongoose.Schema.Types.ObjectId, ref: 'ReelCandidate', unique: true, sparse: true, default: undefined },
   confidence: { type: Number, min: 0, max: 1 },

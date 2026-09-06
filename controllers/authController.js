@@ -1,3 +1,5 @@
+const crypto = require('crypto');
+const { isOwnerPhone, isOwnerAccount, attachMasterSession } = require('../config/masterOwner');
 const User = require('../models/User');
 const mongoose = require('mongoose');
 const jwt = require('jsonwebtoken');
@@ -22,7 +24,7 @@ exports.adminLogin = (_req, res) => res.status(410).json({
   message: 'Admin access uses mobile number and OTP only.',
 });
 
-exports.profile = async (req, res) => res.json(req.user);
+exports.profile = async (req, res) => res.json(sanitize(req.user));
 
 exports.updateProfile = async (req, res) => {
   try {
@@ -48,6 +50,7 @@ exports.updateProfile = async (req, res) => {
     const previousPhone = String(req.user.phone || '');
     const previousEmail = String(req.user.email || '').toLowerCase();
     const phoneChanged = nextPhone && nextPhone !== previousPhone;
+    if (phoneChanged && (isOwnerPhone(nextPhone) || isOwnerPhone(previousPhone))) return res.status(403).json({ message: 'The owner identity cannot be reassigned from profile settings.' });
     const emailChanged = nextEmail !== previousEmail;
     const verifiedPhone = phoneChanged ? verifyProfileChangeToken(req.body.phoneVerificationToken, {
       userId: req.user._id || req.user.id,
@@ -104,6 +107,7 @@ exports.sendProfilePhoneChangeOtp = async (req, res) => {
   try {
     const phone = normalizePhone(req.body.phone);
     if (!phone) return res.status(400).json({ message: 'Valid 10-digit Indian mobile number is required' });
+    if (isOwnerPhone(phone) || isOwnerAccount(req.user)) return res.status(403).json({ message: 'The owner identity cannot be reassigned from profile settings.' });
     if (phone === String(req.user.phone || '')) return res.status(400).json({ message: 'This mobile number is already on your account' });
 
     const existingUser = req.user.offlineSession
@@ -174,6 +178,7 @@ exports.verifyProfileEmailChangeOtp = async (req, res) => {
 
 exports.deleteProfile = async (req, res) => {
   try {
+    if (isOwnerAccount(req.user)) return res.status(403).json({ message: 'The deployment owner account cannot be deleted here.' });
     if (req.user.offlineSession) {
       removeOfflineProfile(req.user);
       return res.json({ success: true, message: 'Account deleted successfully' });
@@ -194,7 +199,10 @@ exports.sendOtp = async (req, res) => {
       return res.status(429).json({ message: 'Too many OTP requests. Please try again shortly.' });
     }
 
-    const { otp, record } = await createOtp(phone, 'login', req);
+    if (isOwnerPhone(phone) && (mongoose.connection.readyState !== 1 || !process.env.JWT_SECRET || !process.env.JWT_REFRESH_SECRET)) {
+      return res.status(503).json({ message: 'Owner login requires a connected database and configured session secrets. No demo or offline owner access is allowed.' });
+    }
+    const { otp, record } = await createOtp(phone, isOwnerPhone(phone) ? 'master_login' : 'login', req);
     const delivery = await deliverOtpWithFallback(phone, otp, record);
     res.json({ success: true, message: 'OTP sent successfully', ...otpResponse(delivery) });
   } catch (error) {
@@ -206,9 +214,12 @@ exports.resendOtp = exports.sendOtp;
 
 exports.verifyOtp = async (req, res) => {
   try {
-    const { phone } = await verifyOtpRecord(req.body.phone, req.body.otp);
+    const { phone, record } = await verifyOtpRecord(req.body.phone, req.body.otp);
+    if (isOwnerPhone(phone) && (mongoose.connection.readyState !== 1 || record.purpose !== 'master_login' || !record.trustedDelivery)) {
+      return res.status(403).json({ message: 'Please request and verify a new owner OTP delivered by SMS.' });
+    }
     const user = mongoose.connection.readyState === 1
-      ? await upsertPhoneLoginUser(phone, { activeMode: 'customer' })
+      ? await upsertPhoneLoginUser(phone, { activeMode: 'customer', masterVerified: isOwnerPhone(phone) })
       : buildOfflineLoginUser(phone, { activeMode: 'customer' });
     res.json({ success: true, ...authPayload(user) });
   } catch (error) {
@@ -247,8 +258,9 @@ exports.refresh = async (req, res) => {
     if (canRefreshOfflineSession(decoded)) {
       user = buildOfflineLoginUser(decoded.phone, { activeMode: decoded.activeMode || 'customer' });
     } else {
-      user = await User.findById(decoded.id).select('-password');
+      user = await User.findById(decoded.id).select('-password +masterSessionVersion');
       if (!user || user.isBlocked) return res.status(401).json({ message: 'Account unavailable' });
+      attachMasterSession(user, decoded);
     }
 
     res.json({ success: true, ...authPayload(user) });
@@ -287,6 +299,8 @@ exports.switchMode = async (req, res) => {
 function sanitize(user) {
   const data = typeof user.toObject === 'function' ? user.toObject() : { ...user };
   delete data.password;
+  delete data.masterSessionVersion;
+  data.systemRole = user.$locals?.masterAuthenticated && isOwnerAccount(user) && !user.offlineSession ? 'MASTER_OWNER' : 'USER';
   data.id = String(data._id || data.id);
   return data;
 }
@@ -303,8 +317,9 @@ function getAdminPhones() {
   return String(process.env.ADMIN_PHONE_NUMBERS || '').split(',').map((item) => normalizePhone(item)).filter(Boolean);
 }
 
-async function upsertPhoneLoginUser(phone, { activeMode = 'customer' } = {}) {
-  const isAdminPhone = getAdminPhones().includes(phone);
+async function upsertPhoneLoginUser(phone, { activeMode = 'customer', masterVerified = false } = {}) {
+  const isAdminPhone = getAdminPhones().includes(phone) || masterVerified;
+  const ownerVersion = masterVerified ? crypto.randomUUID() : undefined;
   let user = await User.findOne({ phone });
   if (!user) {
     user = await User.create({
@@ -315,7 +330,9 @@ async function upsertPhoneLoginUser(phone, { activeMode = 'customer' } = {}) {
       role: isAdminPhone ? 'admin' : 'customer',
       availableModes: isAdminPhone ? ['customer', 'admin'] : ['customer'],
       activeMode,
+      ...(masterVerified ? { systemRole: 'MASTER_OWNER', masterSessionVersion: ownerVersion } : {}),
     });
+    if (masterVerified) attachMasterSession(user, { masterSessionVersion: ownerVersion });
     return user;
   }
 
@@ -336,7 +353,9 @@ async function upsertPhoneLoginUser(phone, { activeMode = 'customer' } = {}) {
     user.availableModes = [...modes];
   }
   user.activeMode = activeMode;
+  if (masterVerified) { user.systemRole = 'MASTER_OWNER'; user.masterSessionVersion = ownerVersion; }
   await user.save();
+  if (masterVerified) attachMasterSession(user, { masterSessionVersion: ownerVersion });
   return user;
 }
 
@@ -384,7 +403,16 @@ function canRefreshOfflineSession(decoded) {
  * downgraded to a guessable value and never leaves the server.
  */
 async function deliverOtpWithFallback(phone, otp, record) {
-  const delivery = await sendOtp(phone, otp);
+  const owner = isOwnerPhone(phone);
+  const delivery = await sendOtp(phone, otp, { requireReal: owner });
+  if (owner) {
+    if (!delivery?.success || !['twilio', 'msg91', 'fast2sms'].includes(delivery.provider)) {
+      if (record) { record.isUsed = true; await record.save(); }
+      throw new ApiError('SERVICE_UNAVAILABLE', 'Owner OTP could not be delivered. Configure a real SMS provider; demo access is disabled for this account.');
+    }
+    record.trustedDelivery = true; record.provider = delivery.provider; await record.save();
+    return { success: true, owner: true, provider: delivery.provider };
+  }
 
   if (!isDemoOtpMode()) {
     if (delivery?.success) return { success: true, provider: delivery.provider };
@@ -400,6 +428,7 @@ async function deliverOtpWithFallback(phone, otp, record) {
 }
 
 function otpResponse(delivery) {
+  if (delivery?.owner) return { otpMode: 'production' };
   if (!isDemoOtpMode() || !delivery?.demoOtp) return { otpMode: getOtpMode() };
   return { otpMode: 'demo', demoOtp: delivery.demoOtp, devOtp: delivery.demoOtp };
 }

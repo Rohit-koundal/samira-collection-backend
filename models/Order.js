@@ -38,6 +38,7 @@ const orderSchema = new mongoose.Schema({
   billingAddress: Object,
   invoiceNumber: String,
   invoiceDate: Date,
+  invoiceSeller: { storeName: String, legalBusinessName: String, gstin: String, contactEmail: String, contactPhone: String, whatsappNumber: String, address: String, billingAddress: String, returnPolicy: String },
   shipment: { type: mongoose.Schema.Types.ObjectId, ref: 'Shipment' },
   deliveredAt: Date,
   paymentMethod: { type: String, enum: ['COD', 'UPI', 'CARD', 'Card', 'NETBANKING', 'WALLET', 'Razorpay'], default: 'COD' },

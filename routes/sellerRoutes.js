@@ -64,6 +64,8 @@ router.post('/inbox/:id/reply', requireStorePermission('inbox.write'), inbox.rep
 router.put('/inbox/:id/status', requireStorePermission('inbox.write'), inbox.updateStatus);
 
 router.get('/audit-logs', requireStorePermission('audit.read'), audit.list);
+router.get('/audit-logs/options', requireStorePermission('audit.read'), audit.options);
+router.get('/audit-logs/:id', requireStorePermission('audit.read'), audit.get);
 router.get('/analytics/funnel', requireStorePermission('marketing.read'), analytics.funnel);
 
 router.use('/uploads', requireStorePermission('catalog.write'), require('./uploadRoutes'));

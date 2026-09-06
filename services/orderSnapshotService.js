@@ -56,6 +56,7 @@ function buildPersistedOrderFields({ userId, draft, shippingAddress, billingAddr
     billingAddress: snapshotAddress(billingAddress || shippingAddress),
     invoiceNumber: invoiceNumberForId(id, draft.settings),
     invoiceDate: extra.invoiceDate || new Date(),
+    invoiceSeller: Object.fromEntries(['storeName', 'legalBusinessName', 'gstin', 'contactEmail', 'contactPhone', 'whatsappNumber', 'address', 'billingAddress', 'returnPolicy'].map((key) => [key, String(draft.settings?.[key] || '').trim()])),
     paymentMethod: draft.paymentMethod,
     ...draft.totals,
     ...extra,

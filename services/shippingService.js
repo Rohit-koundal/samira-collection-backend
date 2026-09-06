@@ -47,11 +47,12 @@ async function upsertShipmentForOrder(order, { courierName, trackingNumber, trac
   if (['SHIPPED', 'IN_TRANSIT', 'OUT_FOR_DELIVERY'].includes(nextStatus)) {
     notifyLater({
       userId: order.user,
-      event: 'ORDER_SHIPPED',
-      title: 'Your order is on the way',
+      storeId: order.storeId,
+      event: nextStatus === 'OUT_FOR_DELIVERY' ? 'ORDER_OUT_FOR_DELIVERY' : 'ORDER_SHIPPED',
+      title: nextStatus === 'OUT_FOR_DELIVERY' ? 'Out for delivery' : 'Your order is on the way',
       message: shipment.trackingNumber
         ? `Tracking ${shipment.trackingNumber}${shipment.courierName ? ` via ${shipment.courierName}` : ''}`
-        : 'Your order has been shipped.',
+        : nextStatus === 'OUT_FOR_DELIVERY' ? 'Your order is out for delivery.' : 'Your order is on the way.',
       metadata: { orderId: String(order._id), shipmentId: String(shipment._id) },
     });
   }

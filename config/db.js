@@ -2,11 +2,19 @@ const dns = require('node:dns');
 const mongoose = require('mongoose');
 
 function usePublicDnsForAtlasSrv(uri = '') {
-  if (!String(uri).startsWith('mongodb+srv://')) return;
+  if (!String(uri).trim().startsWith('mongodb+srv://')) return;
+  const configured = String(process.env.MONGO_DNS_SERVERS || '').trim();
+  if (configured.toLowerCase() === 'system') return;
+  const servers = (configured || '8.8.8.8,1.1.1.1').split(',').map((server) => server.trim()).filter(Boolean);
   try {
-    dns.setServers(['8.8.8.8', '1.1.1.1']);
+    // Validate before changing either resolver so invalid configuration changes neither.
+    new dns.Resolver().setServers(servers);
+    dns.setServers(servers);
+    // The MongoDB driver uses dns.promises. On Windows/Node 24, changing the
+    // callback resolver alone can leave the promise resolver on the OS DNS.
+    dns.promises.setServers(servers);
   } catch {
-    // Keep the OS resolver if Node refuses to change servers.
+    console.warn('MongoDB DNS configuration could not be applied. Check MONGO_DNS_SERVERS.');
   }
 }
 
@@ -30,3 +38,4 @@ async function connectDB() {
 }
 
 module.exports = connectDB;
+module.exports.usePublicDnsForAtlasSrv = usePublicDnsForAtlasSrv;
