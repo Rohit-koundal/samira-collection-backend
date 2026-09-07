@@ -50,8 +50,10 @@ app.get('/health', async (req, res) => {
   const imageStorage = isR2Configured() ? 'r2' : isCloudinaryConfigured() ? 'cloudinary' : 'local';
   const persistentImageStorageConfigured = imageStorage !== 'local';
   const redis = await redisHealthStatus();
+  const release = String(process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || '').trim().slice(0, 12) || null;
   res.json({
     status: process.env.NODE_ENV === 'production' && !persistentImageStorageConfigured ? 'degraded' : 'ok',
+    release,
     database: dbStates[mongoose.connection.readyState] || 'unknown',
     environment: process.env.NODE_ENV || 'development',
     imageStorage,
