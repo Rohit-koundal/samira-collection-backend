@@ -335,6 +335,7 @@ test('real-delivery owner OTP flow grants master access only after verification 
   process.env.JWT_REFRESH_SECRET = 'isolated-unit-refresh-secret-not-a-real-key';
   process.env.SMS_PROVIDER = 'twilio';
   process.env.OTP_MODE = 'demo';
+  process.env.ALLOW_HOSTED_OWNER_DEMO = 'false';
   try {
     let record;
     t.mock.method(crypto, 'randomInt', () => 765432);
@@ -369,7 +370,7 @@ test('real-delivery owner OTP flow grants master access only after verification 
     assert.equal(replay.statusCode, 400);
   } finally {
     mongoose.connection.readyState = previousState;
-    for (const key of ['JWT_SECRET', 'JWT_REFRESH_SECRET', 'SMS_PROVIDER', 'OTP_MODE']) {
+    for (const key of ['JWT_SECRET', 'JWT_REFRESH_SECRET', 'SMS_PROVIDER', 'OTP_MODE', 'ALLOW_HOSTED_OWNER_DEMO']) {
       if (saved[key] === undefined) delete process.env[key]; else process.env[key] = saved[key];
     }
   }
@@ -499,7 +500,7 @@ function hostedDemoRequest(body = {}, extra = {}) {
   };
 }
 
-test('hosted owner demo requires both explicit settings and takes precedence over local binding', (t) => {
+test('hosted owner demo supports an explicit override and takes precedence over local binding', (t) => {
   enableLocalDemo(t);
   const demo = require('../config/localOwnerDemo');
   assert.equal(demo.getOwnerDemoProvider(hostedDemoRequest()), '');
@@ -516,6 +517,23 @@ test('hosted owner demo requires both explicit settings and takes precedence ove
     assert.equal(demo.getOwnerDemoProvider(hostedDemoRequest()), '');
     assert.equal(demo.allowsOwnerDemoSession({ hostedOwnerDemo: true }, hostedDemoRequest()), false);
   }
+  delete process.env.OTP_MODE;
+  assert.equal(demo.isHostedOwnerDemoEnabled(), false);
+});
+
+test('hosted owner demo preserves legacy OTP_MODE=demo behavior when the new override is unset', (t) => {
+  enableLocalDemo(t);
+  const demo = require('../config/localOwnerDemo');
+  delete process.env.LOCAL_OWNER_DEMO;
+  delete process.env.ALLOW_HOSTED_OWNER_DEMO;
+  assert.equal(demo.isHostedOwnerDemoEnabled(), true);
+  assert.equal(demo.getOwnerDemoProvider(hostedDemoRequest()), 'hosted-demo');
+  process.env.ALLOW_HOSTED_OWNER_DEMO = 'false';
+  assert.equal(demo.isHostedOwnerDemoEnabled(), false);
+  assert.equal(demo.getOwnerDemoProvider(hostedDemoRequest()), '');
+  delete process.env.ALLOW_HOSTED_OWNER_DEMO;
+  process.env.OTP_MODE = 'production';
+  assert.equal(demo.isHostedOwnerDemoEnabled(), false);
   delete process.env.OTP_MODE;
   assert.equal(demo.isHostedOwnerDemoEnabled(), false);
 });
