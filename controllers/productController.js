@@ -293,6 +293,7 @@ function validateProduct(data, creating = true) {
   if (Number(data.price) <= 0) return 'Selling price is required';
   if (Number(data.price) > Number(data.originalPrice)) return 'Selling price cannot exceed original price';
   if (Number(data.stock) < 0) return 'Stock cannot be negative';
+  if (data.shippingWeightKg !== undefined && (!Number.isFinite(Number(data.shippingWeightKg)) || Number(data.shippingWeightKg) < 0 || Number(data.shippingWeightKg) > 1000)) return 'Packed unit weight must be between 0 and 1000 kg';
   if (creating && (!Array.isArray(data.images) || !data.images.length)) return 'At least one product image is required';
   if (Array.isArray(data.images) && data.images.some((image) => image.url?.startsWith('data:'))) return 'Images must be uploaded files or valid URLs, not base64 data';
   if (Array.isArray(data.images) && data.images.some((image) => image?.url && !image.url.startsWith('http') && !image.url.startsWith('/uploads/'))) {

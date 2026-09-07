@@ -3,14 +3,15 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { DEFAULT_WEBSITE_CONFIG, normalizeWebsiteConfig, getPresetList } = require('../config/websiteCustomization');
 
-test('all nine presets have complete, independent configurations and coordinated palettes', () => {
+test('all seventeen presets have complete, independent configurations and coordinated palettes', () => {
   const presets = getPresetList();
-  assert.equal(presets.length, 9);
+  assert.equal(presets.length, 17);
   for (const preset of presets) {
     assert.equal(preset.config.theme.preset, preset.id);
     assert.equal(preset.config.mobile.enabled, false);
     assert.equal(preset.config.tablet.enabled, false);
     assert.ok(preset.description);
+    assert.ok(preset.collection);
     assert.equal(preset.swatches.primary, preset.config.colors.primary);
     assert.equal(preset.config.homepage.sections.length, 14);
     if (preset.id !== 'default') {
@@ -21,6 +22,21 @@ test('all nine presets have complete, independent configurations and coordinated
   }
   presets[0].config.branding.websiteName = 'Changed';
   assert.equal(DEFAULT_WEBSITE_CONFIG.branding.websiteName, 'Samira Collection');
+});
+
+test('lightweight gallery presets keep the same appearance with no repeated business content', () => {
+  const full = getPresetList();
+  const compact = getPresetList({ appearanceOnly: true });
+  assert.equal(compact.length, full.length);
+  for (const [index, preset] of compact.entries()) {
+    assert.equal(preset.config.branding, undefined);
+    assert.equal(preset.config.homepage, undefined);
+    assert.equal(preset.config.footer.menus, undefined);
+    const normalized = normalizeWebsiteConfig(preset.config);
+    for (const key of ['colors', 'typography', 'productCards', 'buttons', 'theme']) assert.deepEqual(normalized[key], full[index].config[key]);
+    assert.equal(normalized.theme.preset, preset.id);
+  }
+  assert.ok(JSON.stringify(compact).length < JSON.stringify(full).length * 0.3);
 });
 
 test('legacy normalization does not enable handheld overrides or enhanced desktop styling', () => {

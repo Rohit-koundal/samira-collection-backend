@@ -1,7 +1,10 @@
 const router = require('express').Router();
 const product = require('../controllers/productController');
+const smartFill = require('../controllers/productSmartFillController');
 
 router.get('/', product.getProducts);
+router.get('/smart-fill/status', smartFill.status);
+router.post('/smart-fill', smartFill.limiter, smartFill.fill);
 router.get('/quick-analyze/status', product.getQuickAddVisionStatus);
 router.post('/quick-analyze', product.analyzeQuickAdd);
 router.get('/:id', product.getProductById);

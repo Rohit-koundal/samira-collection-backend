@@ -141,6 +141,7 @@ async function createPaymentOrder(req, res) {
   });
 
   const amountInPaise = amountToPaise(draft.totals.finalAmount);
+  require('../services/shippingRules').assertQuotedTotal(draft, req.body?.expectedTotal);
   if (amountInPaise < 100) {
     throw new ApiError('VALIDATION_ERROR', 'Order amount must be at least Rs. 1 for online payment.');
   }

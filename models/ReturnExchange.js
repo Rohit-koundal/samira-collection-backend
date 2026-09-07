@@ -36,6 +36,7 @@ const returnExchangeSchema = new mongoose.Schema({
   inventoryRestoredAt: Date,
   exchangeDeducted: { type: Boolean, default: false },
   pickupScheduledAt: Date,
+  shipment: { type: mongoose.Schema.Types.ObjectId, ref: 'ReverseShipment' },
 }, { timestamps: true });
 
 returnExchangeSchema.plugin(storeIdPlugin);

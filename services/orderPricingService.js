@@ -17,7 +17,6 @@ const {
   assertPaymentMethodAllowed,
   getStoreSettings,
   resolveCodCharge,
-  resolveDeliveryCharge,
   resolvePrepaidDiscount,
 } = require('./paymentSettingsService');
 const { requireObjectId, requireQuantity } = require('../utils/validators');
@@ -102,6 +101,7 @@ async function loadOrderItems(orderItems, { tenantFilter = {} } = {}) {
       lineTotal: round(unitPrice * quantity),
       category: product.category,
       storeId: product.storeId || null,
+      shippingWeightKg: Number(product.shippingWeightKg || 0),
     });
   }
 
@@ -119,8 +119,10 @@ async function loadOrderItems(orderItems, { tenantFilter = {} } = {}) {
  */
 async function buildOrderDraft({ orderItems, couponCode, paymentMethod, settings, userId, shippingAddress, tenantFilter } = {}) {
   const storeSettings = settings || await getStoreSettings();
+  if (storeSettings.acceptingOrders === false) throw new ApiError('VALIDATION_ERROR', storeSettings.orderPauseMessage || 'The store is temporarily not accepting new orders.');
   const method = normalizeMethod(paymentMethod);
   const { items, totalMRP, sellingTotal } = await loadOrderItems(orderItems, { tenantFilter });
+  if (sellingTotal < Number(storeSettings.minimumOrderAmount || 0)) throw new ApiError('VALIDATION_ERROR', `The minimum order value is ₹${Number(storeSettings.minimumOrderAmount).toLocaleString('en-IN')} before coupon discounts and delivery charges.`);
 
   let coupon = null;
   let couponDiscount = 0;
@@ -142,7 +144,8 @@ async function buildOrderDraft({ orderItems, couponCode, paymentMethod, settings
   }
 
   const productDiscount = round(Math.max(0, totalMRP - sellingTotal));
-  const deliveryCharge = resolveDeliveryCharge(sellingTotal, storeSettings);
+  const shippingQuote = await require('./deliveryService').checkoutShipping({ items, settings: storeSettings, address: shippingAddress, paymentMethod: method, amount: sellingTotal });
+  const deliveryCharge = shippingQuote.deliveryCharge;
   const prepaidDiscount = resolvePrepaidDiscount(method, sellingTotal - couponDiscount, storeSettings);
   const platformFee = items.length ? Math.max(0, Number(storeSettings.platformFee ?? 23)) : 0;
   const taxRate = Math.max(0, Number(storeSettings.gstRate ?? 5));
@@ -178,6 +181,7 @@ async function buildOrderDraft({ orderItems, couponCode, paymentMethod, settings
     items,
     paymentMethod: method,
     settings: storeSettings,
+    shippingQuote,
     storeId: items[0]?.storeId || null,
     totals: {
       totalMRP,

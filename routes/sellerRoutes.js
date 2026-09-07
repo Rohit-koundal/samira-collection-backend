@@ -1,5 +1,6 @@
 const router = require('express').Router();
 const product = require('../controllers/productController');
+const smartFill = require('../controllers/productSmartFillController');
 const order = require('../controllers/orderController');
 const coupon = require('../controllers/couponController');
 const banner = require('../controllers/bannerController');
@@ -18,6 +19,8 @@ const { getShippingProvider } = require('../services/shippingProvider');
 const { requireStorePermission, stripClientStoreId } = require('../middleware/storeMiddleware');
 
 router.get('/products', requireStorePermission('catalog.read'), product.getProducts);
+router.get('/products/smart-fill/status', requireStorePermission('catalog.read'), smartFill.status);
+router.post('/products/smart-fill', requireStorePermission('catalog.write'), smartFill.limiter, smartFill.fill);
 router.get('/products/quick-analyze/status', requireStorePermission('catalog.read'), product.getQuickAddVisionStatus);
 router.post('/products/quick-analyze', requireStorePermission('catalog.write'), product.analyzeQuickAdd);
 router.get('/products/:id', requireStorePermission('catalog.read'), product.getProductById);

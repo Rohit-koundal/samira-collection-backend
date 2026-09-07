@@ -5,6 +5,7 @@ const { adminOnly } = require('../middleware/adminMiddleware');
 router.get('/', settings.getSettings);
 router.get('/payment-methods', settings.getPaymentMethods);
 router.get('/payment-readiness', protect, adminOnly, settings.getPaymentReadiness);
+router.get('/shipping-readiness', protect, adminOnly, require('../controllers/deliveryController').readiness);
 router.put('/', protect, adminOnly, settings.updateSettings);
 router.put('/admin/update', protect, adminOnly, settings.updateSettings);
 module.exports = router;

@@ -7,9 +7,16 @@ const { buildPaymentOptions, getStoreSettings, razorpayDisabledReason, razorpayU
 const { isRazorpayConfigured } = require('../services/razorpayService');
 const { logAudit } = require('../services/auditService');
 const { auditSnapshot } = require('../utils/auditData');
+const { normalizeSettingsUpdates } = require('../services/storeSettingsValidation');
 
 exports.getSettings = asyncHandler(async (req, res) => {
-  res.json((await Settings.findOne()) || await Settings.create({}));
+  const settings = (await Settings.findOne()) || await Settings.create({});
+  const data = settings.toObject();
+  if (!req.user || req.user.role !== 'admin') {
+    delete data.shippingPickup;
+    delete data.shippingRateZones;
+  }
+  res.json(data);
 });
 
 /**
@@ -61,56 +68,26 @@ exports.getPaymentReadiness = asyncHandler(async (req, res) => {
 });
 
 exports.updateSettings = asyncHandler(async (req, res) => {
-  // The admin form round-trips the whole document, so drop the fields Mongo
-  // owns before using it as an update.
-  const { _id, __v, createdAt, updatedAt, storeId, ...updates } = req.body || {};
-  if (storeId && String(storeId) !== String((await getStoreSettings()).storeId || '')) throw new ApiError('FORBIDDEN', 'Store identity cannot be changed here');
-  if (Object.keys(updates).some((key) => !Settings.schema.path(key))) {
-    throw new ApiError('FORBIDDEN', 'Only basic store settings can be changed here');
-  }
-  if (!isMasterOwner(req.user) && !(await readConfiguration()).structure.clientPermissions.payments) {
-    const current = await getStoreSettings();
-    const protectedFields = ['razorpayEnabled', 'upiEnabled', 'cardPaymentEnabled', 'netBankingEnabled', 'walletEnabled', 'codEnabled', 'codCharge', 'codMinAmount', 'codMaxAmount', 'codPincodes', 'prepaidDiscountType', 'prepaidDiscountValue', 'codConfirmationRequired', 'rtoBlockEnabled', 'rtoBlockMinOrders', 'rtoBlockThreshold', 'platformFee', 'gstRate'];
-    if (protectedFields.some((key) => updates[key] !== undefined && JSON.stringify(updates[key]) !== JSON.stringify(current[key]))) {
-      throw new ApiError('FORBIDDEN', 'Payment configuration is managed by the store owner');
-    }
-  }
-
-  if (!isMasterOwner(req.user) && !(await readConfiguration()).structure.clientPermissions.content) {
-    const current = await getStoreSettings();
-    const contentFields = ['storeName', 'contactEmail', 'contactPhone', 'whatsappNumber', 'address', 'socialLinks', 'footerText', 'returnPolicy', 'privacyPolicy', 'termsConditions', 'shippingPolicy', 'cancellationPolicy', 'sizeGuide', 'faqs', 'ourStory', 'appLinks'];
-    if (contentFields.some((key) => updates[key] !== undefined && JSON.stringify(updates[key]) !== JSON.stringify(current[key]))) {
-      throw new ApiError('FORBIDDEN', 'Store content is managed by the store owner');
-    }
-  }
-
-  if (!String(updates.storeName || '').trim()) {
-    throw new ApiError('VALIDATION_ERROR', 'Store name is required');
-  }
-  if (updates.contactEmail && !/^\S+@\S+\.\S+$/.test(updates.contactEmail)) {
-    throw new ApiError('VALIDATION_ERROR', 'Valid email is required');
-  }
-
-  for (const field of ['deliveryCharge', 'freeShippingMinAmount', 'codCharge', 'codMaxAmount', 'codMinAmount', 'returnWindowDays', 'prepaidDiscountValue', 'rtoBlockMinOrders', 'rtoBlockThreshold', 'platformFee', 'gstRate']) {
-    if (updates[field] === undefined || updates[field] === '') continue;
-    const value = Number(updates[field]);
-    if (!Number.isFinite(value) || value < 0) {
-      throw new ApiError('VALIDATION_ERROR', `${field} must be zero or a positive number`);
-    }
-    updates[field] = value;
-  }
-
-  if (updates.codPincodes !== undefined) {
-    updates.codPincodes = Array.isArray(updates.codPincodes)
-      ? updates.codPincodes.map((pin) => String(pin || '').replace(/\D/g, '')).filter((pin) => /^\d{6}$/.test(pin))
-      : String(updates.codPincodes || '').split(/[,\s]+/).map((pin) => pin.replace(/\D/g, '')).filter((pin) => /^\d{6}$/.test(pin));
-  }
-  if (updates.prepaidDiscountType && !['Percentage', 'Flat', ''].includes(updates.prepaidDiscountType)) {
-    throw new ApiError('VALIDATION_ERROR', 'Prepaid discount type must be Percentage or Flat');
-  }
-
+  const { _id, __v, createdAt, updatedAt, expectedUpdatedAt, storeId, ...input } = req.body || {};
   const previous = await Settings.findOne();
-  const saved = await Settings.findOneAndUpdate({}, updates, { new: true, upsert: true, runValidators: true });
+  const current = previous?.toObject() || {};
+  if (storeId && String(storeId) !== String(current.storeId || '')) throw new ApiError('FORBIDDEN', 'Store identity cannot be changed here');
+  if (Object.keys(input).some(key => key.includes('.') || key.startsWith('$') || !Settings.schema.path(key))) throw new ApiError('FORBIDDEN', 'Only supported store settings can be changed here');
+  if (expectedUpdatedAt !== undefined && String(expectedUpdatedAt || '') !== (current.updatedAt ? new Date(current.updatedAt).toISOString() : '')) {
+    throw new ApiError('DUPLICATE_REQUEST', 'Settings changed in another session. Reload the saved settings and review your changes.');
+  }
+  const updates = normalizeSettingsUpdates(input, current);
+  if (!isMasterOwner(req.user)) {
+    const permissions = (await readConfiguration()).structure.clientPermissions;
+    const paymentFields = ['razorpayEnabled', 'upiEnabled', 'cardPaymentEnabled', 'netBankingEnabled', 'walletEnabled', 'codEnabled', 'codCharge', 'codMinAmount', 'codMaxAmount', 'codPincodes', 'prepaidDiscountType', 'prepaidDiscountValue', 'codConfirmationRequired', 'rtoBlockEnabled', 'rtoBlockMinOrders', 'rtoBlockThreshold', 'platformFee', 'gstRate'];
+    const changed = fields => fields.some(key => updates[key] !== undefined && JSON.stringify(updates[key]) !== JSON.stringify(current[key]));
+    if (!permissions.payments && changed(paymentFields)) throw new ApiError('FORBIDDEN', 'Payment configuration is managed by the store owner');
+    if (!permissions.content && changed(Object.keys(updates).filter(key => !paymentFields.includes(key)))) throw new ApiError('FORBIDDEN', 'Store settings are managed by the store owner');
+  }
+  const filter = previous ? { _id: previous._id, ...(current.updatedAt ? { updatedAt: current.updatedAt } : {}) } : {};
+  const saved = await Settings.findOneAndUpdate(filter, { $set: updates }, { new: true, upsert: !previous, runValidators: true });
+  if (!saved) throw new ApiError('DUPLICATE_REQUEST', 'Settings changed while saving. Reload and review your changes.');
+  require('./websiteCustomizationController')._invalidateActiveCache();
   logAudit({ req, action: 'SETTINGS_UPDATE', entityType: 'Settings', entityId: saved._id, before: auditSnapshot(previous, Object.keys(updates)), after: auditSnapshot(saved, Object.keys(updates)) });
   res.json(saved);
 });

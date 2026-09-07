@@ -2,6 +2,7 @@ const mongoose = require('mongoose');
 const WebsiteTheme = require('../models/WebsiteTheme');
 const WebsiteThemeVersion = require('../models/WebsiteThemeVersion');
 const Settings = require('../models/Settings');
+const { applyStorePresentation } = require('../services/storeSettingsValidation');
 const { asyncHandler } = require('../middleware/validate');
 const { ApiError, notFound } = require('../utils/apiError');
 const { logAudit } = require('../services/auditService');
@@ -140,7 +141,11 @@ exports.getActiveConfig = asyncHandler(async (req, res) => {
     return res.json(activeCache);
   }
   const active = await WebsiteTheme.findOne({ isActive: true, publishedConfig: { $exists: true, $ne: null } }).sort('-publishedAt').lean();
-  activeCache = active ? publicPayload(active) : { config: buildInitialConfig(await Settings.findOne().lean()), theme: null };
+  const settings = await Settings.findOne().lean() || {};
+  activeCache = active ? publicPayload(active) : { config: buildInitialConfig(settings), theme: null };
+  activeCache.config = applyStorePresentation(activeCache.config, settings);
+  activeCache.metadata = { title: settings.seoTitle || '', description: settings.seoDescription || '' };
+  activeCache.brandIdentityManaged = Boolean(settings.brandIdentityEnabled);
   activeCacheExpiresAt = Date.now() + PUBLIC_CACHE_MS;
   res.setHeader('Cache-Control', 'public, max-age=0, must-revalidate');
   return res.json(activeCache);
@@ -153,7 +158,7 @@ exports.getWorkspace = asyncHandler(async (req, res) => {
     themes: themes.map(themeSummary),
     selectedTheme: selected,
     configurationLocked: (await require('../services/masterConfigurationService').readConfiguration()).locked,
-    presets: getPresetList(),
+    presets: getPresetList({ appearanceOnly: true }),
   });
 });
 

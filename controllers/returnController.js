@@ -174,7 +174,21 @@ exports.adminReturns = asyncHandler(async (req, res) => {
   const { andFilter } = require('../services/storeService');
   const { wantsPagination, buildPaginatedResponse } = require('../utils/validators');
   const extra = {};
+  if (req.query.from || req.query.to || req.query.range) {
+    const { dashboardRange, periodFilter } = require('../services/dashboardAnalytics');
+    Object.assign(extra, periodFilter(dashboardRange(req.query)));
+  }
   if (req.query.id) extra._id = requireObjectId(req.query.id, 'return id');
+  if (req.query.status) extra.status = requireEnum(req.query.status, RETURN_STATUSES, 'status');
+  const search = optionalString(req.query.search, 'search', { max: 100 });
+  if (search) {
+    const regex = new RegExp(search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+    const [users, products] = await Promise.all([
+      require('../models/User').find({ name: regex }).select('_id').lean(),
+      Product.find(andFilter({ name: regex }, req.tenantFilter)).select('_id').lean(),
+    ]);
+    extra.$or = [{ user: { $in: users.map(user => user._id) } }, { product: { $in: products.map(product => product._id) } }, { reason: regex }, { type: regex }, { $expr: { $regexMatch: { input: { $toString: '$_id' }, regex: regex.source, options: 'i' } } }];
+  }
   const filter = andFilter(extra, req.tenantFilter);
   if (wantsPagination(req.query)) {
     const { page, limit, skip } = readPagination(req.query, { defaultLimit: 24, maxLimit: 100 });

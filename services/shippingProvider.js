@@ -1,6 +1,12 @@
 const { ApiError } = require('../utils/apiError');
 
-function getShippingProvider() {
+function providerFor(name) {
+  if (name === 'bluedart') return require('./blueDartProvider');
+  throw new ApiError('SHIPPING_UNAVAILABLE', 'This delivery provider is not connected.', { statusCode: 503 });
+}
+
+function getShippingProvider(name) {
+  if (name === 'bluedart') return providerFor(name).readiness();
   const shiprocket = Boolean(String(process.env.SHIPROCKET_EMAIL || '').trim() && String(process.env.SHIPROCKET_PASSWORD || '').trim());
   const delhivery = Boolean(String(process.env.DELHIVERY_TOKEN || '').trim());
 
@@ -29,6 +35,7 @@ function assertLiveBookingDisabled() {
 }
 
 module.exports = {
+  providerFor,
   assertLiveBookingDisabled,
   getShippingProvider,
 };

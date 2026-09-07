@@ -65,6 +65,7 @@ const productSchema = new mongoose.Schema({
   variants: { type: [variantSchema], default: [] },
   stock: { type: Number, required: true, default: 0 },
   lowStockAlert: { type: Number, default: 5 },
+  shippingWeightKg: { type: Number, min: 0, max: 1000, default: 0 },
   sku: { type: String, unique: true, sparse: true },
   tags: [String],
   primaryImage: String,

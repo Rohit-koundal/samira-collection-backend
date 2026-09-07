@@ -61,6 +61,23 @@ test('structured replies exclude thinking parts and tolerate a JSON code fence',
   assert.equal((await generateGeminiJson({ parts })).raw.name, 'Fixture saree');
 });
 
+test('a leaked key has an actionable safe message and never retries other models', async (t) => {
+  setup(t);
+  const request = t.mock.method(global, 'fetch', async () => reply(403, { error: { message: 'Your API key was reported as leaked. Please use another API key. ' + process.env.GEMINI_API_KEY } }));
+  await assert.rejects(generateGeminiJson({ parts }), error => {
+    assert.equal(error.contextCode, 'AI_ACCESS_DENIED');
+    assert.match(error.message, /reported as leaked/);
+    assert.match(error.message, /replacement key in Google AI Studio/);
+    assert.match(error.message, /restart the backend/);
+    assert.ok(!error.message.includes(process.env.GEMINI_API_KEY));
+    assert.equal(error.retryModel, false);
+    return true;
+  });
+  assert.equal(request.mock.callCount(), 1);
+  request.mock.mockImplementation(async () => reply(403, { error: { message: 'Project access denied' } }));
+  await assert.rejects(generateGeminiJson({ parts }), error => error.contextCode === 'AI_ACCESS_DENIED' && !error.message.includes('leaked'));
+});
+
 test('truncated and invalid answers are never accepted as complete product details', async (t) => {
   setup(t); const request = t.mock.method(global, 'fetch', async () => success('{"name":"Partial"}', { finishReason: 'MAX_TOKENS' }));
   await assert.rejects(generateGeminiJson({ parts }), { contextCode: 'AI_RESPONSE_INCOMPLETE' });

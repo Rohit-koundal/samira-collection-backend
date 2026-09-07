@@ -7,6 +7,67 @@ const ffprobe = require('ffprobe-static').path;
 const { run } = require('../services/productFrameSelection.service');
 const { captionPrices, captionSuggestion, normalizeContext, prepareContextVideo, analyzeProductContext } = require('../services/productImportContext.service');
 const categories = [{ _id: 'sarees', name: 'Sarees' }, { _id: 'kurtis', name: 'Kurtis' }];
+
+test('catalog Smart Fill sends bounded in-memory photos and retains evidence checks', async (t) => {
+  const previous = process.env.GEMINI_API_KEY; process.env.GEMINI_API_KEY = 'isolated-smart-fill';
+  t.after(() => { if (previous === undefined) delete process.env.GEMINI_API_KEY; else process.env.GEMINI_API_KEY = previous; });
+  const request = t.mock.method(global, 'fetch', async (_url, options) => {
+    const body = JSON.parse(options.body);
+    assert.equal(body.contents[0].parts.filter(part => part.inlineData).length, 2);
+    return { ok: true, status: 200, json: async () => ({ candidates: [{ content: { parts: [{ text: JSON.stringify({ ...raw, sizes: ['M'], fabric: 'Silk', fieldSources: { price: { source: 'caption', quote: 'Price: 1299' }, sizes: { source: 'visual', quote: 'Looks medium' }, fabric: { source: 'visual', quote: 'Looks silky' } } }) }] } }] }) };
+  });
+  const images = [1, 2].map(() => ({ mimeType: 'image/jpeg', buffer: Buffer.from([255, 216, 255, 1]) }));
+  const result = await analyzeProductContext({ caption: 'Name: Wine Saree\nPrice: 1299', images, categories });
+  assert.equal(result.contextStatus, 'completed'); assert.equal(result.contextInputs.photos, true);
+  assert.equal(result.price, 1299); assert.equal(result.fabric, ''); assert.deepEqual(result.sizes, []);
+  assert.equal(request.mock.callCount(), 1);
+});
+
+test('catalog Smart Fill blocks arbitrary URLs and only accepts image bytes from configured storage', (t) => {
+  const { mediaLocation, verifiedImage } = require('../services/productSmartFillMedia');
+  const previous = process.env.R2_PUBLIC_URL; process.env.R2_PUBLIC_URL = 'https://catalog.example/products';
+  t.after(() => { if (previous === undefined) delete process.env.R2_PUBLIC_URL; else process.env.R2_PUBLIC_URL = previous; });
+  assert.equal(mediaLocation('https://catalog.example/products/a.webp').url.hostname, 'catalog.example');
+  assert.ok(mediaLocation('/uploads/product.jpg').file.endsWith('product.jpg'));
+  for (const url of ['http://169.254.169.254/latest/meta-data', 'https://catalog.example.evil.test/products/a.jpg', 'https://catalog.example/private/a.jpg', 'https://user:secret@catalog.example/products/a.jpg', '/uploads/../.env', '/uploads/%2e%2e%2f.env', 'file:///etc/passwd', '/uploads/a\\b.jpg']) assert.throws(() => mediaLocation(url));
+  assert.equal(verifiedImage(Buffer.from([255, 216, 255, 1])).mimeType, 'image/jpeg');
+  assert.throws(() => verifiedImage(Buffer.from('<svg></svg>')));
+  assert.throws(() => verifiedImage(Buffer.alloc(4 * 1024 * 1024 + 1)));
+});
+
+test('catalog Smart Fill controller scopes categories, returns notes fallback and never writes a product', async (t) => {
+  const { EventEmitter } = require('node:events');
+  const Category = require('../models/Category');
+  const Configuration = require('../models/MasterConfiguration');
+  const Product = require('../models/Product');
+  const controller = require('../controllers/productSmartFillController');
+  const previous = process.env.GEMINI_API_KEY; delete process.env.GEMINI_API_KEY;
+  t.after(() => { if (previous !== undefined) process.env.GEMINI_API_KEY = previous; });
+  let query;
+  t.mock.method(Category, 'find', value => { query = value; return { select() { return this; }, limit() { return this; }, lean: async () => categories }; });
+  t.mock.method(Configuration, 'findById', () => ({ lean: async () => ({ structure: { features: { sizing: true }, attributes: [{ key: 'lining', label: 'Lining material' }] } }) }));
+  const write = t.mock.method(Product, 'create', () => { throw new Error('Must never create products'); });
+  const res = new EventEmitter(); res.json = value => { res.body = value; res.writableEnded = true; };
+  let error;
+  await controller.fill({ user: { _id: 'admin-test' }, tenantFilter: { storeId: 'store-test' }, body: { notes: 'Name: Wine Saree\nFabric: Cotton\nPrice: 899\nShipping: Rs 99\nLining material: Cotton', existing: { stock: 100, price: 500, apiKey: 'never-send' }, imageUrls: [] } }, res, value => { error = value; });
+  assert.equal(error, undefined); assert.ok(JSON.stringify(query).includes('store-test'));
+  assert.equal(res.body.mode, 'notes'); assert.equal(res.body.suggestion.price, 899);
+  assert.equal(res.body.suggestion.category, 'sarees'); assert.equal(res.body.suggestion.stock, undefined);
+  assert.equal(res.body.suggestion.attributeValues.lining, 'Cotton');
+  assert.equal(write.mock.callCount(), 0); assert.equal(res.listenerCount('close'), 0);
+  assert.ok(!JSON.stringify(res.body).includes('never-send'));
+});
+
+test('catalog Smart Fill validates requests before doing database or AI work', async (t) => {
+  const Category = require('../models/Category');
+  const controller = require('../controllers/productSmartFillController');
+  const lookup = t.mock.method(Category, 'find', () => { throw new Error('Must not query'); });
+  for (const body of [{ notes: {} }, { notes: 'a'.repeat(7001) }, { imageUrls: ['a', 'b', 'c', 'd'] }, { imageUrls: [null] }]) {
+    let error; await controller.fill({ user: { _id: 'test' }, body }, {}, value => { error = value; });
+    assert.equal(error.errorCode, 'VALIDATION_ERROR');
+  }
+  assert.equal(lookup.mock.callCount(), 0);
+});
 const raw = { name: 'Wine Embroidered Saree', description: 'A wine saree with an embroidered border.', category: 'sarees', multipleProducts: false, priceAmbiguous: false, currency: 'INR', price: 1299, originalPrice: 1999, fieldSources: { price: { source: 'speech', quote: 'Selling price is 1299 rupees', timestampSeconds: 4 }, originalPrice: { source: 'on_screen', quote: 'MRP ₹1999' } } };
 
 test('caption autofill separates the selling price, MRP and delivery fees', () => {
@@ -80,4 +141,5 @@ test('caption autofill remains available without an AI key', async (t) => {
   const request = t.mock.method(global, 'fetch', () => { throw new Error('Must not call AI'); });
   const value = await analyzeProductContext({ caption: 'Name: Cotton Kurti\nPrice: 899\nSizes: S, M', categories });
   assert.equal(value.price, 899); assert.equal(value.category, 'kurtis'); assert.equal(value.contextStatus, 'caption'); assert.equal(request.mock.callCount(), 0);
+  assert.equal(captionSuggestion('Selling price: 899\nFabric: Cotton', '', categories).name, '');
 });

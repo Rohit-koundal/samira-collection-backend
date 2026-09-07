@@ -28,6 +28,7 @@ async function startServer() {
   await connectDB();
 
   if (mongoose.connection.readyState === 1) {
+    require('./services/deliveryService').startDeliveryWorker();
     require('./modules/social-workspace/publishing').startWorker();
     const socialImports = require('./modules/social-product-import/socialImport.service');
     await socialImports.recoverImports().catch(() => console.error('Social import recovery unavailable'));

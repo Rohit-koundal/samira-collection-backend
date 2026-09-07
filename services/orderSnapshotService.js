@@ -42,6 +42,7 @@ function snapshotOrderItems(items = []) {
       discount: Math.round((unitMrp - unitPrice) * 100) / 100,
       tax: Number(item.tax || 0),
       category: item.category,
+      shippingWeightKg: Number(item.shippingWeightKg || 0),
     };
   });
 }
@@ -54,10 +55,11 @@ function buildPersistedOrderFields({ userId, draft, shippingAddress, billingAddr
     user: userId,
     orderItems: snapshotOrderItems(draft.items),
     shippingAddress: shipping,
+    shippingQuote: draft.shippingQuote || undefined,
     billingAddress: snapshotAddress(billingAddress || shippingAddress),
     invoiceNumber: invoiceNumberForId(id, draft.settings),
     invoiceDate: extra.invoiceDate || new Date(),
-    invoiceSeller: Object.fromEntries(['storeName', 'legalBusinessName', 'gstin', 'contactEmail', 'contactPhone', 'whatsappNumber', 'address', 'billingAddress', 'returnPolicy'].map((key) => [key, String(draft.settings?.[key] || '').trim()])),
+    invoiceSeller: Object.fromEntries(['storeName', 'legalBusinessName', 'gstin', 'contactEmail', 'contactPhone', 'whatsappNumber', 'address', 'billingAddress', 'returnPolicy', 'logoUrl', 'invoiceNote'].map((key) => [key, String(draft.settings?.[key] || '').trim()])),
     paymentMethod: draft.paymentMethod,
     ...draft.totals,
     ...extra,

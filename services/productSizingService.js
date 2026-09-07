@@ -72,7 +72,8 @@ function validateProductSizing(payload = {}, categoryName = '') {
 function inferProfile(product = {}, categoryName = '') {
   const explicit = String(product.sizeChartProfile || '').trim();
   if (explicit && explicit !== 'auto' && (explicit === 'free-size' || SIZE_CHART_PROFILES[explicit])) return explicit;
-  const text = [categoryName, product.category?.name, product.subCategory, product.name]
+  const category = typeof product.category === 'object' ? product.category?.name : product.category;
+  const text = [categoryName, category, product.subCategory, product.name, product.productType]
     .map((value) => String(value || '').toLowerCase()).join(' ');
   if (NON_SIZED_TERMS.some((term) => text.includes(term))) return 'free-size';
   if (/(jumpsuit|romper)/.test(text)) return 'jumpsuit';
@@ -91,6 +92,17 @@ function resolveMode(product, profile = inferProfile(product)) {
   return profile === 'free-size' ? 'free-size' : 'sized';
 }
 
+// Purchase validation must use the same category-aware rule as the product
+// response and storefront. Legacy records can still contain sizes in auto mode.
+function resolveProductSizingMode(product = {}, categoryName = '') {
+  return resolveMode(product, inferProfile(product, categoryName));
+}
+
+function getSelectableProductSizes(product = {}, categoryName = '') {
+  if (resolveProductSizingMode(product, categoryName) !== 'sized') return [];
+  return uniqueStrings(product.sizes).filter((size) => !/^free\s*size$/i.test(size));
+}
+
 function uniqueStrings(values) {
   return [...new Set((Array.isArray(values) ? values : []).map((value) => String(value || '').trim()).filter(Boolean))];
 }
@@ -99,4 +111,4 @@ function humanize(value) {
   return String(value).replace(/([A-Z])/g, ' $1').trim().toLowerCase();
 }
 
-module.exports = { SIZE_CHART_PROFILES, inferProfile, normalizeProductSizing, validateProductSizing };
+module.exports = { SIZE_CHART_PROFILES, inferProfile, normalizeProductSizing, validateProductSizing, resolveProductSizingMode, getSelectableProductSizes };

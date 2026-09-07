@@ -1,7 +1,7 @@
 const mongoose = require('mongoose');
 const storeIdPlugin = require('./plugins/storeId');
 
-const SHIPMENT_STATUSES = ['READY_TO_SHIP', 'SHIPPED', 'IN_TRANSIT', 'OUT_FOR_DELIVERY', 'DELIVERED', 'FAILED'];
+const SHIPMENT_STATUSES = ['WAITING', 'READY_TO_SHIP', 'PICKUP_SCHEDULED', 'PICKED_UP', 'SHIPPED', 'IN_TRANSIT', 'OUT_FOR_DELIVERY', 'DELIVERED', 'CANCELLED', 'RTO_IN_TRANSIT', 'RETURNED', 'EXCEPTION', 'FAILED'];
 
 const shipmentSchema = new mongoose.Schema({
   order: { type: mongoose.Schema.Types.ObjectId, ref: 'Order', required: true, unique: true },
@@ -17,6 +17,26 @@ const shipmentSchema = new mongoose.Schema({
   }],
   provider: { type: String, default: 'manual' },
   providerRef: String,
+  environment: { type: String, enum: ['sandbox', 'production'] },
+  returnRequest: { type: mongoose.Schema.Types.ObjectId, ref: 'ReturnExchange' },
+  parcel: Object,
+  pickupAddress: { type: Object, select: false },
+  destination: { type: Object, select: false },
+  service: Object,
+  pickup: { token: String, date: String, time: String, closeTime: String, areaCode: String, cancelled: Boolean },
+  bookingState: { type: String, enum: ['IDLE', 'BOOKING', 'BOOKED', 'UNKNOWN', 'FAILED', 'CANCELLED'], default: 'IDLE' },
+  operation: { type: String, default: '' },
+  operationStartedAt: Date,
+  lastError: String,
+  lastSyncedAt: Date,
+  nextSyncAt: Date,
+  syncLeaseUntil: Date,
+  providerStatus: String,
+  providerStatusAt: Date,
+  expectedDeliveryAt: Date,
+  labelPdf: { type: Buffer, select: false },
+  labelAvailable: { type: Boolean, default: false },
+  providerCharge: Number,
 }, { timestamps: true });
 
 shipmentSchema.plugin(storeIdPlugin);
@@ -25,3 +45,10 @@ shipmentSchema.index({ storeId: 1, createdAt: -1 });
 
 module.exports = mongoose.model('Shipment', shipmentSchema);
 module.exports.SHIPMENT_STATUSES = SHIPMENT_STATUSES;
+// Separate collection preserves the existing unique forward-shipment/order index.
+const reverseSchema = shipmentSchema.clone();
+reverseSchema.remove('order');
+reverseSchema.add({ order: { type: mongoose.Schema.Types.ObjectId, ref: 'Order', required: true } });
+reverseSchema.index({ returnRequest: 1 }, { unique: true });
+reverseSchema.index({ provider: 1, nextSyncAt: 1 });
+module.exports.ReverseShipment = mongoose.model('ReverseShipment', reverseSchema);

@@ -6,6 +6,7 @@ const { availableStock, findVariant, requireVariant, variantId, variantUnitPrice
 const { requireQuantity, requireObjectId } = require('../utils/validators');
 const { andFilter } = require('../services/storeService');
 const { normalizeProductImages } = require('../utils/imageUtils');
+const { getSelectableProductSizes } = require('../services/productSizingService');
 
 function readSessionId(req) {
   const raw = String(req.headers['x-session-id'] || '').trim();
@@ -95,7 +96,7 @@ async function findCart(req, { create = false } = {}) {
 
 async function presentCart(cart, req) {
   if (!cart) return { items: [] };
-  const products = await Product.find(andFilter({ _id: { $in: cart.items.map(item => item.product) } }, req.tenantFilter));
+  const products = await Product.find(andFilter({ _id: { $in: cart.items.map(item => item.product) } }, req.tenantFilter)).populate('category', 'name');
   const lookup = new Map(products.map(product => [String(product._id), product]));
   return { _id: cart._id, items: cart.items.map(line => {
     const product = lookup.get(String(line.product));
@@ -130,7 +131,7 @@ async function changeCart(req, operation, { create = false } = {}) {
   }
 }
 async function resolveSelection(productId, input, req) {
-  const product = await Product.findOne(andFilter({ _id: requireObjectId(String(productId), 'product') }, req.tenantFilter));
+  const product = await Product.findOne(andFilter({ _id: requireObjectId(String(productId), 'product') }, req.tenantFilter)).populate('category', 'name');
   if (!product || product.isActive === false || product.isArchived) throw notFound('This product is no longer available');
   const size = String(input.size || '').trim(), color = String(input.color || '').trim();
   if (size.length > 60 || color.length > 100) throw new ApiError('VALIDATION_ERROR', 'Please choose a valid size and colour');
@@ -139,7 +140,8 @@ async function resolveSelection(productId, input, req) {
     variant = requireVariant(product, input);
     if (!variant) throw new ApiError('VARIANT_UNAVAILABLE', 'This selection is no longer available');
   } else {
-    if (product.sizingMode !== 'free-size' && product.sizes?.length && !product.sizes.includes(size)) throw new ApiError('VARIANT_UNAVAILABLE', 'Please choose an available size');
+    const sizes = getSelectableProductSizes(product);
+    if (sizes.length && !sizes.includes(size)) throw new ApiError('VARIANT_UNAVAILABLE', 'Please choose an available size');
     if (product.colors?.length && !product.colors.includes(color)) throw new ApiError('VARIANT_UNAVAILABLE', 'Please choose an available colour');
   }
   const selection = { size: variant?.size ?? size, color: variant?.color ?? color, variantId: variant ? variantId(variant) : '' };

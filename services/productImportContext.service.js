@@ -53,7 +53,7 @@ function matchCategory(text, categories = []) {
 function captionSuggestion(caption = '', title = '', categories = []) {
   const text = String(caption || '').slice(0, 10000);
   const labelled = (label) => clean(text.match(new RegExp(`(?:^|\\n)\\s*(?:${label})\\s*[:=-]\\s*([^\\n]+)`, 'i'))?.[1], 160);
-  const first = text.split('\n').map((line) => line.trim()).find((line) => line.length > 4 && !/^#|https?:|\d+[,.\d]* likes|dm\b|shop now|follow\b|(?:price|mrp|shipping|delivery)\s*[:=-]/i.test(line));
+  const first = text.split('\n').map((line) => line.trim()).find((line) => line.length > 4 && !/^#|https?:|\d+[,.\d]* likes|dm\b|shop now|follow\b|(?:selling price|sale price|price|mrp|shipping|delivery|fabric|material|sizes?(?: available)?|colou?rs?|category|product type|occasion|description)\s*[:=-]/i.test(line));
   const name = labelled('product(?: name)?|name|title') || clean((first || title).replace(/^[^:]{1,80} on Instagram:\s*/i, '').replace(/#[\w]+/g, '').replace(/["“”]/g, ''), 160);
   const sizes = list(labelled('sizes?(?: available)?')); const fabric = labelled('fabric|material');
   const colors = list(labelled('colou?rs?'));
@@ -133,7 +133,7 @@ async function prepareContextVideo(videoPath, directory, { signal, startSeconds 
   } catch (error) { await fs.unlink(target).catch(() => {}); throw error; }
 }
 
-async function analyzeProductContext({ caption = '', title = '', filePaths = [], videoFiles = [], directory, categories = [], attributes = [], signal } = {}) {
+async function analyzeProductContext({ caption = '', title = '', filePaths = [], images = [], videoFiles = [], directory, categories = [], attributes = [], signal } = {}) {
   const base = captionSuggestion(caption, title, categories);
   if (!enabled()) return base;
   const temporary = []; let usedVideo = 0; let stage = 'media';
@@ -155,11 +155,18 @@ async function analyzeProductContext({ caption = '', title = '', filePaths = [],
       if (bytesUsed + buffer.length > 14 * 1024 * 1024) break;
       parts.push({ inlineData: { mimeType: 'image/jpeg', data: buffer.toString('base64') } }); bytesUsed += buffer.length;
     }
+    // Saved catalog photos are already compressed. Keep this path in memory;
+    // reel file preparation continues to use the existing bounded workflow.
+    for (const item of images.slice(0, 3)) {
+      if (!['image/jpeg', 'image/png', 'image/webp'].includes(item.mimeType) || !Buffer.isBuffer(item.buffer) || !item.buffer.length || item.buffer.length > 4 * 1024 * 1024) throw new Error('Invalid catalog photo');
+      if (bytesUsed + item.buffer.length > 14 * 1024 * 1024) break;
+      parts.push({ inlineData: { mimeType: item.mimeType, data: item.buffer.toString('base64') } }); bytesUsed += item.buffer.length;
+    }
     stage = 'provider';
     const { raw, model } = await generateGeminiJson({ parts, signal });
     stage = 'response';
     const ai = normalizeContext(raw, { caption, categories, attributes, videoCount: usedVideo });
-    const result = { ...base, ...Object.fromEntries(Object.entries(ai).filter(([,value]) => value !== '' && value !== undefined && !(Array.isArray(value) && !value.length))), fieldSources: { ...base.fieldSources, ...ai.fieldSources }, contextModel: model, contextInputs: { caption: Boolean(caption), photos: filePaths.length > 0, video: usedVideo > 0 }, contextPartial: usedVideo < videoFiles.length };
+    const result = { ...base, ...Object.fromEntries(Object.entries(ai).filter(([,value]) => value !== '' && value !== undefined && !(Array.isArray(value) && !value.length))), fieldSources: { ...base.fieldSources, ...ai.fieldSources }, contextModel: model, contextInputs: { caption: Boolean(caption), photos: filePaths.length + images.length > 0, video: usedVideo > 0 }, contextPartial: usedVideo < videoFiles.length };
     if (base.price && ai.price && base.price !== ai.price || base.originalPrice && ai.originalPrice && base.originalPrice !== ai.originalPrice) result.priceAmbiguous = true;
     if (result.priceAmbiguous || result.multipleProducts) { delete result.price; delete result.originalPrice; delete result.fieldSources.price; delete result.fieldSources.originalPrice; }
     return result;

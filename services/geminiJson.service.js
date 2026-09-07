@@ -24,6 +24,11 @@ function providerError(status, payload) {
     return aiError('AI_MODEL_UNAVAILABLE', 'The configured AI model and available fallbacks could not be used. Check the Gemini model available to your project.', true);
   }
   if (status === 429) return aiError('AI_QUOTA_EXCEEDED', 'The Gemini quota is currently exhausted. Wait for it to reset, then try again.');
+  if ([400, 401, 403].includes(status) && /reported.{0,20}leaked|leaked.{0,50}key|key.{0,50}leaked/i.test(detail)) {
+    // Preserve the shared access-denied code so bulk imports stop immediately.
+    // Never forward the provider payload, which may contain sensitive values.
+    return aiError('AI_ACCESS_DENIED', 'Google blocked this Gemini API key because it was reported as leaked. Create a replacement key in Google AI Studio, update GEMINI_API_KEY on the backend, then restart the backend. You can still fill details from pasted product notes.');
+  }
   if ([401, 403].includes(status) || status === 400 && /API.?key.*(?:not valid|invalid|expired)/i.test(detail)) {
     return aiError('AI_ACCESS_DENIED', 'Gemini rejected the API key or project access. Check the backend key and its permissions.');
   }

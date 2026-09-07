@@ -174,7 +174,7 @@ function resolveCodCharge(method, settings) {
 function resolveDeliveryCharge(sellingTotal, settings) {
   const freeAbove = Number(settings?.freeShippingMinAmount ?? 999);
   const charge = Number(settings?.deliveryCharge ?? 99);
-  return Number(sellingTotal || 0) >= freeAbove ? 0 : Math.max(0, charge);
+  return settings?.shippingFreeAboveEnabled !== false && Number(sellingTotal || 0) >= freeAbove ? 0 : Math.max(0, charge);
 }
 
 module.exports = {

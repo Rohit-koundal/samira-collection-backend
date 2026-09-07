@@ -13,6 +13,7 @@ function toShipmentStatus(orderStatus) {
 
 async function upsertShipmentForOrder(order, { courierName, trackingNumber, trackingUrl, awb, status, note } = {}) {
   if (!order) throw notFound('Order not found');
+  if (order.paymentMethod === 'COD' && order.codConfirmationStatus === 'PENDING') throw new ApiError('VALIDATION_ERROR', 'Confirm this cash-on-delivery order with the customer before arranging shipment.');
 
   const nextStatus = status || toShipmentStatus(order.orderStatus) || 'READY_TO_SHIP';
   const payload = {
@@ -26,6 +27,14 @@ async function upsertShipmentForOrder(order, { courierName, trackingNumber, trac
   let shipment = order.shipment
     ? await Shipment.findById(order.shipment._id || order.shipment)
     : await Shipment.findOne({ order: order._id });
+
+  if (shipment?.provider === 'bluedart') throw new ApiError('SHIPPING_VALIDATION', 'This shipment is managed by Blue Dart. Use courier booking, pickup and tracking actions.');
+  if (!Shipment.SHIPMENT_STATUSES.includes(nextStatus)) throw new ApiError('VALIDATION_ERROR', 'Choose a valid shipment status.');
+  if (trackingUrl) {
+    let url;
+    try { url = new URL(trackingUrl); } catch { throw new ApiError('VALIDATION_ERROR', 'Enter a valid tracking URL.'); }
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) throw new ApiError('VALIDATION_ERROR', 'Enter a valid HTTP or HTTPS tracking URL.');
+  }
 
   if (!shipment) {
     shipment = await Shipment.create({

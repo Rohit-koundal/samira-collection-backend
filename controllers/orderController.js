@@ -19,6 +19,7 @@ const { readAttribution } = require('../utils/attribution');
 const { logAudit } = require('../services/auditService');
 const { recordEventLater } = require('../services/analyticsService');
 const { normalizeIndianMobile } = require('../utils/phoneUtils');
+const { adminOrderFilter } = require('../services/dashboardAnalytics');
 
 const ORDER_STATUSES = ['Pending', 'Confirmed', 'Packed', 'Shipped', 'Out for Delivery', 'Delivered', 'Cancelled', 'Return Requested', 'Exchange Requested', 'Returned', 'Refunded'];
 const PAYMENT_STATUSES = ['Pending', 'Paid', 'Failed', 'Refunded'];
@@ -75,6 +76,7 @@ exports.quoteOrder = asyncHandler(async (req, res) => {
 
   return res.json({
     paymentMethod: draft.paymentMethod,
+    shipping: draft.shippingQuote,
     totals: draft.totals,
     items: draft.items,
     paymentOptions: buildPaymentOptions(settings, {
@@ -102,6 +104,7 @@ exports.createOrder = asyncHandler(async (req, res) => {
     tenantFilter: req.tenantFilter,
   });
 
+  require('../services/shippingRules').assertQuotedTotal(draft, req.body?.expectedTotal);
   const order = await runInTransaction(async (session) => {
     const [created] = await Order.create([{
       ...buildPersistedOrderFields({
@@ -223,8 +226,15 @@ exports.getOrder = asyncHandler(async (req, res) => {
 });
 
 exports.adminOrders = asyncHandler(async (req, res) => {
-  const filter = andFilter({}, req.tenantFilter);
-  const finder = () => Order.find(filter).populate('user', 'name email phone').sort('-createdAt');
+  let filter = await adminOrderFilter(req.query, req.tenantFilter);
+  if (req.query.deliveryStatus) {
+    const Shipment = require('../models/Shipment');
+    const status = requireEnum(req.query.deliveryStatus, Shipment.SHIPMENT_STATUSES, 'delivery status');
+    const shipments = await Shipment.find(andFilter({ status }, req.tenantFilter)).select('_id').lean();
+    const booked = { shipment: { $in: shipments.map(s => s._id) } };
+    filter = andFilter(filter, status === 'WAITING' ? { $or: [booked, { shipment: null, orderStatus: { $in: ['Pending', 'Confirmed', 'Packed'] } }] } : booked);
+  }
+  const finder = () => Order.find(filter).populate('user', 'name email phone').populate('shipment', 'provider status awb bookingState').sort({ createdAt: -1, _id: -1 });
   if (wantsPagination(req.query)) {
     const { page, limit, skip } = readPagination(req.query, { defaultLimit: 24, maxLimit: 100 });
     const [items, total] = await Promise.all([
@@ -251,13 +261,19 @@ exports.updateOrderStatus = asyncHandler(async (req, res) => {
     return res.json(await cancelOrderInternal(order, { req, actor: req.user, note: note || 'Cancelled by admin', force: true }));
   }
 
-  const before = { orderStatus: order.orderStatus };
+  if (order.paymentMethod === 'COD' && order.codConfirmationStatus === 'PENDING' && ['Packed', 'Shipped', 'Out for Delivery', 'Delivered'].includes(orderStatus)) {
+    throw new ApiError('VALIDATION_ERROR', 'Confirm this cash-on-delivery order with the customer, then mark it Confirmed before fulfilment.');
+  }
+  const before = { orderStatus: order.orderStatus, codConfirmationStatus: order.codConfirmationStatus };
+  const courierShipment = await require('../models/Shipment').findOne({ order: order._id, provider: 'bluedart', bookingState: { $in: ['BOOKED', 'BOOKING', 'UNKNOWN'] } });
+  if (courierShipment && ['Shipped', 'Out for Delivery', 'Delivered'].includes(orderStatus)) throw new ApiError('SHIPPING_VALIDATION', 'Refresh Blue Dart tracking to update delivery status for this shipment.');
+  if (order.paymentMethod === 'COD' && order.codConfirmationStatus === 'PENDING' && orderStatus === 'Confirmed') order.codConfirmationStatus = 'CONFIRMED';
   order.orderStatus = orderStatus;
   order.statusTimeline.push({ status: orderStatus, date: new Date(), note });
   if (orderStatus === 'Delivered') order.deliveredAt = order.deliveredAt || new Date();
   await order.save();
 
-  logAudit({ req, action: 'ORDER_STATUS_UPDATE', entityType: 'Order', entityId: order._id, storeId: order.storeId, before, after: { orderStatus: order.orderStatus } });
+  logAudit({ req, action: 'ORDER_STATUS_UPDATE', entityType: 'Order', entityId: order._id, storeId: order.storeId, before, after: { orderStatus: order.orderStatus, codConfirmationStatus: order.codConfirmationStatus } });
 
   if (toShipmentStatus(orderStatus)) {
     await upsertShipmentForOrder(order, { status: toShipmentStatus(orderStatus), note: note || `Order marked ${orderStatus}` }).catch(() => null);
@@ -333,6 +349,14 @@ exports.cancelOrder = asyncHandler(async (req, res) => {
  * cancellation, and restocking there would invent inventory.
  */
 async function cancelOrderInternal(order, { req, actor, note, force = false, source }) {
+  const delivery = require('../services/deliveryService');
+  return delivery.withOrderLock(order._id, async freshOrder => {
+    await delivery.cancelBooking(freshOrder);
+    return cancelAfterCourier(freshOrder, { req, actor, note, force, source });
+  });
+}
+
+async function cancelAfterCourier(order, { req, actor, note, force = false, source }) {
   if (order.orderStatus === 'Cancelled') return order;
 
   const allowed = force
@@ -434,6 +458,8 @@ async function buildReceipt(order) {
     billingAddress: order.billingAddress,
     shipment: order.shipment,
     storeDetails: {
+      logoUrl: settings?.logoUrl,
+      invoiceNote: settings?.invoiceNote,
       storeName: settings?.storeName || 'Samira Collection',
       legalBusinessName: settings?.legalBusinessName,
       gstin: settings?.gstin,

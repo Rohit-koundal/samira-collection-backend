@@ -191,6 +191,62 @@ const PRESET_OVERRIDES = {
     buttons: { borderRadius: 999, hoverEffect: 'glow' },
     theme: { preset: 'wedding' },
   },
+  pearl: {
+    colors: { primary: '#473c36', secondary: '#f2eee8', accent: '#a58153', background: '#fdfbf8' },
+    typography: { headingFont: 'Georgia', headingWeight: 400 },
+    buttons: { borderRadius: 4, style: 'solid', hoverEffect: 'darken' },
+    productCards: { borderRadius: 8, shadow: 'none', layout: 'minimal', imageRatio: '4/5' },
+    theme: { preset: 'pearl' },
+  },
+  midnight: {
+    colors: { primary: '#242b45', secondary: '#edf0f6', accent: '#aa8552', background: '#fafbfe' },
+    typography: { headingFont: 'Playfair Display', headingWeight: 600 },
+    buttons: { borderRadius: 8, style: 'solid', hoverEffect: 'lift' },
+    productCards: { borderRadius: 12, shadow: 'soft', layout: 'classic', imageRatio: '3/4' },
+    theme: { preset: 'midnight' },
+  },
+  champagne: {
+    colors: { primary: '#6c5139', secondary: '#f6eddf', accent: '#b58e56', background: '#fffdf7' },
+    typography: { headingFont: 'Georgia', headingWeight: 400 },
+    buttons: { borderRadius: 999, style: 'solid', hoverEffect: 'darken' },
+    productCards: { borderRadius: 16, shadow: 'soft', layout: 'classic', imageRatio: '4/5' },
+    theme: { preset: 'champagne' },
+  },
+  terracotta: {
+    colors: { primary: '#904832', secondary: '#faeee5', accent: '#b18856', background: '#fffaf5' },
+    typography: { headingFont: 'Georgia', headingWeight: 700 },
+    buttons: { borderRadius: 12, style: 'solid', hoverEffect: 'lift' },
+    productCards: { borderRadius: 16, shadow: 'none', layout: 'classic', imageRatio: '4/5' },
+    theme: { preset: 'terracotta' },
+  },
+  emerald: {
+    colors: { primary: '#174e42', secondary: '#edf4ef', accent: '#b28a4b', background: '#fbfdf9' },
+    typography: { headingFont: 'Playfair Display', headingWeight: 600 },
+    buttons: { borderRadius: 6, style: 'solid', hoverEffect: 'darken' },
+    productCards: { borderRadius: 10, shadow: 'soft', layout: 'classic', imageRatio: '3/4' },
+    theme: { preset: 'emerald' },
+  },
+  lilac: {
+    colors: { primary: '#644678', secondary: '#f2edf7', accent: '#a18465', background: '#fdfaff' },
+    typography: { headingFont: 'Inter', headingWeight: 600 },
+    buttons: { borderRadius: 24, style: 'solid', hoverEffect: 'lift' },
+    productCards: { borderRadius: 20, shadow: 'soft', layout: 'classic', imageRatio: '4/5' },
+    theme: { preset: 'lilac' },
+  },
+  coastal: {
+    colors: { primary: '#32616a', secondary: '#eaf3f2', accent: '#aa895a', background: '#fafdfa' },
+    typography: { headingFont: 'Georgia', headingWeight: 400 },
+    buttons: { borderRadius: 8, style: 'outline', hoverEffect: 'none' },
+    productCards: { borderRadius: 8, shadow: 'none', layout: 'minimal', imageRatio: '4/5' },
+    theme: { preset: 'coastal' },
+  },
+  graphite: {
+    colors: { primary: '#30343b', secondary: '#eef0f2', accent: '#787f8b', background: '#ffffff' },
+    typography: { headingFont: 'Inter', headingWeight: 600 },
+    buttons: { borderRadius: 8, style: 'solid', hoverEffect: 'darken' },
+    productCards: { borderRadius: 10, shadow: 'none', layout: 'compact', imageRatio: '4/5' },
+    theme: { preset: 'graphite' },
+  },
 };
 
 const PRESET_LABELS = {
@@ -201,6 +257,14 @@ const PRESET_LABELS = {
   sale: 'Sale Theme',
   wedding: 'Wedding Theme',
   sage: 'Botanical Sage', rose: 'Soft Rose', indigo: 'Indigo Heritage',
+  pearl: 'Pearl Atelier',
+  midnight: 'Midnight Studio',
+  champagne: 'Champagne Edit',
+  terracotta: 'Terracotta Muse',
+  emerald: 'Emerald Luxe',
+  lilac: 'Lilac Bloom',
+  coastal: 'Coastal Linen',
+  graphite: 'Modern Graphite',
 };
 
 function clone(value) {
@@ -361,7 +425,7 @@ function buildPresetConfig(preset = 'default') {
   return config;
 }
 
-function getPresetList() {
+function getPresetList({ appearanceOnly = false } = {}) {
   const descriptions = {
     default: 'The original Samira wine and ivory look.',
     premium: 'Rich wine, warm gold and elevated cards.',
@@ -372,11 +436,40 @@ function getPresetList() {
     sage: 'Calm green, warm neutrals and soft corners.',
     rose: 'Blush tones and softly rounded cards.',
     indigo: 'Classic blue with subtle gold accents.',
+    pearl: 'Warm ivory, delicate serif type and quiet borders.',
+    midnight: 'Deep navy, portrait cards and polished details.',
+    champagne: 'Soft gold, warm neutrals and elegant curves.',
+    terracotta: 'Earthy clay tones with a relaxed editorial feel.',
+    emerald: 'Jewel green and gold for occasion collections.',
+    lilac: 'Airy lavender, modern type and soft corners.',
+    coastal: 'Linen whites, muted teal and fine outlines.',
+    graphite: 'Crisp monochrome and compact contemporary cards.',
+  };
+  const collections = {
+    default: 'Signature', premium: 'Signature', indigo: 'Signature',
+    minimal: 'Minimal', festive: 'Celebration', sale: 'Celebration', wedding: 'Celebration',
+    sage: 'Nature', rose: 'Nature',
+    pearl: 'Minimal',
+    midnight: 'Signature',
+    champagne: 'Celebration',
+    terracotta: 'Nature',
+    emerald: 'Celebration',
+    lilac: 'Nature',
+    coastal: 'Nature',
+    graphite: 'Minimal',
   };
   return Object.keys(PRESET_OVERRIDES).map((id) => {
     const config = buildPresetConfig(id);
-    return { id, name: PRESET_LABELS[id], description: descriptions[id],
-      swatches: { primary: config.colors.primary, secondary: config.colors.secondary, accent: config.colors.accent, background: config.colors.background }, config };
+    // Avoid repeating default catalog, menus and home content in gallery entries.
+    // The full configuration remains the default for existing API consumers.
+    const appearance = appearanceOnly ? {
+      schemaVersion: config.schemaVersion, colors: config.colors, typography: config.typography,
+      buttons: config.buttons, productCards: config.productCards, theme: config.theme,
+      header: Object.fromEntries(['background', 'textColor', 'announcementBackground', 'announcementTextColor'].map((key) => [key, config.header[key]])),
+      footer: { background: config.footer.background, textColor: config.footer.textColor },
+    } : config;
+    return { id, name: PRESET_LABELS[id], description: descriptions[id], collection: collections[id],
+      swatches: { primary: config.colors.primary, secondary: config.colors.secondary, accent: config.colors.accent, background: config.colors.background }, config: appearance };
   });
 }
 
