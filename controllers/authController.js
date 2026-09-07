@@ -11,7 +11,7 @@ const { getDemoOtp, getJwtRefreshSecret, getJwtSecret, getOtpMode, isDemoOtpMode
 const { ApiError } = require('../utils/apiError');
 const { listMemberships } = require('../services/storeService');
 const { normalizeIndianMobile } = require('../utils/phoneUtils');
-const { isLocalOwnerDemoRequest, allowsOwnerDemoSession } = require('../config/localOwnerDemo');
+const { getOwnerDemoProvider, allowsOwnerDemoSession } = require('../config/localOwnerDemo');
 
 const otpRateLimit = new Map();
 const offlineProfiles = new Map();
@@ -205,7 +205,7 @@ exports.sendOtp = async (req, res) => {
       return res.status(503).json({ message: 'Owner login requires a connected database and configured session secrets.' });
     }
     const purpose = isOwnerPhone(phone)
-      ? (isLocalOwnerDemoRequest(req) ? 'master_demo_login' : 'master_login') : 'login';
+      ? (getOwnerDemoProvider(req) ? 'master_demo_login' : 'master_login') : 'login';
     const { otp, record } = await createOtp(phone, purpose, req);
     const delivery = await deliverOtpWithFallback(phone, otp, record, req);
     res.json({ success: true, message: 'OTP sent successfully', ...otpResponse(delivery) });
@@ -219,12 +219,14 @@ exports.resendOtp = exports.sendOtp;
 exports.verifyOtp = async (req, res) => {
   try {
     const { phone, record } = await verifyOtpRecord(req.body.phone, req.body.otp, req);
-    const localOwnerDemo = record.purpose === 'master_demo_login' && isLocalOwnerDemoRequest(req);
-    if (isOwnerPhone(phone) && (mongoose.connection.readyState !== 1 || (!localOwnerDemo && (record.purpose !== 'master_login' || !record.trustedDelivery)))) {
+    const demoOwner = record.purpose === 'master_demo_login' && record.provider === getOwnerDemoProvider(req);
+    const localOwnerDemo = demoOwner && record.provider === 'local-demo';
+    const hostedOwnerDemo = demoOwner && record.provider === 'hosted-demo';
+    if (isOwnerPhone(phone) && (mongoose.connection.readyState !== 1 || (!demoOwner && (record.purpose !== 'master_login' || !record.trustedDelivery)))) {
       return res.status(403).json({ message: 'Please request and verify a new owner OTP delivered by SMS.' });
     }
     const user = mongoose.connection.readyState === 1
-      ? await upsertPhoneLoginUser(phone, { activeMode: 'customer', masterVerified: isOwnerPhone(phone), localOwnerDemo })
+      ? await upsertPhoneLoginUser(phone, { activeMode: 'customer', masterVerified: isOwnerPhone(phone), localOwnerDemo, hostedOwnerDemo })
       : buildOfflineLoginUser(phone, { activeMode: 'customer' });
     res.json({ success: true, ...authPayload(user) });
   } catch (error) {
@@ -258,7 +260,7 @@ exports.refresh = async (req, res) => {
   try {
     const decoded = jwt.verify(token, getJwtRefreshSecret());
     if (decoded.tokenType !== 'refresh') return res.status(401).json({ message: 'Invalid refresh token' });
-    if (!allowsOwnerDemoSession(decoded, req)) return res.status(401).json({ message: 'This demo session only works on the local demo server. Please log in again.' });
+    if (!allowsOwnerDemoSession(decoded, req)) return res.status(401).json({ message: 'This demo session is not enabled on this server. Please log in again.' });
 
     let user;
     if (canRefreshOfflineSession(decoded)) {
@@ -326,9 +328,9 @@ function getAdminPhones() {
   return String(process.env.ADMIN_PHONE_NUMBERS || '').split(',').map((item) => normalizePhone(item)).filter(Boolean);
 }
 
-async function upsertPhoneLoginUser(phone, { activeMode = 'customer', masterVerified = false, localOwnerDemo = false } = {}) {
+async function upsertPhoneLoginUser(phone, { activeMode = 'customer', masterVerified = false, localOwnerDemo = false, hostedOwnerDemo = false } = {}) {
   const isAdminPhone = getAdminPhones().includes(phone) || masterVerified;
-  const ownerVersion = masterVerified ? `${localOwnerDemo ? 'local-demo:' : ''}${crypto.randomUUID()}` : undefined;
+  const ownerVersion = masterVerified ? `${hostedOwnerDemo ? 'hosted-demo:' : localOwnerDemo ? 'local-demo:' : ''}${crypto.randomUUID()}` : undefined;
   let user = await User.findOne({ phone });
   if (!user) {
     user = await User.create({
@@ -341,7 +343,7 @@ async function upsertPhoneLoginUser(phone, { activeMode = 'customer', masterVeri
       activeMode,
       ...(masterVerified ? { systemRole: 'MASTER_OWNER', masterSessionVersion: ownerVersion } : {}),
     });
-    if (masterVerified) attachMasterSession(user, { masterSessionVersion: ownerVersion, localOwnerDemo });
+    if (masterVerified) attachMasterSession(user, { masterSessionVersion: ownerVersion, localOwnerDemo, hostedOwnerDemo });
     return user;
   }
 
@@ -364,7 +366,7 @@ async function upsertPhoneLoginUser(phone, { activeMode = 'customer', masterVeri
   user.activeMode = activeMode;
   if (masterVerified) { user.systemRole = 'MASTER_OWNER'; user.masterSessionVersion = ownerVersion; }
   await user.save();
-  if (masterVerified) attachMasterSession(user, { masterSessionVersion: ownerVersion, localOwnerDemo });
+  if (masterVerified) attachMasterSession(user, { masterSessionVersion: ownerVersion, localOwnerDemo, hostedOwnerDemo });
   return user;
 }
 
@@ -413,8 +415,8 @@ function canRefreshOfflineSession(decoded) {
  */
 async function deliverOtpWithFallback(phone, otp, record, req) {
   const owner = isOwnerPhone(phone);
-  if (owner && record?.purpose === 'master_demo_login' && isLocalOwnerDemoRequest(req)) {
-    return { success: true, provider: 'local-demo', demoOtp: getDemoOtp() };
+  if (owner && record?.purpose === 'master_demo_login' && record.provider === getOwnerDemoProvider(req)) {
+    return { success: true, provider: record.provider, demoOtp: getDemoOtp() };
   }
   const delivery = await sendOtp(phone, otp, { requireReal: owner });
   if (owner) {

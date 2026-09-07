@@ -386,7 +386,7 @@ function localDemoRequest(body = {}, extra = {}) {
 }
 
 function enableLocalDemo(t) {
-  const values = { NODE_ENV: 'production', OTP_MODE: 'demo', LOCAL_OWNER_DEMO: 'true', DEMO_OTP: '123456',
+  const values = { NODE_ENV: 'production', OTP_MODE: 'demo', LOCAL_OWNER_DEMO: 'true', ALLOW_HOSTED_OWNER_DEMO: 'false', DEMO_OTP: '123456',
     JWT_SECRET: 'local-demo-unit-access', JWT_REFRESH_SECRET: 'local-demo-unit-refresh', OTP_RESEND_COOLDOWN_SECONDS: '60' };
   const previous = Object.fromEntries(Object.keys(values).map(key => [key, process.env[key]]));
   Object.assign(process.env, values);
@@ -489,4 +489,105 @@ test('local demo OTP expiry and attempt limits remain enforced', async (t) => {
   assert.equal(record.isUsed, true);
   record.isUsed = false; record.expiresAt = new Date(Date.now() + 60000); record.attempts = 5;
   await assert.rejects(otpService.verifyOtp('9816978086', '123456', localDemoRequest()), /Maximum OTP attempts/);
+});
+
+function hostedDemoRequest(body = {}, extra = {}) {
+  return {
+    body, ip: 'hosted-demo-unit', socket: { remoteAddress: '10.0.0.2', localAddress: '10.0.0.3' },
+    headers: { host: 'demo-store.example', origin: 'https://demo-shop.example', 'x-forwarded-proto': 'https', 'x-forwarded-for': '203.0.113.5' },
+    ...extra,
+  };
+}
+
+test('hosted owner demo requires both explicit settings and takes precedence over local binding', (t) => {
+  enableLocalDemo(t);
+  const demo = require('../config/localOwnerDemo');
+  assert.equal(demo.getOwnerDemoProvider(hostedDemoRequest()), '');
+  process.env.ALLOW_HOSTED_OWNER_DEMO = 'true';
+  assert.equal(demo.isHostedOwnerDemoEnabled(), true);
+  assert.equal(demo.isLocalOwnerDemoEnabled(), false);
+  assert.equal(demo.getOwnerDemoProvider(hostedDemoRequest()), 'hosted-demo');
+  assert.equal(demo.allowsOwnerDemoSession({ localOwnerDemo: true }, hostedDemoRequest()), false);
+  assert.equal(demo.allowsOwnerDemoSession({ hostedOwnerDemo: true }, hostedDemoRequest()), true);
+  assert.equal(demo.allowsOwnerDemoSession({ hostedOwnerDemo: true, localOwnerDemo: true }, hostedDemoRequest()), false);
+  for (const mode of ['production', '', 'invalid']) {
+    process.env.OTP_MODE = mode;
+    assert.equal(demo.isHostedOwnerDemoEnabled(), false);
+    assert.equal(demo.getOwnerDemoProvider(hostedDemoRequest()), '');
+    assert.equal(demo.allowsOwnerDemoSession({ hostedOwnerDemo: true }, hostedDemoRequest()), false);
+  }
+  delete process.env.OTP_MODE;
+  assert.equal(demo.isHostedOwnerDemoEnabled(), false);
+});
+
+test('hosted demo works through a proxy and its OTPs and sessions stop working when disabled', async (t) => {
+  enableLocalDemo(t);
+  process.env.ALLOW_HOSTED_OWNER_DEMO = 'true'; process.env.DEMO_OTP = '654321';
+  const previousState = mongoose.connection.readyState; mongoose.connection.readyState = 1;
+  t.after(() => { mongoose.connection.readyState = previousState; });
+  const sms = t.mock.method(require('../services/providers/twilioSmsProvider'), 'sendOtp', async () => assert.fail('Hosted demo must not send SMS'));
+  const controller = require('../controllers/authController');
+  const { protect, optionalProtect } = require('../middleware/authMiddleware');
+  const jwt = require('jsonwebtoken');
+  let record;
+  t.mock.method(Otp, 'findOne', () => ({ sort: async () => record && !record.isUsed ? record : null }));
+  t.mock.method(Otp, 'updateMany', async () => {});
+  t.mock.method(Otp, 'create', async value => {
+    record = { ...value, _id: 'hosted-otp', isUsed: false, trustedDelivery: false, attempts: 0, createdAt: new Date(), save: async () => record };
+    return record;
+  });
+  t.mock.method(Otp, 'updateOne', async () => { record.attempts += 1; });
+  t.mock.method(Otp, 'findOneAndUpdate', async predicate => {
+    assert.equal(predicate.purpose, 'master_demo_login'); assert.equal(predicate.trustedDelivery, false);
+    assert.equal(predicate.provider, 'hosted-demo'); assert.deepEqual(predicate.attempts, { $lt: 5 });
+    assert.ok(predicate.expiresAt.$gt instanceof Date);
+    if (record.isUsed) return null;
+    record.isUsed = true; return record;
+  });
+  const user = { _id: '0123456789abcdef01234567', phone: '9816978086', name: 'Owner', role: 'customer', save: async () => user };
+  t.mock.method(User, 'findOne', async () => user);
+  t.mock.method(User, 'findById', () => ({ select: async () => user }));
+  const body = { phone: '9816978086' };
+  const sent = response(); await controller.sendOtp(hostedDemoRequest(body), sent);
+  assert.equal(sent.statusCode, 200); assert.equal(sent.body.demoOtp, '654321'); assert.equal(sent.body.otpMode, 'demo');
+  assert.equal(record.provider, 'hosted-demo'); assert.equal(record.trustedDelivery, false);
+  const earlyResend = response(); await controller.resendOtp(hostedDemoRequest(body), earlyResend); assert.equal(earlyResend.statusCode, 429);
+  const wrong = response(); await controller.verifyOtp(hostedDemoRequest({ ...body, otp: '000000' }), wrong);
+  assert.equal(wrong.statusCode, 400); assert.equal(record.attempts, 1);
+  process.env.ALLOW_HOSTED_OWNER_DEMO = 'false';
+  const disabledOtp = response(); await controller.verifyOtp(hostedDemoRequest({ ...body, otp: '654321' }), disabledOtp);
+  assert.equal(disabledOtp.statusCode, 403); assert.equal(record.isUsed, false);
+  process.env.ALLOW_HOSTED_OWNER_DEMO = 'true';
+  const verified = response(); await controller.verifyOtp(hostedDemoRequest({ ...body, otp: '654321' }), verified);
+  assert.equal(verified.statusCode, 200); assert.equal(verified.body.user.systemRole, 'MASTER_OWNER');
+  assert.equal(jwt.decode(verified.body.token).hostedOwnerDemo, true);
+  assert.equal(jwt.decode(verified.body.token).localOwnerDemo, undefined);
+  const switched = response(); await controller.switchMode({ user, body: { mode: 'admin' }, query: {} }, switched);
+  assert.equal(policy.isMasterOwner(user), true); assert.equal(jwt.decode(switched.body.token).hostedOwnerDemo, true);
+  const accessReq = hostedDemoRequest({}, { headers: { ...hostedDemoRequest().headers, authorization: `Bearer ${switched.body.token}` } });
+  let authorized = false; await protect(accessReq, response(), () => { authorized = true; }); assert.equal(authorized, true);
+  const refreshed = response(); await controller.refresh(hostedDemoRequest({ refreshToken: switched.body.refreshToken }), refreshed);
+  assert.equal(refreshed.statusCode, 200); assert.equal(jwt.decode(refreshed.body.token).hostedOwnerDemo, true);
+  const replay = response(); await controller.verifyOtp(hostedDemoRequest({ ...body, otp: '654321' }), replay); assert.equal(replay.statusCode, 400);
+  await assert.rejects(require('../services/clientHandoverService').assertClientHandoverReady(), /production OTP/);
+  for (const mode of ['disabled', 'production']) {
+    process.env.ALLOW_HOSTED_OWNER_DEMO = mode === 'disabled' ? 'false' : 'true';
+    process.env.OTP_MODE = mode === 'production' ? 'production' : 'demo';
+    const rejectedAccess = response(); await protect(accessReq, rejectedAccess, () => assert.fail('Disabled demo access must fail'));
+    assert.equal(rejectedAccess.statusCode, 401);
+    const optionalReq = hostedDemoRequest({}, { headers: accessReq.headers });
+    await optionalProtect(optionalReq, response(), () => {}); assert.equal(optionalReq.user, undefined);
+    const rejectedRefresh = response(); await controller.refresh(hostedDemoRequest({ refreshToken: refreshed.body.refreshToken }), rejectedRefresh);
+    assert.equal(rejectedRefresh.statusCode, 401);
+  }
+  assert.equal(sms.mock.callCount(), 0);
+  assert.equal(policy.isMasterOwner(policy.attachMasterSession(user, { masterSessionVersion: user.masterSessionVersion })), false);
+  const realSms = t.mock.method(require('../services/providers/twilioSmsProvider'), 'sendOtp', async () => ({ success: true, provider: 'twilio' }));
+  const savedSmsProvider = process.env.SMS_PROVIDER;
+  process.env.SMS_PROVIDER = 'twilio';
+  t.after(() => { if (savedSmsProvider === undefined) delete process.env.SMS_PROVIDER; else process.env.SMS_PROVIDER = savedSmsProvider; });
+  const liveOtp = response(); await controller.sendOtp(hostedDemoRequest(body), liveOtp);
+  assert.equal(liveOtp.statusCode, 200); assert.equal(liveOtp.body.otpMode, 'production');
+  assert.equal(liveOtp.body.demoOtp, undefined); assert.equal(realSms.mock.callCount(), 1);
+  assert.equal(record.purpose, 'master_login'); assert.equal(record.trustedDelivery, true);
 });

@@ -3,7 +3,7 @@ const mongoose = require('mongoose');
 const Otp = require('../models/Otp');
 const { normalizePhone, requireValidPhone } = require('../utils/phoneUtils');
 const { getDemoOtp, getJwtSecret, isDemoOtpMode } = require('../config/env');
-const { isLocalOwnerDemoRequest } = require('../config/localOwnerDemo');
+const { getOwnerDemoProvider } = require('../config/localOwnerDemo');
 
 const memoryOtps = new Map();
 
@@ -102,8 +102,9 @@ async function createEmailOtp(email, purpose = 'profile_email_change', req) {
 }
 
 async function createTargetOtp(target, { purpose = 'login', req, targetType = 'phone' } = {}) {
-  if (purpose === 'master_demo_login' && !isLocalOwnerDemoRequest(req)) {
-    const error = new Error('Owner demo login is only available on the local demo server.');
+  const demoProvider = purpose === 'master_demo_login' ? getOwnerDemoProvider(req) : '';
+  if (purpose === 'master_demo_login' && !demoProvider) {
+    const error = new Error('Owner demo login is not enabled for this request. Please request a new OTP.');
     error.statusCode = 403;
     throw error;
   }
@@ -150,7 +151,7 @@ async function createTargetOtp(target, { purpose = 'login', req, targetType = 'p
     targetType,
     otpHash: hashOtp(normalizedTarget, otp),
     purpose,
-    provider: purpose === 'master_demo_login' ? 'local-demo' : process.env.OTP_PROVIDER || process.env.SMS_PROVIDER || 'mock',
+    provider: demoProvider || process.env.OTP_PROVIDER || process.env.SMS_PROVIDER || 'mock',
     expiresAt: new Date(Date.now() + getExpiryMinutes() * 60 * 1000),
     maxAttempts: getMaxAttempts(),
     resendCount: resend.latest ? resend.latest.resendCount + 1 : 0,
@@ -187,8 +188,8 @@ async function verifyTargetOtp(target, otp, { targetType = 'phone', req } = {}) 
     throw error;
   }
   const ownerDemo = record.purpose === 'master_demo_login';
-  if (ownerDemo && (!isLocalOwnerDemoRequest(req) || record.provider !== 'local-demo')) {
-    const error = new Error('Owner demo login is only available on the local demo server.');
+  if (ownerDemo && (!getOwnerDemoProvider(req) || record.provider !== getOwnerDemoProvider(req))) {
+    const error = new Error('Owner demo login is not enabled for this request. Please request a new OTP.');
     error.statusCode = 403;
     throw error;
   }
@@ -222,7 +223,7 @@ async function verifyTargetOtp(target, otp, { targetType = 'phone', req } = {}) 
     // Atomically redeem once: parallel verify requests cannot reuse an owner OTP.
     const redeemed = await Otp.findOneAndUpdate({
       _id: record._id, isUsed: false, purpose: record.purpose, trustedDelivery: !ownerDemo, otpHash: record.otpHash,
-      ...(ownerDemo ? { provider: 'local-demo' } : {}),
+      ...(ownerDemo ? { provider: record.provider } : {}),
       attempts: { $lt: record.maxAttempts }, expiresAt: { $gt: new Date() },
     }, { $set: { isUsed: true } }, { new: true });
     if (!redeemed) {

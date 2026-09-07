@@ -1,7 +1,14 @@
 const { isDemoOtpMode } = require('./env');
 
+function isHostedOwnerDemoEnabled() {
+  // Hosted owner access requires both explicit settings; an unset OTP_MODE
+  // must never turn on the public demo through the legacy customer default.
+  return process.env.ALLOW_HOSTED_OWNER_DEMO === 'true'
+    && String(process.env.OTP_MODE || '').trim().toLowerCase() === 'demo';
+}
+
 function isLocalOwnerDemoEnabled() {
-  return process.env.LOCAL_OWNER_DEMO === 'true' && isDemoOtpMode();
+  return process.env.LOCAL_OWNER_DEMO === 'true' && isDemoOtpMode() && !isHostedOwnerDemoEnabled();
 }
 
 function isLoopback(address) {
@@ -33,7 +40,14 @@ function isLocalOwnerDemoRequest(req) {
 }
 
 function allowsOwnerDemoSession(claims, req) {
+  if (claims?.localOwnerDemo && claims?.hostedOwnerDemo) return false;
+  if (claims?.hostedOwnerDemo) return isHostedOwnerDemoEnabled();
   return !claims?.localOwnerDemo || isLocalOwnerDemoRequest(req);
 }
 
-module.exports = { isLocalOwnerDemoEnabled, isLocalOwnerDemoRequest, allowsOwnerDemoSession };
+function getOwnerDemoProvider(req) {
+  if (isHostedOwnerDemoEnabled()) return 'hosted-demo';
+  return isLocalOwnerDemoRequest(req) ? 'local-demo' : '';
+}
+
+module.exports = { isLocalOwnerDemoEnabled, isLocalOwnerDemoRequest, isHostedOwnerDemoEnabled, getOwnerDemoProvider, allowsOwnerDemoSession };

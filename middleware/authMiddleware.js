@@ -13,7 +13,7 @@ async function protect(req, res, next) {
   try {
     const decoded = jwt.verify(token, getJwtSecret());
     if (decoded.tokenType && decoded.tokenType !== 'access') return res.status(401).json({ success: false, code: 'UNAUTHORIZED', message: 'Access token required' });
-    if (!allowsOwnerDemoSession(decoded, req)) return res.status(401).json({ success: false, code: 'UNAUTHORIZED', message: 'This demo session only works on the local demo server. Please log in again.' });
+    if (!allowsOwnerDemoSession(decoded, req)) return res.status(401).json({ success: false, code: 'UNAUTHORIZED', message: 'This demo session is not enabled on this server. Please log in again.' });
     if (canUseOfflineSession(decoded)) {
       req.user = buildOfflineUser(decoded);
       return next();

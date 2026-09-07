@@ -13,6 +13,7 @@ function tokenPayload(user) {
     offlineSession: !!user.offlineSession,
     ...(user.$locals?.masterAuthenticated && user.masterSessionVersion ? { masterSessionVersion: user.masterSessionVersion } : {}),
     ...(user.$locals?.localOwnerDemo ? { localOwnerDemo: true } : {}),
+    ...(user.$locals?.hostedOwnerDemo ? { hostedOwnerDemo: true } : {}),
   };
 }
 
