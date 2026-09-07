@@ -374,3 +374,119 @@ test('real-delivery owner OTP flow grants master access only after verification 
     }
   }
 });
+
+function localDemoRequest(body = {}, extra = {}) {
+  return {
+    body, ip: 'local-demo-unit',
+    app: { locals: { localOwnerDemo: true } },
+    socket: { remoteAddress: '127.0.0.1', localAddress: '127.0.0.1' },
+    headers: { host: 'localhost:5000', origin: 'http://localhost:3000' },
+    ...extra,
+  };
+}
+
+function enableLocalDemo(t) {
+  const values = { NODE_ENV: 'production', OTP_MODE: 'demo', LOCAL_OWNER_DEMO: 'true', DEMO_OTP: '123456',
+    JWT_SECRET: 'local-demo-unit-access', JWT_REFRESH_SECRET: 'local-demo-unit-refresh', OTP_RESEND_COOLDOWN_SECONDS: '60' };
+  const previous = Object.fromEntries(Object.keys(values).map(key => [key, process.env[key]]));
+  Object.assign(process.env, values);
+  t.after(() => Object.keys(values).forEach(key => {
+    if (previous[key] === undefined) delete process.env[key]; else process.env[key] = previous[key];
+  }));
+}
+
+test('local owner demo requires explicit opt-in, a loopback listener and direct local requests', (t) => {
+  enableLocalDemo(t);
+  const { isLocalOwnerDemoRequest } = require('../config/localOwnerDemo');
+  assert.equal(isLocalOwnerDemoRequest(localDemoRequest()), true);
+  for (const extra of [
+    { app: { locals: {} } },
+    { socket: { remoteAddress: '192.168.1.2', localAddress: '127.0.0.1' } },
+    { headers: { host: 'samira.example', origin: 'https://samira.example' } },
+    { headers: { host: 'localhost:5000', origin: 'https://untrusted.example' } },
+    { headers: { host: 'localhost.evil.example:5000' } },
+    { headers: { host: 'localhost:5000', 'x-forwarded-for': '127.0.0.1' } },
+    { headers: { host: 'localhost:5000', forwarded: 'for=127.0.0.1' } },
+  ]) assert.equal(isLocalOwnerDemoRequest(localDemoRequest({}, extra)), false);
+  process.env.OTP_MODE = 'production';
+  assert.equal(isLocalOwnerDemoRequest(localDemoRequest()), false);
+  process.env.OTP_MODE = 'demo'; delete process.env.LOCAL_OWNER_DEMO;
+  assert.equal(isLocalOwnerDemoRequest(localDemoRequest()), false);
+});
+
+test('local demo completes OTP, admin mode and refresh without SMS, while replay and remote sessions fail', async (t) => {
+  enableLocalDemo(t);
+  const previousState = mongoose.connection.readyState;
+  mongoose.connection.readyState = 1;
+  t.after(() => { mongoose.connection.readyState = previousState; });
+  const sms = t.mock.method(require('../services/providers/twilioSmsProvider'), 'sendOtp', async () => assert.fail('Local demo must not send SMS'));
+  const controller = require('../controllers/authController');
+  const { protect, optionalProtect } = require('../middleware/authMiddleware');
+  const jwt = require('jsonwebtoken');
+  let record;
+  t.mock.method(Otp, 'findOne', () => ({ sort: async () => record && !record.isUsed ? record : null }));
+  t.mock.method(Otp, 'updateMany', async () => {});
+  t.mock.method(Otp, 'create', async value => {
+    record = { ...value, _id: 'local-otp', isUsed: false, trustedDelivery: false, attempts: 0, createdAt: new Date(), save: async () => record };
+    return record;
+  });
+  t.mock.method(Otp, 'updateOne', async () => { record.attempts += 1; });
+  t.mock.method(Otp, 'findOneAndUpdate', async predicate => {
+    assert.equal(predicate.purpose, 'master_demo_login');
+    assert.equal(predicate.trustedDelivery, false);
+    assert.equal(predicate.provider, 'local-demo');
+    if (record.isUsed) return null;
+    record.isUsed = true; return record;
+  });
+  const user = { _id: '0123456789abcdef01234567', phone: '9816978086', name: 'Owner', role: 'customer', save: async () => user };
+  t.mock.method(User, 'findOne', async () => user);
+  t.mock.method(User, 'findById', () => ({ select: async () => user }));
+  const body = { phone: '9816978086' };
+  const sent = response(); await controller.sendOtp(localDemoRequest(body), sent);
+  assert.equal(sent.statusCode, 200);
+  assert.equal(sent.body.otpMode, 'demo'); assert.equal(sent.body.demoOtp, '123456');
+  assert.equal(record.purpose, 'master_demo_login'); assert.equal(record.trustedDelivery, false);
+  const earlyResend = response(); await controller.resendOtp(localDemoRequest(body), earlyResend);
+  assert.equal(earlyResend.statusCode, 429);
+  const wrong = response(); await controller.verifyOtp(localDemoRequest({ ...body, otp: '000000' }), wrong);
+  assert.equal(wrong.statusCode, 400); assert.equal(record.attempts, 1);
+  const remoteVerify = response(); await controller.verifyOtp(localDemoRequest({ ...body, otp: '123456' }, { headers: { host: 'live.example' } }), remoteVerify);
+  assert.equal(remoteVerify.statusCode, 403); assert.equal(record.isUsed, false);
+  const verified = response(); await controller.verifyOtp(localDemoRequest({ ...body, otp: '123456' }), verified);
+  assert.equal(verified.statusCode, 200); assert.equal(verified.body.user.systemRole, 'MASTER_OWNER');
+  assert.equal(jwt.decode(verified.body.token).localOwnerDemo, true);
+  const switched = response(); await controller.switchMode({ user, body: { mode: 'admin' }, query: {} }, switched);
+  assert.equal(policy.isMasterOwner(user), true);
+  assert.equal(jwt.decode(switched.body.token).localOwnerDemo, true);
+  const accessReq = localDemoRequest({}, { headers: { ...localDemoRequest().headers, authorization: `Bearer ${switched.body.token}` } });
+  let authorized = false;
+  await protect(accessReq, response(), () => { authorized = true; }); assert.equal(authorized, true);
+  const refreshed = response(); await controller.refresh(localDemoRequest({ refreshToken: switched.body.refreshToken }), refreshed);
+  assert.equal(refreshed.statusCode, 200); assert.equal(jwt.decode(refreshed.body.token).localOwnerDemo, true);
+  const remoteReq = { headers: { host: 'live.example', authorization: `Bearer ${refreshed.body.token}` } };
+  const rejectedAccess = response(); await protect(remoteReq, rejectedAccess, () => assert.fail('Must reject remote demo access'));
+  assert.equal(rejectedAccess.statusCode, 401);
+  await optionalProtect(remoteReq, response(), () => {}); assert.equal(remoteReq.user, undefined);
+  const rejectedRefresh = response(); await controller.refresh({ body: { refreshToken: refreshed.body.refreshToken } }, rejectedRefresh);
+  assert.equal(rejectedRefresh.statusCode, 401);
+  const replay = response(); await controller.verifyOtp(localDemoRequest({ ...body, otp: '123456' }), replay);
+  assert.equal(replay.statusCode, 400);
+  await assert.rejects(require('../services/clientHandoverService').assertClientHandoverReady(), /production OTP/);
+  assert.equal(sms.mock.callCount(), 0);
+  // Neither a guessed marker nor an old token may promote an existing session.
+  assert.equal(policy.isMasterOwner(policy.attachMasterSession(user, { masterSessionVersion: user.masterSessionVersion })), false);
+});
+
+test('local demo OTP expiry and attempt limits remain enforced', async (t) => {
+  enableLocalDemo(t);
+  const previousState = mongoose.connection.readyState; mongoose.connection.readyState = 1;
+  t.after(() => { mongoose.connection.readyState = previousState; });
+  const otpService = require('../services/otpService');
+  const record = { purpose: 'master_demo_login', provider: 'local-demo', otpHash: otpService.hashOtp('9816978086', '123456'),
+    expiresAt: new Date(Date.now() - 1000), attempts: 0, maxAttempts: 5, save: async () => record };
+  t.mock.method(Otp, 'findOne', () => ({ sort: async () => record }));
+  await assert.rejects(otpService.verifyOtp('9816978086', '123456', localDemoRequest()), /OTP expired/);
+  assert.equal(record.isUsed, true);
+  record.isUsed = false; record.expiresAt = new Date(Date.now() + 60000); record.attempts = 5;
+  await assert.rejects(otpService.verifyOtp('9816978086', '123456', localDemoRequest()), /Maximum OTP attempts/);
+});

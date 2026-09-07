@@ -6,7 +6,7 @@ const otpSchema = new mongoose.Schema({
   target: { type: String, required: true, index: true },
   targetType: { type: String, enum: ['phone', 'email'], default: 'phone', index: true },
   otpHash: { type: String, required: true },
-  purpose: { type: String, enum: ['login', 'register', 'profile_phone_change', 'profile_email_change', 'master_login'], default: 'login' },
+  purpose: { type: String, enum: ['login', 'register', 'profile_phone_change', 'profile_email_change', 'master_login', 'master_demo_login'], default: 'login' },
   trustedDelivery: { type: Boolean, default: false },
   provider: { type: String, default: 'mock' },
   expiresAt: { type: Date, required: true },

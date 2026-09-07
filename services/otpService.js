@@ -3,6 +3,7 @@ const mongoose = require('mongoose');
 const Otp = require('../models/Otp');
 const { normalizePhone, requireValidPhone } = require('../utils/phoneUtils');
 const { getDemoOtp, getJwtSecret, isDemoOtpMode } = require('../config/env');
+const { isLocalOwnerDemoRequest } = require('../config/localOwnerDemo');
 
 const memoryOtps = new Map();
 
@@ -101,6 +102,11 @@ async function createEmailOtp(email, purpose = 'profile_email_change', req) {
 }
 
 async function createTargetOtp(target, { purpose = 'login', req, targetType = 'phone' } = {}) {
+  if (purpose === 'master_demo_login' && !isLocalOwnerDemoRequest(req)) {
+    const error = new Error('Owner demo login is only available on the local demo server.');
+    error.statusCode = 403;
+    throw error;
+  }
   const normalizedTarget = normalizeTarget(target, targetType);
   const resend = await canResendTargetOtp(normalizedTarget, targetType);
   if (!resend.allowed) {
@@ -144,7 +150,7 @@ async function createTargetOtp(target, { purpose = 'login', req, targetType = 'p
     targetType,
     otpHash: hashOtp(normalizedTarget, otp),
     purpose,
-    provider: process.env.OTP_PROVIDER || process.env.SMS_PROVIDER || 'mock',
+    provider: purpose === 'master_demo_login' ? 'local-demo' : process.env.OTP_PROVIDER || process.env.SMS_PROVIDER || 'mock',
     expiresAt: new Date(Date.now() + getExpiryMinutes() * 60 * 1000),
     maxAttempts: getMaxAttempts(),
     resendCount: resend.latest ? resend.latest.resendCount + 1 : 0,
@@ -155,15 +161,15 @@ async function createTargetOtp(target, { purpose = 'login', req, targetType = 'p
   return { record, otp, target: normalizedTarget, [targetType]: normalizedTarget };
 }
 
-async function verifyOtp(phone, otp) {
-  return verifyTargetOtp(phone, otp, { targetType: 'phone' });
+async function verifyOtp(phone, otp, req) {
+  return verifyTargetOtp(phone, otp, { targetType: 'phone', req });
 }
 
 async function verifyEmailOtp(email, otp) {
   return verifyTargetOtp(email, otp, { targetType: 'email' });
 }
 
-async function verifyTargetOtp(target, otp, { targetType = 'phone' } = {}) {
+async function verifyTargetOtp(target, otp, { targetType = 'phone', req } = {}) {
   const normalizedTarget = normalizeTarget(target, targetType);
   const code = String(otp || '');
   if (!/^\d{6}$/.test(code)) {
@@ -178,6 +184,12 @@ async function verifyTargetOtp(target, otp, { targetType = 'phone' } = {}) {
   if (!record) {
     const error = new Error('OTP not found or expired');
     error.statusCode = 400;
+    throw error;
+  }
+  const ownerDemo = record.purpose === 'master_demo_login';
+  if (ownerDemo && (!isLocalOwnerDemoRequest(req) || record.provider !== 'local-demo')) {
+    const error = new Error('Owner demo login is only available on the local demo server.');
+    error.statusCode = 403;
     throw error;
   }
   if (record.expiresAt < new Date()) {
@@ -195,7 +207,7 @@ async function verifyTargetOtp(target, otp, { targetType = 'phone' } = {}) {
   const matches = compareOtp(normalizedTarget, code, record.otpHash);
 
   if (!matches) {
-    if (record.purpose === 'master_login' && !useMemoryOtpStore()) {
+    if ((record.purpose === 'master_login' || ownerDemo) && !useMemoryOtpStore()) {
       await Otp.updateOne({ _id: record._id, isUsed: false, attempts: { $lt: record.maxAttempts } }, { $inc: { attempts: 1 } });
     } else {
       record.attempts += 1;
@@ -206,10 +218,11 @@ async function verifyTargetOtp(target, otp, { targetType = 'phone' } = {}) {
     throw error;
   }
 
-  if (record.purpose === 'master_login' && !useMemoryOtpStore()) {
+  if ((record.purpose === 'master_login' || ownerDemo) && !useMemoryOtpStore()) {
     // Atomically redeem once: parallel verify requests cannot reuse an owner OTP.
     const redeemed = await Otp.findOneAndUpdate({
-      _id: record._id, isUsed: false, trustedDelivery: true, otpHash: record.otpHash,
+      _id: record._id, isUsed: false, purpose: record.purpose, trustedDelivery: !ownerDemo, otpHash: record.otpHash,
+      ...(ownerDemo ? { provider: 'local-demo' } : {}),
       attempts: { $lt: record.maxAttempts }, expiresAt: { $gt: new Date() },
     }, { $set: { isUsed: true } }, { new: true });
     if (!redeemed) {

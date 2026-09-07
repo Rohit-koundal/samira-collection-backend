@@ -30,3 +30,94 @@ test('invalid and expired credentials remain unauthorized, while missing account
   await protect({ headers: { authorization: `Bearer ${token(true)}` } }, res, () => assert.fail('Must not authorize'));
   assert.equal(res.statusCode, 401);
 });
+
+function configureSmsTest(t) {
+  const values = {
+    NODE_ENV: 'production', OTP_MODE: 'production', OTP_PROVIDER: 'sms', SMS_PROVIDER: 'twilio',
+    SMS_ACCOUNT_SID: 'AC-unit-account', SMS_AUTH_TOKEN: 'unit-token', SMS_SENDER_ID: '+15005550006',
+    JWT_SECRET: 'isolated-auth-test-secret', JWT_REFRESH_SECRET: 'isolated-refresh-test-secret',
+  };
+  const previous = Object.fromEntries(Object.keys(values).map(key => [key, process.env[key]]));
+  Object.assign(process.env, values);
+  t.after(() => Object.keys(values).forEach(key => {
+    if (previous[key] === undefined) delete process.env[key]; else process.env[key] = previous[key];
+  }));
+}
+
+test('Twilio rejects invalid credentials with a stable code and no raw account data', async (t) => {
+  configureSmsTest(t);
+  const request = t.mock.method(global, 'fetch', async () => ({
+    ok: false, status: 401, json: async () => ({ code: 20003, message: 'Rejected private-account-identifier private-token' }),
+  }));
+  await assert.rejects(require('../services/providers/twilioSmsProvider').sendOtp('9876543210', '654321'), error => {
+    assert.equal(error.errorCode, 'OTP_PROVIDER_AUTH_FAILED');
+    assert.equal(error.providerCode, 20003);
+    assert.equal(error.statusCode, 503);
+    assert.equal(error.message.includes('private-'), false);
+    return true;
+  });
+  assert.ok(request.mock.calls[0].arguments[1].signal instanceof AbortSignal);
+});
+
+test('SMS configuration and timeouts return safe, distinct delivery errors', async (t) => {
+  configureSmsTest(t);
+  const request = t.mock.method(global, 'fetch', async () => { throw new DOMException('private-provider-data', 'TimeoutError'); });
+  const log = t.mock.method(console, 'warn', () => {});
+  const service = require('../services/smsService');
+  process.env.SMS_AUTH_TOKEN = '';
+  const previousKey = process.env.SMS_API_KEY;
+  delete process.env.SMS_API_KEY;
+  t.after(() => { if (previousKey === undefined) delete process.env.SMS_API_KEY; else process.env.SMS_API_KEY = previousKey; });
+  assert.deepEqual(await service.sendOtp('9876543210', '654321', { requireReal: true }), { success: false, code: 'OTP_PROVIDER_NOT_CONFIGURED' });
+  assert.equal(request.mock.callCount(), 0);
+  process.env.SMS_AUTH_TOKEN = 'unit-token';
+  assert.deepEqual(await service.sendOtp('9876543210', '654321', { requireReal: true }), { success: false, code: 'OTP_DELIVERY_UNAVAILABLE' });
+  assert.equal(JSON.stringify(log.mock.calls).includes('private-provider-data'), false);
+});
+
+test('failed owner and customer delivery invalidate the OTP and permit retry after credentials are repaired', async (t) => {
+  for (const phone of ['9816978086', '9876543210']) {
+    await t.test(phone === '9816978086' ? 'owner' : 'customer', async (subtest) => {
+      configureSmsTest(subtest);
+      const mongoose = require('mongoose');
+      const Otp = require('../models/Otp');
+      const previousState = mongoose.connection.readyState;
+      mongoose.connection.readyState = 1;
+      subtest.after(() => { mongoose.connection.readyState = previousState; });
+      let record;
+      subtest.mock.method(Otp, 'findOne', () => ({ sort: async () => record && !record.isUsed ? record : null }));
+      subtest.mock.method(Otp, 'updateMany', async () => {});
+      subtest.mock.method(Otp, 'create', async value => {
+        record = { ...value, createdAt: new Date(), isUsed: false, save: async () => record };
+        return record;
+      });
+      let available = false;
+      subtest.mock.method(global, 'fetch', async () => ({
+        ok: available, status: available ? 201 : 401,
+        json: async () => available ? { sid: 'unit-message' } : { code: 20003, message: 'private-provider-data' },
+      }));
+      subtest.mock.method(console, 'warn', () => {});
+      const controller = require('../controllers/authController');
+      const failed = response();
+      const req = { body: { phone }, ip: 'isolated-delivery-recovery' };
+      await controller.sendOtp(req, failed);
+      assert.equal(failed.statusCode, 503);
+      assert.equal(failed.body.code, 'OTP_PROVIDER_AUTH_FAILED');
+      assert.equal(record.isUsed, true);
+      assert.notEqual(record.trustedDelivery, true);
+      assert.equal(failed.body.demoOtp, undefined);
+      assert.equal(failed.body.devOtp, undefined);
+      assert.equal(failed.body.token, undefined);
+      assert.equal(JSON.stringify(failed.body).includes('private-provider-data'), false);
+      available = true;
+      const retried = response();
+      await controller.resendOtp(req, retried);
+      assert.equal(retried.statusCode, 200);
+      assert.equal(retried.body.success, true);
+      assert.equal(retried.body.otpMode, 'production');
+      assert.equal(record.isUsed, false);
+      assert.equal(retried.body.demoOtp, undefined);
+      if (phone === '9816978086') assert.equal(record.trustedDelivery, true);
+    });
+  }
+});

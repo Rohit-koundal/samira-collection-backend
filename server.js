@@ -9,6 +9,7 @@ const connectDB = require('./config/db');
 const { isR2Configured } = require('./services/r2Upload');
 const { isCloudinaryConfigured } = require('./services/cloudinaryUpload');
 const { assertProductionSecrets, getOtpMode, isProduction } = require('./config/env');
+const { isLocalOwnerDemoEnabled } = require('./config/localOwnerDemo');
 const mongoose = require('mongoose');
 const { resumePendingReelImports } = require('./queues/reelImport.queue');
 const { startReelImportWatchdog } = require('./services/reelImportProgress.service');
@@ -49,7 +50,12 @@ async function startServer() {
     console.warn('Persistent image storage is not configured. Product uploads will be rejected until Cloudinary or R2 is connected.');
   }
 
-  app.listen(PORT, () => console.log(`Backend API running on port ${PORT}`));
+  const localOwnerDemo = isLocalOwnerDemoEnabled();
+  app.locals.localOwnerDemo = localOwnerDemo;
+  app.listen(PORT, localOwnerDemo ? '127.0.0.1' : undefined, () => {
+    console.log(`Backend API running on port ${PORT}`);
+    if (localOwnerDemo) console.log('Local owner demo login enabled. API accepts connections from this computer only.');
+  });
 }
 
 startServer();

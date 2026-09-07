@@ -3,6 +3,7 @@ const jwt = require('jsonwebtoken');
 const mongoose = require('mongoose');
 const User = require('../models/User');
 const { getJwtSecret } = require('../config/env');
+const { allowsOwnerDemoSession } = require('../config/localOwnerDemo');
 
 async function protect(req, res, next) {
   const header = req.headers.authorization || '';
@@ -12,6 +13,7 @@ async function protect(req, res, next) {
   try {
     const decoded = jwt.verify(token, getJwtSecret());
     if (decoded.tokenType && decoded.tokenType !== 'access') return res.status(401).json({ success: false, code: 'UNAUTHORIZED', message: 'Access token required' });
+    if (!allowsOwnerDemoSession(decoded, req)) return res.status(401).json({ success: false, code: 'UNAUTHORIZED', message: 'This demo session only works on the local demo server. Please log in again.' });
     if (canUseOfflineSession(decoded)) {
       req.user = buildOfflineUser(decoded);
       return next();
@@ -66,6 +68,7 @@ async function optionalProtect(req, res, next) {
   try {
     const decoded = jwt.verify(token, getJwtSecret());
     if (decoded.tokenType && decoded.tokenType !== 'access') throw new Error('Access token required');
+    if (!allowsOwnerDemoSession(decoded, req)) return next();
     if (canUseOfflineSession(decoded)) {
       req.user = buildOfflineUser(decoded);
       return next();

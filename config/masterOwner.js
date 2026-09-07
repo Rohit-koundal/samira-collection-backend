@@ -15,7 +15,9 @@ function attachMasterSession(user, claims = {}) {
   user.$locals = user.$locals || {};
   user.$locals.masterAuthenticated = Boolean(isOwnerAccount(user) && user.systemRole === 'MASTER_OWNER' &&
     user.isPhoneVerified && !user.isBlocked && !user.offlineSession &&
-    user.masterSessionVersion && claims.masterSessionVersion === user.masterSessionVersion);
+    user.masterSessionVersion && claims.masterSessionVersion === user.masterSessionVersion
+    && String(user.masterSessionVersion).startsWith('local-demo:') === (claims.localOwnerDemo === true));
+  user.$locals.localOwnerDemo = user.$locals.masterAuthenticated && claims.localOwnerDemo === true;
   return user;
 }
 function assertMasterOwner(user) {
