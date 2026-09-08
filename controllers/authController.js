@@ -4,7 +4,7 @@ const User = require('../models/User');
 const mongoose = require('mongoose');
 const jwt = require('jsonwebtoken');
 const { generateRefreshToken, generateToken } = require('../utils/generateToken');
-const { normalizePhone, normalizeEmail, createOtp, createEmailOtp, hashOtp, verifyOtp: verifyOtpRecord, verifyEmailOtp: verifyEmailOtpRecord } = require('../services/otpService');
+const { normalizePhone, normalizeEmail, createOtp, createEmailOtp, verifyOtp: verifyOtpRecord, verifyEmailOtp: verifyEmailOtpRecord } = require('../services/otpService');
 const { sendOtp } = require('../services/smsService');
 const { sendOtpEmail } = require('../services/emailService');
 const { getDemoOtp, getJwtRefreshSecret, getJwtSecret, getOtpMode, isDemoOtpMode } = require('../config/env');
@@ -418,6 +418,17 @@ async function deliverOtpWithFallback(phone, otp, record, req) {
   if (owner && record?.purpose === 'master_demo_login' && record.provider === getOwnerDemoProvider(req)) {
     return { success: true, provider: record.provider, demoOtp: getDemoOtp() };
   }
+
+  // Customer demo accounts always use the displayed fixed code. Do not call
+  // Twilio (or another paid provider) for non-owner numbers in demo mode.
+  if (!owner && isDemoOtpMode()) {
+    if (record) {
+      record.provider = 'demo';
+      await record.save();
+    }
+    return { success: true, provider: 'demo', demoOtp: getDemoOtp() };
+  }
+
   const delivery = await sendOtp(phone, otp, { requireReal: owner });
   if (owner) {
     if (!delivery?.success || !['twilio', 'msg91', 'fast2sms'].includes(delivery.provider)) {
@@ -428,18 +439,9 @@ async function deliverOtpWithFallback(phone, otp, record, req) {
     return { success: true, owner: true, provider: delivery.provider };
   }
 
-  if (!isDemoOtpMode()) {
-    if (delivery?.success) return { success: true, provider: delivery.provider };
-    if (record) { record.isUsed = true; await record.save(); }
-    throw otpDeliveryError(delivery);
-  }
-
-  const demoOtp = getDemoOtp();
-  if (!delivery?.success && record) {
-    record.otpHash = hashOtp(phone, demoOtp);
-    await record.save();
-  }
-  return { success: true, provider: delivery?.success ? delivery.provider : 'demo', demoOtp };
+  if (delivery?.success) return { success: true, provider: delivery.provider };
+  if (record) { record.isUsed = true; await record.save(); }
+  throw otpDeliveryError(delivery);
 }
 
 function otpDeliveryError(delivery) {

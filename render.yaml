@@ -32,11 +32,11 @@ services:
         sync: false
       - key: ADMIN_PHONE_NUMBERS
         sync: false
-      # Public demo access for the owner account. Disable before real sales.
+      # Keep the owner on real SMS while customer accounts use the demo OTP.
       - key: OTP_MODE
         value: demo
       - key: ALLOW_HOSTED_OWNER_DEMO
-        value: "true"
+        value: "false"
       - key: DEMO_OTP
         value: "123456"
       - key: OTP_PROVIDER

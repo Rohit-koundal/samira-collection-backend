@@ -1,15 +1,10 @@
 const { isDemoOtpMode } = require('./env');
 
 function isHostedOwnerDemoEnabled() {
-  // OTP_MODE=demo historically enabled the displayed OTP for every account,
-  // including the owner. Preserve that behavior on hosted deployments. The
-  // optional flag can explicitly force it on/off, while LOCAL_OWNER_DEMO keeps
-  // the development listener isolated when no hosted override is supplied.
-  if (String(process.env.OTP_MODE || '').trim().toLowerCase() !== 'demo') return false;
-  const override = String(process.env.ALLOW_HOSTED_OWNER_DEMO || '').trim().toLowerCase();
-  if (override === 'false') return false;
-  if (override === 'true') return true;
-  return process.env.LOCAL_OWNER_DEMO !== 'true';
+  // Customer demo OTP mode must never silently downgrade the owner account.
+  // Hosted owner demo access is a separate, explicit opt-in.
+  return String(process.env.OTP_MODE || '').trim().toLowerCase() === 'demo'
+    && String(process.env.ALLOW_HOSTED_OWNER_DEMO || '').trim().toLowerCase() === 'true';
 }
 
 function isLocalOwnerDemoEnabled() {

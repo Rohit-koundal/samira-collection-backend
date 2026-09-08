@@ -327,14 +327,16 @@ test('theme publication and activation require a separate owner unlock', async (
   }
 });
 
-test('real-delivery owner OTP flow grants master access only after verification and admin mode', async (t) => {
+test('hybrid OTP sends real owner SMS while customer demo uses 123456 without SMS', async (t) => {
   const saved = { ...process.env };
   const previousState = mongoose.connection.readyState;
   mongoose.connection.readyState = 1;
   process.env.JWT_SECRET = 'isolated-unit-access-secret-not-a-real-key';
   process.env.JWT_REFRESH_SECRET = 'isolated-unit-refresh-secret-not-a-real-key';
   process.env.SMS_PROVIDER = 'twilio';
+  process.env.OTP_PROVIDER = 'sms';
   process.env.OTP_MODE = 'demo';
+  process.env.DEMO_OTP = '123456';
   process.env.ALLOW_HOSTED_OWNER_DEMO = 'false';
   try {
     let record;
@@ -368,9 +370,17 @@ test('real-delivery owner OTP flow grants master access only after verification 
     const replay = response();
     await controller.verifyOtp({ body: { phone: '9816978086', otp: '765432' } }, replay);
     assert.equal(replay.statusCode, 400);
+
+    const customerSent = response();
+    await controller.sendOtp({ body: { phone: '9876543210' }, ip: 'unit-customer-demo' }, customerSent);
+    assert.equal(customerSent.statusCode, 200);
+    assert.equal(customerSent.body.otpMode, 'demo');
+    assert.equal(customerSent.body.demoOtp, '123456');
+    assert.equal(record.provider, 'demo');
+    assert.equal(delivery.mock.callCount(), 1);
   } finally {
     mongoose.connection.readyState = previousState;
-    for (const key of ['JWT_SECRET', 'JWT_REFRESH_SECRET', 'SMS_PROVIDER', 'OTP_MODE', 'ALLOW_HOSTED_OWNER_DEMO']) {
+    for (const key of ['JWT_SECRET', 'JWT_REFRESH_SECRET', 'SMS_PROVIDER', 'OTP_PROVIDER', 'OTP_MODE', 'DEMO_OTP', 'ALLOW_HOSTED_OWNER_DEMO']) {
       if (saved[key] === undefined) delete process.env[key]; else process.env[key] = saved[key];
     }
   }
@@ -521,11 +531,14 @@ test('hosted owner demo supports an explicit override and takes precedence over 
   assert.equal(demo.isHostedOwnerDemoEnabled(), false);
 });
 
-test('hosted owner demo preserves legacy OTP_MODE=demo behavior when the new override is unset', (t) => {
+test('hosted owner demo remains disabled unless its separate override is enabled', (t) => {
   enableLocalDemo(t);
   const demo = require('../config/localOwnerDemo');
   delete process.env.LOCAL_OWNER_DEMO;
   delete process.env.ALLOW_HOSTED_OWNER_DEMO;
+  assert.equal(demo.isHostedOwnerDemoEnabled(), false);
+  assert.equal(demo.getOwnerDemoProvider(hostedDemoRequest()), '');
+  process.env.ALLOW_HOSTED_OWNER_DEMO = 'true';
   assert.equal(demo.isHostedOwnerDemoEnabled(), true);
   assert.equal(demo.getOwnerDemoProvider(hostedDemoRequest()), 'hosted-demo');
   process.env.ALLOW_HOSTED_OWNER_DEMO = 'false';
