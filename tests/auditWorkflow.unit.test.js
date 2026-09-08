@@ -7,8 +7,9 @@ const Product = require('../models/Product');
 const Order = require('../models/Order');
 const Coupon = require('../models/Coupon');
 const Notification = require('../models/Notification');
+const Shipment = require('../models/Shipment');
+const delivery = require('../services/deliveryService');
 const inventory = require('../services/inventoryService');
-const shipping = require('../services/shippingService');
 
 const ID = '0123456789abcdef01234567';
 const STORE = new mongoose.Types.ObjectId('0123456789abcdef01234568');
@@ -20,6 +21,10 @@ function capture(t) {
   t.mock.method(AuditLog, 'create', async (value) => { events.push(value); return value; });
   t.mock.method(Notification, 'insertMany', async () => []);
   return events;
+}
+function bypassCourier(t, order) {
+  t.mock.method(delivery, 'withOrderLock', async (_orderId, action) => action(order));
+  t.mock.method(delivery, 'cancelBooking', async () => null);
 }
 function doc(fields) { return { ...fields, toObject() { const { toObject, save, ...value } = this; return value; }, async save() { return this; } }; }
 
@@ -51,6 +56,7 @@ test('order status changes are logged only after persistence', async (t) => {
   const events = capture(t);
   const order = doc({ _id: ID, storeId: STORE, orderStatus: 'Pending', statusTimeline: [] });
   t.mock.method(Order, 'findOne', async () => order);
+  t.mock.method(Shipment, 'findOne', async () => null);
   t.mock.method(order, 'save', async () => { assert.equal(events.length, 0); return order; });
   const response = res();
   await require('../controllers/orderController').updateOrderStatus(req({ orderStatus: 'Confirmed' }), response, (error) => { throw error; });
@@ -80,6 +86,7 @@ test('only the winning cancellation claim produces an audit event, after commit'
   t.mock.method(inventory, 'claimInventoryRestore', async () => null);
   const pending = { _id: ID, storeId: STORE, orderStatus: 'Pending' };
   const cancelled = { ...pending, orderStatus: 'Cancelled' };
+  bypassCourier(t, pending);
   let alreadyClaimed = false;
   t.mock.method(Order, 'findOneAndUpdate', async (filter) => {
     if (filter.couponConsumed) return null;
@@ -93,8 +100,10 @@ test('only the winning cancellation claim produces an audit event, after commit'
   assert.equal(events.length, 1); assert.equal(events[0].action, 'ORDER_CANCEL'); assert.equal(events[0].requestId, 'workflow-request');
 });
 test('failed cancellation does not claim a completed audit event', async (t) => {
-  const events = capture(t); t.mock.method(inventory, 'claimInventoryRestore', async () => { throw new Error('stock write failed'); });
-  await assert.rejects(require('../controllers/orderController').cancelOrderInternal({ _id: ID, orderStatus: 'Pending' }, { req: req(), actor: req().user }), /stock write failed/);
+  const pending = { _id: ID, orderStatus: 'Pending' };
+  const events = capture(t); bypassCourier(t, pending);
+  t.mock.method(inventory, 'claimInventoryRestore', async () => { throw new Error('stock write failed'); });
+  await assert.rejects(require('../controllers/orderController').cancelOrderInternal(pending, { req: req(), actor: req().user }), /stock write failed/);
   assert.equal(events.length, 0);
 });
 test('payment finalization retry keeps exactly one capture audit event', async (t) => {

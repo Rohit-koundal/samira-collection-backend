@@ -1,14 +1,7 @@
 const { isDemoOtpMode } = require('./env');
 
-function isHostedOwnerDemoEnabled() {
-  // Customer demo OTP mode must never silently downgrade the owner account.
-  // Hosted owner demo access is a separate, explicit opt-in.
-  return String(process.env.OTP_MODE || '').trim().toLowerCase() === 'demo'
-    && String(process.env.ALLOW_HOSTED_OWNER_DEMO || '').trim().toLowerCase() === 'true';
-}
-
 function isLocalOwnerDemoEnabled() {
-  return process.env.LOCAL_OWNER_DEMO === 'true' && isDemoOtpMode() && !isHostedOwnerDemoEnabled();
+  return process.env.LOCAL_OWNER_DEMO === 'true' && isDemoOtpMode();
 }
 
 function isLoopback(address) {
@@ -40,14 +33,12 @@ function isLocalOwnerDemoRequest(req) {
 }
 
 function allowsOwnerDemoSession(claims, req) {
-  if (claims?.localOwnerDemo && claims?.hostedOwnerDemo) return false;
-  if (claims?.hostedOwnerDemo) return isHostedOwnerDemoEnabled();
+  if (claims?.hostedOwnerDemo) return false;
   return !claims?.localOwnerDemo || isLocalOwnerDemoRequest(req);
 }
 
 function getOwnerDemoProvider(req) {
-  if (isHostedOwnerDemoEnabled()) return 'hosted-demo';
   return isLocalOwnerDemoRequest(req) ? 'local-demo' : '';
 }
 
-module.exports = { isLocalOwnerDemoEnabled, isLocalOwnerDemoRequest, isHostedOwnerDemoEnabled, getOwnerDemoProvider, allowsOwnerDemoSession };
+module.exports = { isLocalOwnerDemoEnabled, isLocalOwnerDemoRequest, getOwnerDemoProvider, allowsOwnerDemoSession };

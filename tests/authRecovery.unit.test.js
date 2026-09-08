@@ -33,7 +33,7 @@ test('invalid and expired credentials remain unauthorized, while missing account
 
 function configureSmsTest(t) {
   const values = {
-    NODE_ENV: 'production', OTP_MODE: 'production', OTP_PROVIDER: 'sms', SMS_PROVIDER: 'twilio',
+    NODE_ENV: 'production', OTP_MODE: 'production', SMS_PROVIDER: 'twilio',
     SMS_ACCOUNT_SID: 'AC-unit-account', SMS_AUTH_TOKEN: 'unit-token', SMS_SENDER_ID: '+15005550006',
     JWT_SECRET: 'isolated-auth-test-secret', JWT_REFRESH_SECRET: 'isolated-refresh-test-secret',
   };
@@ -65,9 +65,6 @@ test('SMS configuration and timeouts return safe, distinct delivery errors', asy
   const log = t.mock.method(console, 'warn', () => {});
   const service = require('../services/smsService');
   process.env.SMS_AUTH_TOKEN = '';
-  const previousKey = process.env.SMS_API_KEY;
-  delete process.env.SMS_API_KEY;
-  t.after(() => { if (previousKey === undefined) delete process.env.SMS_API_KEY; else process.env.SMS_API_KEY = previousKey; });
   assert.deepEqual(await service.sendOtp('9876543210', '654321', { requireReal: true }), { success: false, code: 'OTP_PROVIDER_NOT_CONFIGURED' });
   assert.equal(request.mock.callCount(), 0);
   process.env.SMS_AUTH_TOKEN = 'unit-token';

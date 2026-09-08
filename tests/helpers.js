@@ -25,7 +25,7 @@ Object.assign(process.env, {
   JWT_SECRET: 'test_jwt_secret',
   JWT_REFRESH_SECRET: 'test_jwt_refresh_secret',
   OTP_MODE: 'demo', DEMO_OTP: '123456', OTP_RESEND_COOLDOWN_SECONDS: '0',
-  OTP_PROVIDER: 'mock', SMS_PROVIDER: 'mock', EMAIL_OTP_PROVIDER: 'mock',
+  SMS_PROVIDER: 'mock', EMAIL_OTP_PROVIDER: 'mock',
   RAZORPAY_MOCK: '1', SHIPPING_PROVIDER: 'disabled',
 });
 const cachedMongoBinary = path.join(__dirname, '../node_modules/.cache/mongodb-binaries/mongod-x64-win32-7.0.14.exe');

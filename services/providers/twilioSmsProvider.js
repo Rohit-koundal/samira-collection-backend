@@ -1,5 +1,5 @@
 async function sendOtp(phone, otp) {
-  const config = getTwilioConfig(phone);
+  const config = getTwilioConfig();
   if (!config.accountSid || !config.authToken || !config.from) {
     const error = new Error('Twilio SMS provider is not configured. Check the backend SMS account, token and sender settings.');
     error.errorCode = 'OTP_PROVIDER_NOT_CONFIGURED';
@@ -37,19 +37,11 @@ async function sendOtp(phone, otp) {
   return { success: true, provider: 'twilio', accountSid: config.accountSid, messageSid: data.sid };
 }
 
-function getTwilioConfig(phone) {
+function getTwilioConfig() {
   const value = (key) => String(process.env[key] || '').trim();
-  if (String(phone) === '9999133567') {
-    return {
-      accountSid: value('SMS_9999133567_ACCOUNT_SID'),
-      authToken: value('SMS_9999133567_AUTH_TOKEN'),
-      from: value('SMS_9999133567_SENDER_ID'),
-    };
-  }
-
   return {
     accountSid: value('SMS_ACCOUNT_SID'),
-    authToken: value('SMS_AUTH_TOKEN') || value('SMS_API_KEY'),
+    authToken: value('SMS_AUTH_TOKEN'),
     from: value('SMS_SENDER_ID'),
   };
 }

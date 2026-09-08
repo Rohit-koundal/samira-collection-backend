@@ -221,12 +221,11 @@ exports.verifyOtp = async (req, res) => {
     const { phone, record } = await verifyOtpRecord(req.body.phone, req.body.otp, req);
     const demoOwner = record.purpose === 'master_demo_login' && record.provider === getOwnerDemoProvider(req);
     const localOwnerDemo = demoOwner && record.provider === 'local-demo';
-    const hostedOwnerDemo = demoOwner && record.provider === 'hosted-demo';
     if (isOwnerPhone(phone) && (mongoose.connection.readyState !== 1 || (!demoOwner && (record.purpose !== 'master_login' || !record.trustedDelivery)))) {
       return res.status(403).json({ message: 'Please request and verify a new owner OTP delivered by SMS.' });
     }
     const user = mongoose.connection.readyState === 1
-      ? await upsertPhoneLoginUser(phone, { activeMode: 'customer', masterVerified: isOwnerPhone(phone), localOwnerDemo, hostedOwnerDemo })
+      ? await upsertPhoneLoginUser(phone, { activeMode: 'customer', masterVerified: isOwnerPhone(phone), localOwnerDemo })
       : buildOfflineLoginUser(phone, { activeMode: 'customer' });
     res.json({ success: true, ...authPayload(user) });
   } catch (error) {
@@ -328,9 +327,9 @@ function getAdminPhones() {
   return String(process.env.ADMIN_PHONE_NUMBERS || '').split(',').map((item) => normalizePhone(item)).filter(Boolean);
 }
 
-async function upsertPhoneLoginUser(phone, { activeMode = 'customer', masterVerified = false, localOwnerDemo = false, hostedOwnerDemo = false } = {}) {
+async function upsertPhoneLoginUser(phone, { activeMode = 'customer', masterVerified = false, localOwnerDemo = false } = {}) {
   const isAdminPhone = getAdminPhones().includes(phone) || masterVerified;
-  const ownerVersion = masterVerified ? `${hostedOwnerDemo ? 'hosted-demo:' : localOwnerDemo ? 'local-demo:' : ''}${crypto.randomUUID()}` : undefined;
+  const ownerVersion = masterVerified ? `${localOwnerDemo ? 'local-demo:' : ''}${crypto.randomUUID()}` : undefined;
   let user = await User.findOne({ phone });
   if (!user) {
     user = await User.create({
@@ -343,7 +342,7 @@ async function upsertPhoneLoginUser(phone, { activeMode = 'customer', masterVeri
       activeMode,
       ...(masterVerified ? { systemRole: 'MASTER_OWNER', masterSessionVersion: ownerVersion } : {}),
     });
-    if (masterVerified) attachMasterSession(user, { masterSessionVersion: ownerVersion, localOwnerDemo, hostedOwnerDemo });
+    if (masterVerified) attachMasterSession(user, { masterSessionVersion: ownerVersion, localOwnerDemo });
     return user;
   }
 
@@ -366,7 +365,7 @@ async function upsertPhoneLoginUser(phone, { activeMode = 'customer', masterVeri
   user.activeMode = activeMode;
   if (masterVerified) { user.systemRole = 'MASTER_OWNER'; user.masterSessionVersion = ownerVersion; }
   await user.save();
-  if (masterVerified) attachMasterSession(user, { masterSessionVersion: ownerVersion, localOwnerDemo, hostedOwnerDemo });
+  if (masterVerified) attachMasterSession(user, { masterSessionVersion: ownerVersion, localOwnerDemo });
   return user;
 }
 

@@ -5,13 +5,12 @@ const twilioSmsProvider = require('./providers/twilioSmsProvider');
 
 function getProvider() {
   if (process.env.NODE_ENV !== 'production') return 'mock';
-  if ((process.env.OTP_PROVIDER || 'mock') === 'mock') return 'mock';
   return String(process.env.SMS_PROVIDER || 'mock').toLowerCase();
 }
 
 async function sendOtp(phone, otp, { requireReal = false } = {}) {
   try {
-    const provider = requireReal ? String(process.env.SMS_PROVIDER || process.env.OTP_PROVIDER || '').toLowerCase() : getProvider();
+    const provider = requireReal ? String(process.env.SMS_PROVIDER || '').toLowerCase() : getProvider();
     if (requireReal && !['msg91', 'fast2sms', 'twilio'].includes(provider)) return { success: false, code: 'OTP_PROVIDER_NOT_CONFIGURED', error: 'A real SMS provider is required' };
     if (provider === 'msg91') return await sendViaMSG91(phone, otp);
     if (provider === 'fast2sms') return await sendViaFast2SMS(phone, otp);

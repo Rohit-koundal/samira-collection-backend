@@ -69,16 +69,16 @@ test('OTP_MODE=demo is the default and is distinct from production mode', () => 
   });
 });
 
-test('server binds hosted demos publicly on the platform port and preserves the local-only listener', async (t) => {
+test('server keeps local owner demo loopback-only and hosted operation public', async (t) => {
   const fs = require('node:fs');
   const path = require('node:path');
   const vm = require('node:vm');
   const source = fs.readFileSync(path.join(__dirname, '../server.js'), 'utf8');
-  const keys = ['LOCAL_OWNER_DEMO', 'ALLOW_HOSTED_OWNER_DEMO', 'OTP_MODE', 'PORT', 'SERVER_PORT'];
+  const keys = ['LOCAL_OWNER_DEMO', 'OTP_MODE', 'PORT', 'SERVER_PORT'];
   const previous = Object.fromEntries(keys.map(key => [key, process.env[key]]));
   t.after(() => keys.forEach(key => { if (previous[key] === undefined) delete process.env[key]; else process.env[key] = previous[key]; }));
-  for (const [hosted, mode, host] of [['false', 'demo', '127.0.0.1'], ['true', 'demo', '0.0.0.0'], ['true', 'production', '0.0.0.0']]) {
-    Object.assign(process.env, { LOCAL_OWNER_DEMO: 'true', ALLOW_HOSTED_OWNER_DEMO: hosted, OTP_MODE: mode, PORT: '10000', SERVER_PORT: '5000' });
+  for (const [localDemo, mode, host] of [['true', 'demo', '127.0.0.1'], ['false', 'demo', '0.0.0.0'], ['true', 'production', '0.0.0.0']]) {
+    Object.assign(process.env, { LOCAL_OWNER_DEMO: localDemo, OTP_MODE: mode, PORT: '10000', SERVER_PORT: '5000' });
     const listening = await new Promise((resolve, reject) => {
       const app = { locals: {}, listen(port, address, callback) { callback(); resolve({ port, address, local: app.locals.localOwnerDemo }); } };
       const dependencies = {

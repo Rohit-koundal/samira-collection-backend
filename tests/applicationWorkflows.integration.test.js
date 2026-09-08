@@ -311,10 +311,10 @@ test('store content edits update published wording and reject stale saves withou
 
 test('owner-controlled client admin handover and role switching retain guarded permissions', async (t) => {
   const master = await createMasterOwner(); const customer = await createCustomer();
-  const keys = ['NODE_ENV','OTP_MODE','OTP_PROVIDER','SMS_PROVIDER'];
+  const keys = ['NODE_ENV','OTP_MODE','SMS_PROVIDER'];
   const previous = Object.fromEntries(keys.map(key => [key,process.env[key]]));
   t.after(() => keys.forEach(key => { if(previous[key]===undefined) delete process.env[key]; else process.env[key]=previous[key]; }));
-  Object.assign(process.env,{NODE_ENV:'production',OTP_MODE:'production',OTP_PROVIDER:'sms',SMS_PROVIDER:'twilio'});
+  Object.assign(process.env,{NODE_ENV:'production',OTP_MODE:'production',SMS_PROVIDER:'twilio'});
   const provisioned = await call('POST','/api/master/client-admins',{name:'Provisioned Fixture Admin',phone:'9123456791'},master.token,201);
   assert.equal(provisioned.role,'admin'); assert.equal(provisioned.systemRole,'USER');
   const promoted = await call('PATCH',`/api/admin/customers/${customer.user._id}/promote-admin`,{},master.token);

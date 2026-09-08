@@ -9,7 +9,7 @@ const connectDB = require('./config/db');
 const { isR2Configured } = require('./services/r2Upload');
 const { isCloudinaryConfigured } = require('./services/cloudinaryUpload');
 const { assertProductionSecrets, getOtpMode, isProduction } = require('./config/env');
-const { isLocalOwnerDemoEnabled, isHostedOwnerDemoEnabled } = require('./config/localOwnerDemo');
+const { isLocalOwnerDemoEnabled } = require('./config/localOwnerDemo');
 const mongoose = require('mongoose');
 const { resumePendingReelImports } = require('./queues/reelImport.queue');
 const { startReelImportWatchdog } = require('./services/reelImportProgress.service');
@@ -55,7 +55,6 @@ async function startServer() {
   app.listen(PORT, localOwnerDemo ? '127.0.0.1' : '0.0.0.0', () => {
     console.log(`Backend API running on port ${PORT}`);
     if (localOwnerDemo) console.log('Local owner demo login enabled. API accepts connections from this computer only.');
-    if (isHostedOwnerDemoEnabled()) console.warn('Hosted owner demo login enabled. The displayed demo OTP grants owner access. Disable ALLOW_HOSTED_OWNER_DEMO and set OTP_MODE=production before real sales.');
   });
 }
 
