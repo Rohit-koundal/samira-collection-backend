@@ -37,6 +37,8 @@ services:
         value: demo
       - key: ALLOW_HOSTED_OWNER_DEMO
         value: "true"
+      - key: DEMO_OTP
+        value: "123456"
       - key: OTP_PROVIDER
         value: sms
       - key: OTP_EXPIRY_MINUTES
