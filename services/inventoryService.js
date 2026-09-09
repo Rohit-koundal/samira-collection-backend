@@ -194,6 +194,27 @@ async function recordTransactions(entries, { orderId, type, reason, userId, sess
   await InventoryTransaction.insertMany(docs, session ? { session } : {});
 }
 
+function notifyStockAttentionLater(entries) {
+  const productIds = [...new Set(entries.map((entry) => String(entry.productId || '')).filter(Boolean))];
+  if (!productIds.length) return;
+  setImmediate(async () => {
+    try {
+      const Notification = require('../models/Notification');
+      const { notify } = require('./notificationService');
+      const products = await Product.find({ _id: { $in: productIds } }).select('name stock variants lowStockAlert storeId').lean();
+      for (const product of products) {
+        const stock = hasManagedVariants(product) ? totalVariantStock(product) : Number(product.stock || 0);
+        if (stock > Number(product.lowStockAlert ?? 5)) continue;
+        const recent = await Notification.exists({ storeId: product.storeId, event: 'LOW_STOCK', 'metadata.productId': String(product._id), createdAt: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) } });
+        if (recent) continue;
+        await notify({ storeId: product.storeId, event: 'LOW_STOCK', title: `${product.name} needs stock`, message: stock > 0 ? `Only ${stock} units remain.` : 'This product is sold out.', channels: ['IN_APP'], metadata: { productId: String(product._id), stock } });
+      }
+    } catch {
+      // Stock updates must succeed even when a background notification cannot be recorded.
+    }
+  });
+}
+
 async function deductStockForOrder(items, { orderId, userId, reason = 'Order placed', session, allowShortfall = false } = {}) {
   const applied = [];
 
@@ -213,6 +234,7 @@ async function deductStockForOrder(items, { orderId, userId, reason = 'Order pla
   }
 
   await recordTransactions(applied, { orderId, type: 'SALE', reason, userId, session });
+  notifyStockAttentionLater(applied);
   return applied;
 }
 

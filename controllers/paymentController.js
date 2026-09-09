@@ -14,6 +14,7 @@ const { buildPersistedOrderFields } = require('../services/orderSnapshotService'
 const { notifyLater } = require('../services/notificationService');
 const { readAttribution } = require('../utils/attribution');
 const { recordEventLater } = require('../services/analyticsService');
+const { assertMonthlyOrderCapacity } = require('../middleware/storeMiddleware');
 
 /**
  * Razorpay flow.
@@ -125,6 +126,7 @@ async function notifyPaid(order) {
  */
 async function createPaymentOrder(req, res) {
   assertCheckoutReady(req);
+  await assertMonthlyOrderCapacity(req.store);
 
   if (!isRazorpayConfigured()) {
     throw new ApiError('SERVICE_UNAVAILABLE', 'Online payment is not available right now. Please choose Cash on Delivery.');
@@ -322,8 +324,50 @@ async function razorpayWebhook(req, res) {
   // for an event we cannot map to an order helps nobody.
   const refundPaymentId = event === 'refund.processed' ? refundEntity?.payment_id : null;
   if (!razorpayOrderId && !refundPaymentId) return res.json({ success: true, ignored: true });
-
   const order = await Order.findOne(razorpayOrderId ? { razorpayOrderId } : { razorpayPaymentId: refundPaymentId });
+
+  // CLIENT_PROJECT_REMOVE_SUBSCRIPTION_START
+  if (!order && event === 'refund.processed' && refundPaymentId) {
+    try {
+      const clientRefund = await require('../services/clientPlatformService').handleRefundWebhook({
+        razorpayPaymentId: refundPaymentId, refundId: refundEntity?.id, refundedAmount: Number(refundEntity?.amount || 0) / 100,
+      });
+      if (clientRefund) {
+        logAudit({ req, source: 'WEBHOOK', action: 'CLIENT_SUBSCRIPTION_REFUND_RECORDED', entityType: 'ClientInstallation', entityId: clientRefund.installation._id, after: { status: clientRefund.payment.status, refundedAmount: clientRefund.payment.refundedAmount } });
+        return res.json({ success: true });
+      }
+    } catch (error) {
+      console.error('Razorpay client subscription refund processing failed:', error.message);
+      return res.status(500).json({ success: false, code: 'INTERNAL_ERROR', message: 'Webhook processing failed' });
+    }
+  }
+  if (!order && razorpayOrderId && ['payment.captured', 'order.paid', 'payment.failed'].includes(event)) {
+    try {
+      const clientSubscription = await require('../services/clientPlatformService').handleWebhook({
+        razorpayOrderId,
+        razorpayPaymentId: paymentEntity?.id,
+        event,
+      });
+      if (clientSubscription) {
+        logAudit({ req, source: 'WEBHOOK', action: clientSubscription.outcome === 'FAILED' ? 'CLIENT_SUBSCRIPTION_PAYMENT_FAILED' : 'CLIENT_SUBSCRIPTION_ACTIVATED', entityType: 'ClientInstallation', entityId: clientSubscription.installation._id, after: { plan: clientSubscription.payment.plan, billingCycle: clientSubscription.payment.billingCycle, amount: clientSubscription.payment.amount, status: clientSubscription.payment.status } });
+        return res.json({ success: true });
+      }
+      const subscription = await require('../services/subscriptionService').handleWebhook({
+        razorpayOrderId,
+        razorpayPaymentId: paymentEntity?.id,
+        event,
+      });
+      if (subscription) {
+        logAudit({ req, source: 'WEBHOOK', action: 'SUBSCRIPTION_ACTIVATED', entityType: 'Store', entityId: subscription.store._id, storeId: subscription.store._id, after: { plan: subscription.payment.plan, billingCycle: subscription.payment.billingCycle, amount: subscription.payment.amount } });
+        return res.json({ success: true });
+      }
+    } catch (error) {
+      console.error('Razorpay subscription webhook processing failed:', error.message);
+      return res.status(500).json({ success: false, code: 'INTERNAL_ERROR', message: 'Webhook processing failed' });
+    }
+  }
+  // CLIENT_PROJECT_REMOVE_SUBSCRIPTION_END
+
   if (!order) return res.json({ success: true, ignored: true });
 
   try {

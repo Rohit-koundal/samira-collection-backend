@@ -23,15 +23,6 @@ function getAllowedOrigins() {
   return [...new Set([...defaultOrigins, ...parseOrigins(process.env.CLIENT_ORIGINS), process.env.FRONTEND_URL].filter(Boolean))];
 }
 
-function isAllowedRenderOrigin(origin) {
-  try {
-    const url = new URL(origin);
-    return url.protocol === 'https:' && url.hostname.endsWith('.onrender.com');
-  } catch (error) {
-    return false;
-  }
-}
-
 function isLocalhostOrigin(origin) {
   try {
     const url = new URL(origin);
@@ -59,7 +50,6 @@ function corsOptions(req, callback) {
   if (
     !origin
     || allowedOrigins.includes(origin)
-    || isAllowedRenderOrigin(origin)
     || allowLocalhost
   ) {
     return callback(null, {

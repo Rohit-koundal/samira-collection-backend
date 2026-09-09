@@ -61,7 +61,7 @@ exports.createReturn = asyncHandler(async (req, res) => {
   });
   if (!orderedItem) throw new ApiError('VALIDATION_ERROR', 'That product is not part of this order');
 
-  const settings = await getStoreSettings();
+  const settings = await getStoreSettings(req.tenantFilter || {});
   const prior = await ReturnExchange.find({ order: orderId });
   const eligibility = returnEligibility(order, prior, settings.returnWindowDays);
   const itemEligibility = eligibility.items.find((item) => item.orderItemId === String(orderedItem._id));
@@ -165,7 +165,7 @@ exports.orderReturns = asyncHandler(async (req, res) => {
   const order = await Order.findOne({ _id: orderId, user: req.user._id });
   if (!order) throw notFound('Order not found');
   const [requests, settings] = await Promise.all([
-    ReturnExchange.find({ order: orderId, user: req.user._id }).sort('-createdAt'), getStoreSettings(),
+    ReturnExchange.find({ order: orderId, user: req.user._id }).sort('-createdAt'), getStoreSettings(req.tenantFilter || {}),
   ]);
   res.json({ requests, ...returnEligibility(order, requests, settings.returnWindowDays) });
 });

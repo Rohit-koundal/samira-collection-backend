@@ -15,9 +15,10 @@ function readiness() {
   const c = configuration();
   const missing = ['LICENCE_KEY', 'LOGIN_ID', 'CUSTOMER_CODE', 'ORIGIN_AREA', 'PRODUCT_CODE'].filter(key => !env(key));
   if (!env('JWT_TOKEN') && !(env('CLIENT_ID') && env('CLIENT_SECRET'))) missing.push('CLIENT_ID / CLIENT_SECRET (or JWT_TOKEN)');
-  return { name: 'bluedart', mode: c.mode, configured: missing.length === 0, missing,
+  return { name: 'bluedart', label: 'Blue Dart', mode: c.mode, configured: missing.length === 0, missing,
     liveBooking: !missing.length && (c.mode === 'sandbox' || env('LIVE_BOOKING_ENABLED') === 'true'),
     trackingLookup: !missing.length, cod: env('COD_ENABLED') === 'true', reverse: env('REVERSE_ENABLED') === 'true',
+    rateQuotes: false, cancelPickup: true,
     note: missing.length ? 'Complete the Blue Dart backend connection before enabling courier delivery.' : c.mode === 'sandbox' ? 'Sandbox bookings do not dispatch real parcels. Complete account testing before switching to production.' : env('LIVE_BOOKING_ENABLED') !== 'true' ? 'Production booking is disabled. Complete Blue Dart account testing, then enable live booking on the backend.' : 'Blue Dart is configured. Availability and bookings are confirmed by the carrier on each request.' };
 }
 function providerError(message, { ambiguous = false, statusCode = 503 } = {}) {
@@ -111,7 +112,7 @@ function addressLines(address) {
 function waybillPayload(c, booking, order, slot, reverse) {
   const origin = booking.pickupAddress, destination = booking.destination;
   const from = addressLines(origin), to = addressLines(destination);
-  if (String(destination.fullName || '').length > 30) throw new ApiError('SHIPPING_VALIDATION', 'Blue Dart recipient name must be 30 characters or fewer.');
+  if (String(destination.fullName || '').length > 30 || String(origin.fullName || '').length > 30) throw new ApiError('SHIPPING_VALIDATION', 'Blue Dart pickup and recipient names must be 30 characters or fewer.');
   const p = booking.parcel, s = booking.service;
   const cod = !reverse && order.paymentMethod === 'COD' && order.paymentStatus !== 'Paid';
   return { Request: {
@@ -184,4 +185,4 @@ async function track({ booking, byReference = false }) {
   const xml = await transport(`${c.base}/tracking/v1/shipment?${query}`, { headers: { JWTToken: await token(c) } });
   return parseTracking(xml, identifier, byReference);
 }
-module.exports = { name: 'bluedart', readiness, configuration, serviceability, book, pickup, cancel, cancelPickup, track, parseTracking, statusOf, carrierDate, waybillPayload, addressLines };
+module.exports = { name: 'bluedart', label: 'Blue Dart', readiness, configuration, serviceability, book, pickup, cancel, cancelPickup, track, parseTracking, statusOf, carrierDate, waybillPayload, addressLines };

@@ -142,12 +142,49 @@ function calculateDiscount(coupon, cartTotal, items) {
   const amount = eligibleCartTotal(coupon, cartTotal, items);
   if (!coupon || amount <= 0) return 0;
 
+  if (coupon.benefitType === 'FREE_SHIPPING') return 0;
+  if (coupon.benefitType === 'BUY_X_GET_Y') {
+    const buy = Math.max(1, Number(coupon.buyQuantity || 1));
+    const get = Math.max(1, Number(coupon.getQuantity || 1));
+    const productIds = idList(coupon.applicableProducts);
+    const categoryIds = idList(coupon.applicableCategories);
+    const discount = (Array.isArray(items) ? items : []).reduce((sum, item) => {
+      const matches = (!productIds.length || productIds.includes(itemProductId(item)))
+        && (!categoryIds.length || categoryIds.includes(itemCategoryId(item)));
+      if (!matches) return sum;
+      const quantity = Math.max(1, Number(item.quantity || 1));
+      const freeUnits = Math.floor(quantity / (buy + get)) * get;
+      return sum + freeUnits * Number(item.price || 0);
+    }, 0);
+    return round(Math.max(0, Math.min(discount, amount)));
+  }
+
   const raw = coupon.type === 'Percentage'
     ? (amount * Number(coupon.discountValue || 0)) / 100
     : Number(coupon.discountValue || 0);
 
   const cap = Number(coupon.maxDiscountAmount || 0) > 0 ? Number(coupon.maxDiscountAmount) : raw;
   return round(Math.max(0, Math.min(raw, cap, amount)));
+}
+
+async function findBestAutomatic({ cartTotal, paymentMethod, items, userId, tenantFilter = {} } = {}) {
+  const now = new Date();
+  const candidates = await Coupon.find(andFilter({
+    activationMode: 'AUTOMATIC', isActive: true, expiryDate: { $gte: now },
+    $or: [{ validFrom: { $exists: false } }, { validFrom: null }, { validFrom: { $lte: now } }],
+  }, tenantFilter)).sort({ discountValue: -1, createdAt: 1 }).limit(50);
+  const eligible = [];
+  for (const coupon of candidates) {
+    try {
+      await assertCouponRules(coupon, { cartTotal, paymentMethod, items, userId, tenantFilter });
+      eligible.push({ coupon, discountAmount: calculateDiscount(coupon, cartTotal, items) });
+    } catch {
+      // An automatic offer that does not match this bag is simply ignored.
+    }
+  }
+  eligible.sort((left, right) => right.discountAmount - left.discountAmount
+    || Number(right.coupon.benefitType === 'FREE_SHIPPING') - Number(left.coupon.benefitType === 'FREE_SHIPPING'));
+  return eligible[0] || null;
 }
 
 /** Convenience wrapper returning both the coupon and its computed discount. */
@@ -219,6 +256,7 @@ module.exports = {
   calculateDiscount,
   consumeCoupon,
   evaluateCoupon,
+  findBestAutomatic,
   releaseCoupon,
   validateAndPrice,
   validateCoupon,

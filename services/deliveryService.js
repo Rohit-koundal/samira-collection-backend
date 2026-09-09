@@ -4,7 +4,7 @@ const Shipment = require('../models/Shipment');
 const { ReverseShipment } = Shipment;
 const ReturnExchange = require('../models/ReturnExchange');
 const { getStoreSettings } = require('./paymentSettingsService');
-const { providerFor } = require('./shippingProvider');
+const { isIntegratedProvider, providerFor, providerLabel } = require('./shippingProvider');
 const { packageForItems, deliveryPrice, pickupAddress, pickupSlot } = require('./shippingRules');
 const { ApiError } = require('../utils/apiError');
 const { notifyLater } = require('./notificationService');
@@ -24,15 +24,21 @@ function publicShipment(row) {
   return data;
 }
 async function checkoutShipping({ items, settings, address, paymentMethod, amount }) {
-  const integrated = settings.shippingProvider === 'bluedart';
+  const integrated = isIntegratedProvider(settings.shippingProvider);
   const parcel = integrated || settings.shippingPricingMode === 'weight' ? packageForItems(items, settings) : null;
-  const pricing = deliveryPrice(amount, address, parcel, settings);
-  if (!integrated) return { provider: 'manual', deliveryCharge: pricing.charge, pricingSource: pricing.pricingSource, parcel };
+  if (!integrated) {
+    const pricing = deliveryPrice(amount, address, parcel, settings);
+    return { provider: 'manual', deliveryCharge: pricing.charge, pricingSource: pricing.pricingSource, parcel };
+  }
   const adapter = providerFor(settings.shippingProvider), ready = adapter.readiness();
   await assertCarrierStore(items[0]?.storeId, settings);
   if (!ready.configured || !ready.liveBooking || ready.mode !== 'production') throw new ApiError('SHIPPING_UNAVAILABLE', 'Delivery setup is being completed. Please contact the store before placing your order.', { statusCode: 503 });
-  const result = await adapter.serviceability({ origin: pickupAddress(settings.shippingPickup), destination: address || {}, cod: paymentMethod === 'COD' });
-  return { ...result, destinationPincode: address.pincode, parcel, deliveryCharge: pricing.charge, pricingSource: pricing.pricingSource };
+  const result = await adapter.serviceability({ origin: pickupAddress(settings.shippingPickup), destination: address || {}, cod: paymentMethod === 'COD', parcel, amount });
+  const pricing = deliveryPrice(amount, address, parcel, settings, result.providerRate);
+  // Contracted carrier cost is an internal merchant value. Checkout only needs
+  // the customer-facing charge and the selected service identity.
+  const { providerRate: _providerRate, ...publicResult } = result;
+  return { ...publicResult, destinationPincode: address.pincode, parcel, deliveryCharge: pricing.charge, pricingSource: pricing.pricingSource };
 }
 async function withOrderLock(orderId, action) {
   const key = randomUUID();
@@ -57,8 +63,8 @@ function assertBookable(order, returnRequest) {
 async function createBooking(order, body, returnRequest) {
   return withOrderLock(order._id, async freshOrder => {
     assertBookable(freshOrder, returnRequest);
-    const settings = await getStoreSettings();
-    if (settings.shippingProvider !== 'bluedart') throw new ApiError('SHIPPING_VALIDATION', 'Select Blue Dart in delivery settings before booking.');
+    const settings = await getStoreSettings(order.storeId ? { storeId: order.storeId } : {});
+    if (!isIntegratedProvider(settings.shippingProvider)) throw new ApiError('SHIPPING_VALIDATION', 'Select a connected delivery provider in store settings before booking.');
     const adapter = providerFor(settings.shippingProvider);
     await assertCarrierStore(order.storeId, settings);
     const ready = adapter.readiness();
@@ -73,25 +79,27 @@ async function createBooking(order, body, returnRequest) {
     const items = returnRequest ? order.orderItems.filter(item => String(item._id) === returnRequest.orderItemId).map(item => ({ ...(item.toObject ? item.toObject() : item), quantity: returnRequest.quantity })) : order.orderItems;
     if (!items.length) throw new ApiError('SHIPPING_VALIDATION', 'The return item could not be matched to this order.');
     const parcel = packageForItems(items, settings, body.parcel);
-    const checked = await adapter.serviceability({ origin, destination, cod: !returnRequest && order.paymentMethod === 'COD' && order.paymentStatus !== 'Paid', reverse: !!returnRequest });
+    const checked = await adapter.serviceability({ origin, destination, cod: !returnRequest && order.paymentMethod === 'COD' && order.paymentStatus !== 'Paid', reverse: !!returnRequest, parcel, amount: order.finalAmount });
     const providerRef = `${returnRequest ? 'R' : 'S'}${String(returnRequest?._id || order._id).slice(-19)}`;
-    const base = { provider: 'bluedart', environment: ready.mode, courierName: 'Blue Dart', providerRef, parcel, pickupAddress: origin, destination, service: checked.service, pickup: { areaCode: checked.pickupArea }, status: 'WAITING', bookingState: 'IDLE' };
+    const providerCharge = Number(checked.providerRate);
+    const base = { provider: settings.shippingProvider, environment: ready.mode, courierName: checked.courierName || adapter.label || providerLabel(settings.shippingProvider), providerRef, parcel, pickupAddress: origin, destination, service: checked.service, pickup: { areaCode: checked.pickupArea }, status: 'WAITING', bookingState: 'IDLE', ...(Number.isFinite(providerCharge) && providerCharge >= 0 ? { providerCharge } : {}) };
     if (!existing) existing = await Model.findOneAndUpdate(filter, { $setOnInsert: { ...filter, order: order._id, storeId: order.storeId, ...base } }, { upsert: true, new: true, setDefaultsOnInsert: true }).select(privateFields);
     if (returnRequest) await ReturnExchange.updateOne({ _id: returnRequest._id }, { $set: { shipment: existing._id } });
     else await Order.updateOne({ _id: order._id }, { $set: { shipment: existing._id } });
     const booking = await Model.findOneAndUpdate({ _id: existing._id, $and: [{ $or: [{ bookingState: { $in: ['IDLE', 'FAILED'] } }, { bookingState: { $exists: false } }] }, { $or: [{ operation: '' }, { operation: { $exists: false } }] }] }, { $set: { ...base, bookingState: 'BOOKING', operation: 'book', operationStartedAt: new Date(), lastError: '' } }, { new: true }).select(privateFields);
     if (!booking) throw conflict('This booking is already being processed. Refresh its status.');
     try {
-      const carrierOrder = returnRequest ? { ...(order.toObject ? order.toObject() : order), finalAmount: Math.round(items.reduce((sum, item) => sum + Number(item.price) * Number(item.quantity), 0) * 100) / 100 } : order;
+      const carrierOrder = returnRequest ? { ...(order.toObject ? order.toObject() : order), orderItems: items, finalAmount: Math.round(items.reduce((sum, item) => sum + Number(item.price) * Number(item.quantity), 0) * 100) / 100 } : order;
       const details = await adapter.book({ booking, order: carrierOrder, slot, reverse: !!returnRequest });
       // Persist the AWB independently of pickup so a failed pickup is never rebooked.
-      Object.assign(booking, details, { trackingNumber: details.awb, bookingState: 'BOOKED', status: 'READY_TO_SHIP', labelAvailable: !!details.labelPdf, operation: '', nextSyncAt: new Date() });
-      booking.events.push({ status: 'READY_TO_SHIP', note: 'Blue Dart AWB created. Pack and label the parcel, then request pickup.', date: new Date() });
+      const autoPickup = Boolean(details.pickup?.token);
+      Object.assign(booking, details, { trackingNumber: details.awb, bookingState: 'BOOKED', status: autoPickup ? 'PICKUP_SCHEDULED' : 'READY_TO_SHIP', labelAvailable: !!details.labelPdf, operation: '', nextSyncAt: new Date() });
+      booking.events.push({ status: booking.status, note: autoPickup ? `${booking.courierName} AWB created and pickup requested.` : `${booking.courierName} AWB created. Pack and label the parcel, then request pickup.`, date: new Date() });
       await booking.save();
       return publicShipment(booking);
     } catch (e) {
       const ambiguous = e.ambiguous || !(e instanceof ApiError);
-      await Model.updateOne({ _id: booking._id }, { $set: { bookingState: ambiguous ? 'UNKNOWN' : 'FAILED', operation: '', lastError: ambiguous ? 'Booking outcome is uncertain. Check by reference before retrying; do not create a second shipment.' : e.message } });
+      await Model.updateOne({ _id: booking._id }, { $set: { ...(e.recovery || {}), bookingState: ambiguous ? 'UNKNOWN' : 'FAILED', operation: '', lastError: ambiguous ? `Booking outcome is uncertain at ${booking.courierName}. Check by reference before retrying; do not create a second shipment.` : e.message } });
       throw e instanceof ApiError ? e : conflict('The booking outcome needs reconciliation. Refresh the shipment and check its reference.');
     }
   });
@@ -111,13 +119,13 @@ async function schedulePickup(order, body, returnRequest) {
       const result = await providerFor(booking.provider).pickup({ booking, slot, reverse: !!returnRequest });
       booking.pickup = { ...booking.pickup.toObject(), ...result, cancelled: false };
       booking.operation = ''; booking.lastError = ''; booking.status = 'PICKUP_SCHEDULED';
-      booking.events.push({ status: booking.status, note: 'Blue Dart confirmed the pickup request.', date: new Date() });
+      booking.events.push({ status: booking.status, note: `${booking.courierName} confirmed the pickup request.`, date: new Date() });
       await booking.save();
       if (returnRequest) await ReturnExchange.updateOne({ _id: returnRequest._id, status: 'Approved' }, { $set: { status: 'Pickup Scheduled', pickupScheduledAt: slot.at } });
       return publicShipment(booking);
     } catch (e) {
       const uncertain = e.ambiguous || !(e instanceof ApiError);
-      await Model.updateOne({ _id: booking._id }, { $set: { operation: uncertain ? 'pickup-unknown' : '', lastError: uncertain ? 'Pickup outcome is uncertain. Confirm the existing request with Blue Dart before retrying.' : e.message } });
+      await Model.updateOne({ _id: booking._id }, { $set: { operation: uncertain ? 'pickup-unknown' : '', lastError: uncertain ? `Pickup outcome is uncertain. Confirm the existing request with ${booking.courierName} before retrying.` : e.message } });
       throw e instanceof ApiError ? e : conflict('Pickup needs reconciliation. Do not request another pickup yet.');
     }
   });
@@ -127,12 +135,12 @@ async function cancelBooking(order, returnRequest) {
   if (!booking || booking.provider === 'manual') return null;
   if (booking.bookingState === 'CANCELLED') return publicShipment(booking);
   if (booking.operation || ['UNKNOWN', 'BOOKING'].includes(booking.bookingState)) throw conflict('Check the outstanding courier request before cancelling this order.');
-  if (!['WAITING', 'READY_TO_SHIP', 'PICKUP_SCHEDULED', 'FAILED'].includes(booking.status)) throw new ApiError('ORDER_NOT_CANCELLABLE', 'This parcel may already be with Blue Dart. Arrange a return instead of restoring stock through cancellation.');
+  if (!['WAITING', 'READY_TO_SHIP', 'PICKUP_SCHEDULED', 'FAILED'].includes(booking.status)) throw new ApiError('ORDER_NOT_CANCELLABLE', `This parcel may already be with ${booking.courierName || 'the courier'}. Arrange a return instead of restoring stock through cancellation.`);
   if (booking.awb) {
     booking.operation = 'cancel'; await booking.save();
     try {
       const adapter = providerFor(booking.provider);
-      if (booking.pickup?.token && !booking.pickup.cancelled) {
+      if (booking.pickup?.token && !booking.pickup.cancelled && typeof adapter.cancelPickup === 'function') {
         await adapter.cancelPickup({ booking });
         booking.pickup.cancelled = true; await booking.save();
       }
@@ -152,13 +160,13 @@ async function cancelBooking(order, returnRequest) {
 async function reconcile(order, body, returnRequest) {
   return withOrderLock(order._id, async () => {
     const booking = await findBooking(order, returnRequest);
-    if (!booking || booking.provider === 'manual') throw new ApiError('SHIPPING_VALIDATION', 'There is no Blue Dart booking to reconcile.');
+    if (!booking || booking.provider === 'manual') throw new ApiError('SHIPPING_VALIDATION', 'There is no integrated courier booking to reconcile.');
     const adapter = providerFor(booking.provider);
     if (['BOOKING', 'UNKNOWN'].includes(booking.bookingState)) {
       if (booking.operationStartedAt && Date.now() - booking.operationStartedAt < 60000) throw conflict('The carrier request may still be running. Check again in a minute.');
       if (body.confirmedWithCarrier === true && body.confirmedNoRequest === true) {
         booking.bookingState = 'FAILED'; booking.operation = ''; booking.lastError = '';
-        booking.events.push({ status: 'WAITING', note: 'Administrator confirmed with Blue Dart that no AWB exists for this reference. Booking retry unlocked.', date: new Date() });
+        booking.events.push({ status: 'WAITING', note: `Administrator confirmed with ${booking.courierName || 'the courier'} that no AWB exists for this reference. Booking retry unlocked.`, date: new Date() });
         await booking.save();
         return publicShipment(booking);
       }
@@ -168,17 +176,17 @@ async function reconcile(order, body, returnRequest) {
       await booking.save();
     } else if (booking.operation) {
       // A tracking lookup cannot prove that no pickup/cancellation exists.
-      // Require the administrator to record the result confirmed with Blue Dart.
-      if (body.confirmedWithCarrier !== true) throw new ApiError('SHIPPING_VALIDATION', 'Confirm the existing pickup/cancellation outcome with Blue Dart before recording the result.');
+      // A carrier tracking lookup cannot prove that no pickup/cancellation exists.
+      if (body.confirmedWithCarrier !== true) throw new ApiError('SHIPPING_VALIDATION', `Confirm the existing pickup/cancellation outcome with ${booking.courierName || 'the courier'} before recording the result.`);
       if (booking.operation === 'pickup-unknown' || booking.operation === 'pickup') {
         if (body.confirmedNoRequest === true) booking.status = 'READY_TO_SHIP';
         else {
-          if (!/^\d{1,8}$/.test(String(body.pickupToken || ''))) throw new ApiError('SHIPPING_VALIDATION', 'Enter the pickup token confirmed by Blue Dart.');
+          if (!/^[A-Za-z0-9._-]{1,100}$/.test(String(body.pickupToken || ''))) throw new ApiError('SHIPPING_VALIDATION', `Enter the pickup token confirmed by ${booking.courierName || 'the courier'}.`);
           booking.pickup.token = String(body.pickupToken); booking.status = 'PICKUP_SCHEDULED';
         }
       } else if (booking.operation.startsWith('cancel')) {
         const checked = await adapter.track({ booking });
-        if (checked.status !== 'CANCELLED') throw conflict('Blue Dart has not confirmed shipment cancellation yet.');
+        if (checked.status !== 'CANCELLED') throw conflict(`${booking.courierName || 'The courier'} has not confirmed shipment cancellation yet.`);
         booking.status = 'CANCELLED'; booking.bookingState = 'CANCELLED';
       }
       booking.operation = ''; booking.lastError = ''; await booking.save();
@@ -207,8 +215,8 @@ async function syncBooking(booking, Model = Shipment) {
     await leased.save();
     if (!leased.returnRequest && leased.environment === 'production') {
       const mapped = { PICKED_UP: 'Shipped', SHIPPED: 'Shipped', IN_TRANSIT: 'Shipped', OUT_FOR_DELIVERY: 'Out for Delivery', DELIVERED: 'Delivered' }[leased.status];
-      const prior = mapped && await Order.findOneAndUpdate({ _id: leased.order, orderStatus: { $in: mapped === 'Shipped' ? ['Pending', 'Confirmed', 'Packed'] : mapped === 'Out for Delivery' ? ['Pending', 'Confirmed', 'Packed', 'Shipped'] : ['Pending', 'Confirmed', 'Packed', 'Shipped', 'Out for Delivery'] } }, { $set: { orderStatus: mapped, ...(mapped === 'Delivered' ? { deliveredAt: tracked.providerStatusAt || now } : {}) }, $push: { statusTimeline: { status: mapped, note: 'Confirmed by Blue Dart tracking', date: tracked.providerStatusAt || now } } }, { new: false });
-      if (prior) notifyLater({ userId: prior.user, storeId: prior.storeId, event: mapped === 'Delivered' ? 'ORDER_DELIVERED' : mapped === 'Out for Delivery' ? 'ORDER_OUT_FOR_DELIVERY' : 'ORDER_SHIPPED', title: `Order ${mapped.toLowerCase()}`, message: `Blue Dart: ${tracked.providerStatus}`, metadata: { orderId: String(prior._id), shipmentId: String(leased._id) } });
+      const prior = mapped && await Order.findOneAndUpdate({ _id: leased.order, orderStatus: { $in: mapped === 'Shipped' ? ['Pending', 'Confirmed', 'Packed'] : mapped === 'Out for Delivery' ? ['Pending', 'Confirmed', 'Packed', 'Shipped'] : ['Pending', 'Confirmed', 'Packed', 'Shipped', 'Out for Delivery'] } }, { $set: { orderStatus: mapped, ...(mapped === 'Delivered' ? { deliveredAt: tracked.providerStatusAt || now } : {}) }, $push: { statusTimeline: { status: mapped, note: `Confirmed by ${leased.courierName || providerLabel(leased.provider)} tracking`, date: tracked.providerStatusAt || now } } }, { new: false });
+      if (prior) notifyLater({ userId: prior.user, storeId: prior.storeId, event: mapped === 'Delivered' ? 'ORDER_DELIVERED' : mapped === 'Out for Delivery' ? 'ORDER_OUT_FOR_DELIVERY' : 'ORDER_SHIPPED', title: `Order ${mapped.toLowerCase()}`, message: `${leased.courierName || providerLabel(leased.provider)}: ${tracked.providerStatus}`, metadata: { orderId: String(prior._id), shipmentId: String(leased._id) } });
     }
     // COD payment, refunds, reverse inspection and inventory are deliberately
     // handled by their existing financial/returns workflows, never scan text.
@@ -226,7 +234,7 @@ function startDeliveryWorker() {
     if (active) return; active = true;
     try {
       for (const Model of [Shipment, ReverseShipment]) {
-        const due = await Model.find({ provider: 'bluedart', bookingState: 'BOOKED', status: { $nin: terminal }, $or: [{ nextSyncAt: { $lte: new Date() } }, { nextSyncAt: { $exists: false } }] }).sort({ nextSyncAt: 1 }).limit(20);
+        const due = await Model.find({ provider: { $ne: 'manual' }, bookingState: 'BOOKED', status: { $nin: terminal }, $or: [{ nextSyncAt: { $lte: new Date() } }, { nextSyncAt: { $exists: false } }] }).sort({ nextSyncAt: 1 }).limit(20);
         for (const booking of due) await syncBooking(booking, Model).catch(() => null);
       }
     } catch { /* Disconnected databases are retried on the next tick. */ }

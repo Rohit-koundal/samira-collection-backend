@@ -23,18 +23,24 @@ exports.getCategoryById = asyncHandler(async (req, res) => {
 exports.createCategory = asyncHandler(async (req, res) => {
   if (!req.body.name || req.body.name.trim().length < 2) return res.status(400).json({ message: 'Category name is required' });
   if (req.body.image?.startsWith('data:')) return res.status(400).json({ message: 'Category image must be an uploaded file URL' });
+  if (req.body.socialImage?.startsWith('data:')) return res.status(400).json({ message: 'Social image must be an uploaded file URL' });
   const slug = req.body.slug?.trim() || slugify(req.body.name);
+  if (await Category.exists(andFilter({ slug }, req.tenantFilter))) return res.status(400).json({ message: 'A category with this slug already exists' });
   res.status(201).json(await Category.create(withStoreId({ ...req.body, name: req.body.name.trim(), slug }, req)));
 });
 exports.updateCategory = asyncHandler(async (req, res) => {
   const existingCategory = await Category.findOne(andFilter({ _id: req.params.id }, req.tenantFilter));
   if (!existingCategory) return res.status(404).json({ message: 'Category not found' });
   if (req.body.image?.startsWith('data:')) return res.status(400).json({ message: 'Category image must be an uploaded file URL' });
+  if (req.body.socialImage?.startsWith('data:')) return res.status(400).json({ message: 'Social image must be an uploaded file URL' });
   const payload = { ...req.body };
   delete payload.storeId;
   if (payload.name !== undefined && (typeof payload.name !== 'string' || payload.name.trim().length < 2)) return res.status(400).json({ message: 'Category name is required' });
   if (payload.name) payload.name = payload.name.trim();
   if (payload.slug) payload.slug = payload.slug.trim() || slugify(payload.name);
+  if (payload.slug && await Category.exists(andFilter({ _id: { $ne: existingCategory._id }, slug: payload.slug }, req.tenantFilter))) {
+    return res.status(400).json({ message: 'A category with this slug already exists' });
+  }
   if (payload.image === undefined || payload.image === '') {
     payload.image = existingCategory.image || '';
   }
@@ -42,12 +48,16 @@ exports.updateCategory = asyncHandler(async (req, res) => {
   if (existingCategory.image && existingCategory.image !== updatedCategory.image) {
     await safeDeleteCategoryImage(existingCategory.image);
   }
+  if (existingCategory.socialImage && existingCategory.socialImage !== updatedCategory.socialImage) {
+    await safeDeleteCategoryImage(existingCategory.socialImage);
+  }
   res.json(updatedCategory);
 });
 exports.deleteCategory = asyncHandler(async (req, res) => {
   const category = await Category.findOne(andFilter({ _id: req.params.id }, req.tenantFilter));
   if (!category) return res.status(404).json({ message: 'Category not found' });
   if (category?.image) await safeDeleteCategoryImage(category.image);
+  if (category?.socialImage && category.socialImage !== category.image) await safeDeleteCategoryImage(category.socialImage);
   await Category.findByIdAndDelete(req.params.id);
   res.json({ message: 'Category deleted' });
 });

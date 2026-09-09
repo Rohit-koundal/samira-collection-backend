@@ -3,6 +3,7 @@ const StoreMember = require('../models/StoreMember');
 const { roleAllows } = require('../models/StoreMember');
 const { ApiError } = require('../utils/apiError');
 const { isPlatformAdmin, resolvePublicStore, resolveStoreFromHost } = require('../services/storeService');
+const { hasStoreFeature, planSummary, storeLimit } = require('../config/storePlans');
 
 function requestedStoreId(req) {
   return String(req.headers['x-store-id'] || req.query.storeId || '').trim();
@@ -78,6 +79,54 @@ function requireStorePermission(permission) {
   };
 }
 
+function requireStoreFeature(feature) {
+  return (req, _res, next) => {
+    if (hasStoreFeature(req.store, feature)) return next();
+    const plan = planSummary(req.store);
+    const message = ['EXPIRED', 'SUSPENDED'].includes(plan.status)
+      ? `Your ${plan.name} licence is ${plan.status.toLowerCase()}. ${plan.renewalMessage || 'Ask the platform owner to renew access.'}`
+      : `${feature} is not included in the ${plan.name} plan.`;
+    return next(new ApiError('FORBIDDEN', message));
+  };
+}
+
+function requireActiveStoreLicenseForWrites(req, _res, next) {
+  if (['GET', 'HEAD', 'OPTIONS'].includes(req.method) || req.path.startsWith('/subscription') || req.path.startsWith('/notifications')) return next();
+  const plan = planSummary(req.store);
+  if (!['EXPIRED', 'SUSPENDED'].includes(plan.status)) return next();
+  return next(new ApiError('SUBSCRIPTION_REQUIRED', `Your ${plan.name} subscription is ${plan.status.toLowerCase()}. Renew it to make changes; your existing data remains available.`));
+}
+
+function assertStoreCanAcceptOrders(store) {
+  if (!store) return;
+  const plan = planSummary(store);
+  if (['EXPIRED', 'SUSPENDED'].includes(plan.status)) {
+    throw new ApiError('SUBSCRIPTION_REQUIRED', 'This store is temporarily not accepting new orders. Please contact the store for help.');
+  }
+}
+
+async function assertMonthlyOrderCapacity(store) {
+  if (!store) return;
+  assertStoreCanAcceptOrders(store);
+  const limit = storeLimit(store, 'ordersPerMonth');
+  if (!Number.isFinite(limit)) return;
+  const monthStart = new Date();
+  monthStart.setUTCDate(1);
+  monthStart.setUTCHours(0, 0, 0, 0);
+  const count = await require('../models/Order').countDocuments({ storeId: store._id, createdAt: { $gte: monthStart }, orderStatus: { $ne: 'Cancelled' } });
+  if (count >= limit) throw new ApiError('PLAN_LIMIT_REACHED', `This store has reached its ${limit.toLocaleString('en-IN')} orders per month plan limit.`);
+}
+
+function requireProductCapacity(req, _res, next) {
+  Promise.resolve().then(async () => {
+    const limit = storeLimit(req.store, 'products');
+    if (!Number.isFinite(limit)) return next();
+    const count = await require('../models/Product').countDocuments({ storeId: req.store._id, isArchived: { $ne: true } });
+    if (count >= limit) throw new ApiError('PLAN_LIMIT_REACHED', `Your plan allows ${limit.toLocaleString('en-IN')} active products. Archive a product or upgrade your subscription.`);
+    return next();
+  }).catch(next);
+}
+
 function stripClientStoreId(req, _res, next) {
   if (req.body && Object.prototype.hasOwnProperty.call(req.body, 'storeId')) {
     delete req.body.storeId;
@@ -96,9 +145,14 @@ function assertStoreOwned(doc, req) {
 
 module.exports = {
   assertStoreOwned,
+  assertMonthlyOrderCapacity,
+  assertStoreCanAcceptOrders,
   optionalResolveStore,
   platformAdminUnscoped,
   requireStoreMember,
+  requireStoreFeature,
+  requireActiveStoreLicenseForWrites,
+  requireProductCapacity,
   requireStorePermission,
   stripClientStoreId,
 };

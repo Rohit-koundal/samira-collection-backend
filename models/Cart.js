@@ -1,6 +1,7 @@
 const mongoose = require('mongoose');
 
 const cartSchema = new mongoose.Schema({
+  storeId: { type: mongoose.Schema.Types.ObjectId, ref: 'Store', index: true },
   user: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   sessionId: { type: String, trim: true, maxlength: 120 },
   mergedGuestCarts: [{ type: mongoose.Schema.Types.ObjectId }],
@@ -15,7 +16,7 @@ const cartSchema = new mongoose.Schema({
   }],
 }, { timestamps: true, optimisticConcurrency: true });
 
-cartSchema.index({ user: 1 }, { unique: true, sparse: true });
-cartSchema.index({ sessionId: 1 }, { unique: true, sparse: true });
+cartSchema.index({ storeId: 1, user: 1 }, { unique: true, partialFilterExpression: { user: { $type: 'objectId' } } });
+cartSchema.index({ storeId: 1, sessionId: 1 }, { unique: true, partialFilterExpression: { sessionId: { $type: 'string' } } });
 
 module.exports = mongoose.model('Cart', cartSchema);

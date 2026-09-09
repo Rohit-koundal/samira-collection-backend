@@ -155,6 +155,46 @@ test('products are archived instead of hard-deleted', async () => {
   assert.equal(stored.isActive, false);
 });
 
+test('catalog archive, restore, duplicate, bulk update and export workflows remain reversible', async () => {
+  const { token } = await createAdmin();
+  const first = await createProduct({ name: 'Catalog One', slug: 'catalog-one', sku: 'CAT-1', stock: 4, lowStockAlert: 5, price: 1200 });
+  const second = await createProduct({ name: 'Catalog Two', slug: 'catalog-two', sku: 'CAT-2', stock: 8, price: 900 });
+
+  assert.equal((await request(`/api/admin/products/${first._id}`, { method: 'DELETE', token })).status, 200);
+  const current = await request('/api/admin/products', { token });
+  assert.equal(current.data.some((product) => product._id === String(first._id)), false);
+  const archived = await request('/api/admin/products?archive=only', { token });
+  assert.equal(archived.data.length, 1);
+  assert.equal(archived.data[0].name, 'Catalog One');
+
+  const restored = await request(`/api/admin/products/${first._id}/restore`, { method: 'PATCH', token });
+  assert.equal(restored.status, 200);
+  assert.equal(restored.data.isArchived, false);
+  assert.equal(restored.data.isActive, false);
+
+  const copy = await request(`/api/admin/products/${second._id}/duplicate`, { method: 'POST', token, body: {} });
+  assert.equal(copy.status, 201);
+  assert.equal(copy.data.isActive, false);
+  assert.notEqual(copy.data.sku, second.sku);
+
+  const bulk = await request('/api/admin/products/bulk', {
+    method: 'POST', token, body: { ids: [String(first._id), String(second._id)], action: 'best-seller' },
+  });
+  assert.equal(bulk.status, 200);
+  assert.equal(bulk.data.count, 2);
+  assert.equal(await Product.countDocuments({ _id: { $in: [first._id, second._id] }, isBestSeller: true }), 2);
+
+  const exported = await request(`/api/admin/products/export?ids=${first._id},${second._id}`, { token });
+  assert.equal(exported.status, 200);
+  assert.equal(exported.data.items.length, 2);
+  assert.ok(exported.data.items.every((item) => Object.hasOwn(item, 'costPrice')));
+
+  const paged = await request('/api/admin/products?page=1&limit=10&includeSummary=true', { token });
+  assert.equal(paged.status, 200);
+  assert.equal(paged.data.summary.total, 3);
+  assert.equal(paged.data.summary.low, 1);
+});
+
 test('pagination is opt-in and keeps the array format by default', async () => {
   const { token } = await createAdmin();
   await createProduct({ sku: 'PAGE-1' });
@@ -269,6 +309,7 @@ test('BEGIN_CHECKOUT is accepted as an analytics event', async () => {
 
 test('inventory ledger copies storeId from the sold product', async () => {
   const seller = await createSellerStore('Ledger Boutique');
+  await Store.updateOne({ _id: seller.store.id }, { status: 'PUBLISHED', publishedAt: new Date() });
   const product = await createProduct({
     name: 'Ledger Kurti',
     slug: 'ledger-kurti',
@@ -282,6 +323,7 @@ test('inventory ledger copies storeId from the sold product', async () => {
   const ordered = await request('/api/orders/cod', {
     method: 'POST',
     token,
+    headers: { 'x-store-slug': seller.store.slug },
     body: {
       orderItems: [{ product: String(product._id), quantity: 1 }],
       shippingAddress: validAddress(),

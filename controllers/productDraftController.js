@@ -9,6 +9,18 @@ const { isR2Configured, uploadImageToR2 } = require('../services/r2Upload');
 const { isCloudinaryConfigured, uploadImage: uploadImageToCloudinary } = require('../services/cloudinaryUpload');
 const { buildUploadFileResponse, isLocalRequest, normalizeProductImages, normalizeProductPayload, sanitizeProductImages } = require('../utils/imageUtils');
 const { normalizeProductSizing, validateProductSizing } = require('../services/productSizingService');
+const { andFilter } = require('../services/storeService');
+
+function draftQuery(req, extra = {}) {
+  return andFilter(extra, req.tenantFilter);
+}
+
+function withDraftStore(req, payload = {}) {
+  const next = { ...payload };
+  delete next.storeId;
+  if (req.store?._id) next.storeId = req.store._id;
+  return next;
+}
 
 exports.bulkUploadMiddleware = multer({
   storage: multer.diskStorage({
@@ -33,7 +45,7 @@ exports.bulkUpload = async (req, res, next) => {
     const uploaded = await uploadDraftImages(req, req.files || []);
     if (!uploaded.length) return res.status(400).json({ success: false, message: 'Please upload at least one image' });
 
-    const drafts = await ProductDraft.insertMany(uploaded.map((file, index) => ({
+    const drafts = await ProductDraft.insertMany(uploaded.map((file, index) => withDraftStore(req, {
       name: '',
       slug: uniqueDraftSlug(file.originalName || `draft-${index + 1}`),
       sku: `DRAFT-${Date.now()}-${String(index + 1).padStart(2, '0')}`,
@@ -72,27 +84,36 @@ exports.bulkUpload = async (req, res, next) => {
 };
 
 exports.listDrafts = asyncHandler(async (req, res) => {
-  const drafts = await ProductDraft.find().populate('category').sort('-updatedAt');
+  const drafts = await ProductDraft.find(draftQuery(req)).populate('category').sort('-updatedAt');
   res.json({ success: true, data: drafts.map(formatDraft) });
+});
+
+exports.createDraft = asyncHandler(async (req, res) => {
+  const payload = normalizeDraftPayload(req.body);
+  for (const key of ['_id', 'id', '__v', 'createdAt', 'updatedAt', 'storeId', 'status', 'publishedProductId', 'createdBy']) delete payload[key];
+  payload.slug = payload.slug || uniqueDraftSlug(payload.name || 'manual-product');
+  const draft = await ProductDraft.create(withDraftStore(req, { ...payload, status: 'draft', sourceType: 'manual', createdBy: req.user?._id }));
+  await draft.populate('category');
+  res.status(201).json({ success: true, message: 'Product draft saved', data: formatDraft(draft) });
 });
 
 exports.getDraft = asyncHandler(async (req, res) => {
   requireObjectId(req.params.id, 'draft id');
-  const draft = await ProductDraft.findById(req.params.id).populate('category');
+  const draft = await ProductDraft.findOne(draftQuery(req, { _id: req.params.id })).populate('category');
   if (!draft) return res.status(404).json({ success: false, message: 'Draft not found' });
   res.json({ success: true, data: formatDraft(draft) });
 });
 
 exports.updateDraft = asyncHandler(async (req, res) => {
   requireObjectId(req.params.id, 'draft id');
-  const draft = await ProductDraft.findById(req.params.id);
+  const draft = await ProductDraft.findOne(draftQuery(req, { _id: req.params.id }));
   if (!draft) return res.status(404).json({ success: false, message: 'Draft not found' });
   if (draft.status === 'published') return res.status(409).json({ success: false, message: 'This draft is already published. Open the published product to edit its details.' });
   const payload = normalizeDraftPayload(req.body);
   // Publication state, identity and source provenance are never client-editable.
   for (const key of ['_id', 'id', '__v', 'createdAt', 'updatedAt', 'sourceType', 'sourceSocialImportId', 'sourceJobId', 'sourceCandidateId', 'sourceUrl', 'sourcePlatform', 'createdBy', 'storeId', 'status', 'publishedProductId', 'importContext']) delete payload[key];
   if (payload.stock !== undefined && (!Number.isSafeInteger(payload.stock) || payload.stock < 0)) return res.status(400).json({ success: false, message: 'Stock must be a whole number of 0 or more' });
-  for (const key of ['price', 'sellingPrice', 'originalPrice']) if (payload[key] !== undefined && (!Number.isFinite(payload[key]) || payload[key] < 0)) return res.status(400).json({ success: false, message: 'Product prices must be finite amounts of 0 or more' });
+  for (const key of ['price', 'sellingPrice', 'originalPrice', 'costPrice', 'gstRate', 'shippingWeightKg']) if (payload[key] !== undefined && (!Number.isFinite(payload[key]) || payload[key] < 0)) return res.status(400).json({ success: false, message: 'Product amounts must be finite values of 0 or more' });
   if (payload.name && !payload.slug) payload.slug = uniqueDraftSlug(payload.name, draft._id);
   Object.assign(draft, payload);
   await draft.save();
@@ -102,7 +123,7 @@ exports.updateDraft = asyncHandler(async (req, res) => {
 
 exports.deleteDraft = asyncHandler(async (req, res) => {
   requireObjectId(req.params.id, 'draft id');
-  const deleted = await ProductDraft.findByIdAndDelete(req.params.id);
+  const deleted = await ProductDraft.findOneAndDelete(draftQuery(req, { _id: req.params.id }));
   if (!deleted) return res.status(404).json({ success: false, message: 'Draft not found' });
   res.json({ success: true, message: 'Draft deleted successfully' });
 });
@@ -111,7 +132,7 @@ exports.publishSelected = asyncHandler(async (req, res) => {
   const ids = Array.isArray(req.body.ids) ? [...new Set(req.body.ids.filter(Boolean).map(id => String(requireObjectId(id, 'draft id'))))] : [];
   if (!ids.length) return res.status(400).json({ success: false, message: 'Please select at least one draft' });
 
-  const drafts = await ProductDraft.find({ _id: { $in: ids } }).populate('category');
+  const drafts = await ProductDraft.find(draftQuery(req, { _id: { $in: ids } })).populate('category');
   if (drafts.length !== ids.length) return res.status(404).json({ success: false, message: 'One or more selected drafts no longer exist. Refresh the list before publishing.' });
   const payloads = new Map();
   for (const draft of drafts) if (!(draft.status === 'published' && draft.publishedProductId)) payloads.set(String(draft._id), await applyProductStructure(buildProductPayloadFromDraft(draft)));
@@ -134,9 +155,9 @@ async function publishPreparedDraft(draft, prepared) {
     }
     const productPayload = prepared || await prepareImportedDraft(draft);
     if (draft.sourceType && !productPayload.sku) productPayload.sku = `IMPORT-${String(draft._id).slice(-10).toUpperCase()}`;
-    productPayload.slug = await ensureUniqueProductSlug(productPayload.slug || productPayload.name, draft._id);
+    productPayload.slug = await ensureUniqueProductSlug(productPayload.slug || productPayload.name, draft._id, draft.storeId);
     if (productPayload.sku) {
-      productPayload.sku = await ensureUniqueSku(productPayload.sku, draft._id);
+      productPayload.sku = await ensureUniqueSku(productPayload.sku, draft._id, draft.storeId);
     }
     // The unique sourceDraftId index makes retries and concurrent publication
     // converge on one product for ordinary uploads as well as imported drafts.
@@ -194,6 +215,13 @@ function normalizeDraftPayload(body = {}) {
   if (payload.originalPrice !== undefined) payload.originalPrice = Number(payload.originalPrice);
   if (payload.sellingPrice !== undefined) payload.sellingPrice = Number(payload.sellingPrice);
   if (payload.stock !== undefined) payload.stock = Number(payload.stock);
+  for (const key of ['costPrice', 'gstRate', 'lowStockAlert', 'reorderQuantity', 'shippingWeightKg']) if (payload[key] !== undefined) payload[key] = Number(payload[key]);
+  if (payload.packageDimensions && typeof payload.packageDimensions === 'object') payload.packageDimensions = {
+    lengthCm: Number(payload.packageDimensions.lengthCm || 0),
+    widthCm: Number(payload.packageDimensions.widthCm || 0),
+    heightCm: Number(payload.packageDimensions.heightCm || 0),
+  };
+  for (const key of ['restockAt', 'publishAt', 'saleStartAt', 'saleEndAt']) if (payload[key] === '' || payload[key] === null) payload[key] = null;
   if (payload.sizeChart) payload.sizeChart = normalizeSizeChart(payload.sizeChart);
   return payload;
 }
@@ -215,6 +243,10 @@ function buildProductPayloadFromDraft(draft) {
     subCategory: data.subCategory || '',
     price: sellingPrice,
     originalPrice,
+    costPrice: Number(data.costPrice || 0),
+    gstRate: Number(data.gstRate || 0),
+    hsnCode: data.hsnCode || '',
+    barcode: data.barcode || '',
     discountPercentage: originalPrice > sellingPrice ? Math.round(((originalPrice - sellingPrice) / originalPrice) * 100) : 0,
     images: data.images || (data.image ? [{ url: data.image, primary: true }] : []),
     videos: data.videos || [],
@@ -227,6 +259,20 @@ function buildProductPayloadFromDraft(draft) {
     fabric: data.fabric || '',
     occasion: data.occasion || '',
     stock: Number(data.stock || 0),
+    lowStockAlert: Number(data.lowStockAlert ?? 5),
+    reorderQuantity: Number(data.reorderQuantity || 0),
+    shippingWeightKg: Number(data.shippingWeightKg || 0),
+    packageDimensions: data.packageDimensions || {},
+    countryOfOrigin: data.countryOfOrigin || 'India',
+    manufacturerDetails: data.manufacturerDetails || '',
+    warranty: data.warranty || '',
+    supplierName: data.supplierName || '',
+    supplierSku: data.supplierSku || '',
+    restockAt: data.restockAt || null,
+    publishAt: data.publishAt || null,
+    saleStartAt: data.saleStartAt || null,
+    saleEndAt: data.saleEndAt || null,
+    variants: data.variants || [],
     tags: data.tags || [],
     highlights: data.highlights || [],
     careInstructions: data.careInstructions || '',
@@ -261,22 +307,22 @@ function validatePublishDraft(draft, prepared) {
   return '';
 }
 
-async function ensureUniqueProductSlug(baseSlug, draftId) {
+async function ensureUniqueProductSlug(baseSlug, draftId, storeId) {
   const cleanBase = slugify(baseSlug || `draft-${draftId}`);
   let candidate = cleanBase;
   let suffix = 1;
-  while (await Product.exists({ slug: candidate })) {
+  while (await Product.exists(andFilter({ slug: candidate }, storeId ? { storeId } : {}))) {
     suffix += 1;
     candidate = `${cleanBase}-${suffix}`;
   }
   return candidate;
 }
 
-async function ensureUniqueSku(baseSku, draftId) {
+async function ensureUniqueSku(baseSku, draftId, storeId) {
   const cleanBase = String(baseSku || `DRAFT-${draftId}`).trim();
   let candidate = cleanBase;
   let suffix = 1;
-  while (await Product.exists({ sku: candidate })) {
+  while (await Product.exists(andFilter({ sku: candidate }, storeId ? { storeId } : {}))) {
     suffix += 1;
     candidate = `${cleanBase}-${suffix}`;
   }

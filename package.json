@@ -11,6 +11,7 @@
     "server": "node server.js",
     "worker:reels": "node workers/reelImport.worker.js",
     "check": "node --check server.js && node --check app.js",
+    "keys:license": "node scripts/generate-license-keys.js",
     "test": "node --test --test-concurrency=1 \"tests/*.test.js\"",
     "test:payments": "node scripts/test-payment-flow.js"
   },

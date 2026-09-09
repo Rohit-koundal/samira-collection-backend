@@ -14,6 +14,18 @@ function variantKey(size = '', color = '') {
   return `${String(size || '').trim().toLowerCase()}::${String(color || '').trim().toLowerCase()}`;
 }
 
+function normalizeOptionValues(value, size = '', color = '') {
+  const source = value instanceof Map ? Object.fromEntries(value) : (value && typeof value === 'object' && !Array.isArray(value) ? value : {});
+  const entries = Object.entries(source).slice(0, 6).map(([key, option]) => [
+    String(key || '').trim().toLowerCase().replace(/[^a-z0-9_]/g, '').slice(0, 40),
+    String(option ?? '').trim().slice(0, 100),
+  ]).filter(([key, option]) => key && option);
+  const result = Object.fromEntries(entries);
+  if (size && !result.size) result.size = size;
+  if (color && !result.colour && !result.color) result.colour = color;
+  return result;
+}
+
 function variantId(variant) {
   return variant?._id ? String(variant._id) : '';
 }
@@ -39,7 +51,7 @@ function requireVariant(product, selection = {}) {
   if (!hasManagedVariants(product)) return null;
   const variant = findVariant(product, selection);
   if (!variant) {
-    throw new ApiError('VARIANT_UNAVAILABLE', 'Please choose an available size and colour');
+    throw new ApiError('VARIANT_UNAVAILABLE', 'Please choose an available product option');
   }
   return variant;
 }
@@ -82,11 +94,13 @@ function normalizeVariantInput(raw = {}, product = {}) {
   const stock = Math.max(0, Number(raw.stock || 0));
   const price = Number(raw.price || 0);
   const originalPrice = Number(raw.originalPrice || 0);
+  const optionValues = normalizeOptionValues(raw.optionValues, size, color);
   return {
     ...(raw._id && mongoose.Types.ObjectId.isValid(raw._id) ? { _id: raw._id } : {}),
     sku: String(raw.sku || '').trim() || undefined,
     size,
     color,
+    optionValues,
     stock,
     price: price > 0 ? price : undefined,
     originalPrice: originalPrice > 0 ? originalPrice : undefined,
@@ -99,7 +113,7 @@ function normalizeVariantsPayload(variants, product = {}) {
   if (!Array.isArray(variants)) return undefined;
   return variants
     .map((variant) => normalizeVariantInput(variant, product))
-    .filter((variant) => variant.size || variant.color);
+    .filter((variant) => variant.size || variant.color || Object.keys(variant.optionValues || {}).length);
 }
 
 module.exports = {

@@ -19,9 +19,10 @@ function requireCartIdentity(req) {
   throw new ApiError('UNAUTHORIZED', 'Sign in or keep a shopping session to update your cart');
 }
 
-async function mergeSessionCartIntoUser(userId, sessionId) {
+async function mergeSessionCartIntoUser(userId, sessionId, req) {
   if (!userId || !sessionId) return;
-  const guest = await Cart.findOne({ sessionId });
+  const tenant = req.tenantFilter || {};
+  const guest = await Cart.findOne(andFilter({ sessionId }, tenant));
   if (!guest) return;
   if (guest.user && String(guest.user) === String(userId)) {
     guest.sessionId = undefined;
@@ -30,7 +31,7 @@ async function mergeSessionCartIntoUser(userId, sessionId) {
   }
   if (guest.user && String(guest.user) !== String(userId)) return;
 
-  let userCart = await Cart.findOne({ user: userId });
+  let userCart = await Cart.findOne(andFilter({ user: userId }, tenant));
   if (!userCart) {
     guest.user = userId;
     guest.sessionId = undefined;
@@ -78,15 +79,15 @@ async function findCart(req, { create = false } = {}) {
   const sessionId = readSessionId(req);
 
   if (userId) {
-    await mergeSessionCartIntoUser(userId, sessionId);
-    let cart = await Cart.findOne({ user: userId });
-    if (!cart && create) cart = await Cart.create({ user: userId, items: [] });
+    await mergeSessionCartIntoUser(userId, sessionId, req);
+    let cart = await Cart.findOne(andFilter({ user: userId }, req.tenantFilter));
+    if (!cart && create) cart = await Cart.create({ user: userId, items: [], ...(req.store?._id ? { storeId: req.store._id } : {}) });
     return cart;
   }
 
   if (sessionId) {
-    let cart = await Cart.findOne({ sessionId });
-    if (!cart && create) cart = await Cart.create({ sessionId, items: [] });
+    let cart = await Cart.findOne(andFilter({ sessionId }, req.tenantFilter));
+    if (!cart && create) cart = await Cart.create({ sessionId, items: [], ...(req.store?._id ? { storeId: req.store._id } : {}) });
     return cart;
   }
 

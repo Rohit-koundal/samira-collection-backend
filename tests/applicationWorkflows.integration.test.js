@@ -6,6 +6,9 @@ const { createMasterOwner, createProvisionedSeller } = require('./accessFixtures
 const Product = require('../models/Product');
 const VariantGroup = require('../models/VariantGroup');
 const Store = require('../models/Store');
+const Cart = require('../models/Cart');
+const Notification = require('../models/Notification');
+const Order = require('../models/Order');
 const Subscriber = require('../models/Subscriber');
 const { readConfiguration } = require('../services/masterConfigurationService');
 test.before(startTestEnvironment);
@@ -203,6 +206,7 @@ test('seller CRM, campaign analytics, manual shipment and reports agree with its
   const seller = await createProvisionedSeller('Commerce Workflow');
   await Store.updateOne({ _id: seller.store.id }, { status: 'PUBLISHED' });
   const headers = { 'x-store-id': seller.store.id };
+  const storefrontHeaders = { 'x-store-slug': seller.store.slug };
   const customer = await createCustomer();
   const product = await createProduct({ storeId: seller.store.id, stock: 8 });
   assert.equal((await get('/api/stores', seller.token)).length, 1);
@@ -215,14 +219,24 @@ test('seller CRM, campaign analytics, manual shipment and reports agree with its
   assert.equal(callback.status, 302);
   assert.match(callback.headers.get('location'), /\/seller\/instagram\?ig=error$/);
   for (const name of ['STORE_VIEW','PRODUCT_VIEW','ADD_TO_CART','BEGIN_CHECKOUT']) await call('POST', `/api/analytics/events?store=${seller.store.slug}`, { name, productId: String(product._id), sessionId: 'workflow-analytics-session', source: 'instagram', campaign: 'workflow-launch' }, customer.token, 202);
-  const order = await call('POST', '/api/orders/cod', { orderItems: [{ product: String(product._id), quantity: 1, size: 'M', color: 'Red' }], shippingAddress: validAddress(), paymentMethod: 'COD', attribution: { source: 'instagram', campaign: 'workflow-launch' } }, customer.token, 201);
+  const order = await call('POST', '/api/orders/cod', { orderItems: [{ product: String(product._id), quantity: 1, size: 'M', color: 'Red' }], shippingAddress: validAddress(), paymentMethod: 'COD', attribution: { source: 'instagram', campaign: 'workflow-launch' } }, customer.token, 201, storefrontHeaders);
+  assert.equal((await get('/api/seller/inventory/history', seller.token, headers)).items[0].type, 'SALE');
   assert.equal((await get('/api/seller/orders', seller.token, headers)).length, 1);
   assert.equal((await get(`/api/seller/orders/${order._id}`, seller.token, headers))._id, order._id);
   const shipment = await call('PUT', `/api/seller/orders/${order._id}/shipment`, { courierName: 'Fixture Courier', trackingNumber: 'FIXTURE-001', trackingUrl: 'https://example.test/tracking/FIXTURE-001', status: 'SHIPPED' }, seller.token, 200, headers);
   assert.equal(shipment.trackingNumber, 'FIXTURE-001');
-  const updated = await call('PUT', `/api/seller/crm/${customer.user._id}`, { tags: ['VIP'], notes: 'Fixture customer sizing preference', acquisition: 'Instagram' }, seller.token, 200, headers);
+  const updated = await call('PUT', `/api/seller/crm/${customer.user._id}`, { tags: ['VIP'], notes: 'Fixture customer sizing preference', acquisition: 'Instagram', marketingConsent: true }, seller.token, 200, headers);
   assert.deepEqual(updated.tags, ['VIP']);
-  const crm = await get('/api/seller/crm', seller.token, headers); assert.equal(crm.length, 1); assert.equal(crm[0].notes, updated.notes);
+  assert.equal(updated.marketingConsent, true);
+  const crm = await get('/api/seller/crm', seller.token, headers); assert.equal(crm.length, 1); assert.equal(crm[0].notes, updated.notes); assert.equal(crm[0].marketingConsent, true);
+  const whatsapp = await call('POST', '/api/seller/business/customer-offers', { customerIds: [String(customer.user._id)], channel: 'WHATSAPP_LINK', title: 'Review before sending' }, seller.token, 200, headers);
+  assert.equal(whatsapp.requiresReview, true); assert.equal(whatsapp.prepared, 1); assert.match(whatsapp.items[0].url, /^https:\/\/wa\.me\//);
+  const whatsappDuplicate = await call('POST', '/api/seller/business/customer-offers', { customerIds: [String(customer.user._id)], channel: 'WHATSAPP_LINK', title: 'Review before sending' }, seller.token, 200, headers);
+  assert.equal(whatsappDuplicate.prepared, 0); assert.equal(whatsappDuplicate.skipped, 1);
+  const offer = await call('POST', '/api/seller/business/customer-offers', { customerIds: [String(customer.user._id)], channel: 'IN_APP', title: 'A private offer', message: 'Thank you for shopping with us.' }, seller.token, 200, headers);
+  assert.equal(offer.sent, 1);
+  assert.equal((await get('/api/notifications', customer.token)).some((item) => item.event === 'CRM_OFFER'), true);
+  assert.equal((await call('POST', '/api/seller/business/customer-offers', { customerIds: [String(customer.user._id)], channel: 'IN_APP', title: 'A private offer' }, seller.token, 200, headers)).skipped, 1);
   const funnel = await get('/api/seller/analytics/funnel?range=30d', seller.token, headers);
   assert.equal(funnel.events.PRODUCT_VIEW, 1); assert.equal(funnel.attributedSales[0].revenue, order.finalAmount);
   const sales = await get('/api/seller/reports/sales?range=30d', seller.token, headers); assert.equal(sales.totals.orders, 1);
@@ -231,12 +245,105 @@ test('seller CRM, campaign analytics, manual shipment and reports agree with its
   const other = await createProvisionedSeller('Unrelated Workflow');
   await call('GET', `/api/seller/orders/${order._id}`, undefined, other.token, 404, { 'x-store-id': other.store.id });
   await call('PUT', `/api/seller/orders/${order._id}/status`, { orderStatus: 'Delivered' }, seller.token, 200, headers);
-  const returnRequest = await call('POST','/api/returns',{order:order._id,product:String(product._id),quantity:1,type:'return',reason:'Fixture return'},customer.token,201);
+  const returnRequest = await call('POST','/api/returns',{order:order._id,product:String(product._id),quantity:1,type:'return',reason:'Fixture return'},customer.token,201,storefrontHeaders);
   assert.equal((await get('/api/seller/returns',seller.token,headers)).length,1);
   await call('PUT',`/api/seller/returns/${returnRequest._id}/status`,{status:'Received'},other.token,404,{'x-store-id':other.store.id});
   assert.equal((await Product.findById(product._id)).stock,7);
   await call('PUT',`/api/seller/returns/${returnRequest._id}/status`,{status:'Received'},seller.token,200,headers);
   assert.equal((await Product.findById(product._id)).stock,8);
+});
+
+test('business center isolates abandoned carts, limits reminders, answers from live data and publishes campaign settings', async () => {
+  const seller = await createProvisionedSeller('Business Center Workflow');
+  const other = await createProvisionedSeller('Other Business Center Workflow');
+  await Store.updateOne({ _id: seller.store.id }, {
+    status: 'PUBLISHED', plan: 'PREMIUM', 'license.status': 'ACTIVE', logo: '/uploads/store-logo.jpg',
+    whatsappNumber: '9123456789', paymentReady: true, shippingReady: true,
+    pickupAddress: { fullName: 'Seller', mobile: '9123456789', pincode: '176001', city: 'Kangra', state: 'Himachal Pradesh', houseNo: '1', area: 'Market' },
+  });
+  const product = await createProduct({ storeId: seller.store.id, stock: 8, name: 'Recovery Workflow Product' });
+  const customer = await createCustomer({ phone: '9234567890' });
+  const olderOrder = await Order.create({
+    storeId: seller.store.id, user: customer.user._id,
+    orderItems: [{ product: product._id, name: product.name, quantity: 1, price: 400 }],
+    finalAmount: 400, paymentStatus: 'Paid', paymentState: 'PAID', orderStatus: 'Delivered',
+  });
+  await Order.collection.updateOne({ _id: olderOrder._id }, { $set: { createdAt: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000) } });
+  const recentOrder = await Order.create({
+    storeId: seller.store.id, user: customer.user._id,
+    orderItems: [{ product: product._id, name: product.name, quantity: 1, price: 800 }],
+    finalAmount: 800, paymentStatus: 'Paid', paymentState: 'PAID', orderStatus: 'Delivered',
+  });
+  await Order.collection.updateOne({ _id: recentOrder._id }, { $set: { createdAt: new Date(Date.now() - 3 * 24 * 60 * 60 * 1000) } });
+  const bag = await call('POST', '/api/cart', { product: String(product._id), size: 'M', color: 'Red', quantity: 2 }, customer.token, 201, { 'x-store-slug': seller.store.slug });
+  await Cart.updateOne({ _id: bag._id }, { $set: { updatedAt: new Date(Date.now() - 60 * 60 * 1000) } }, { timestamps: false });
+  const headers = { 'x-store-id': seller.store.id };
+  const otherHeaders = { 'x-store-id': other.store.id };
+
+  const settings = await get('/api/seller/settings', seller.token, headers);
+  const savedSettings = await call('PUT', '/api/seller/settings', {
+    storeName: 'Business Center Shop',
+    brandIdentityEnabled: true,
+    logoUrl: '/uploads/store-logo.jpg',
+    deliveryCharge: 77,
+    expectedUpdatedAt: new Date(settings.updatedAt).toISOString(),
+  }, seller.token, 200, headers);
+  assert.equal(savedSettings.storeId, seller.store.id);
+  assert.equal((await get('/api/seller/settings', other.token, otherHeaders)).storeName, 'Samira Collection');
+  assert.equal((await get(`/api/settings/payment-methods?store=${seller.store.slug}`)).deliveryCharge, 77);
+  const storefrontConfig = await get(`/api/website-config?store=${seller.store.slug}`);
+  assert.equal(storefrontConfig.config.branding.websiteName, 'Business Center Shop');
+  assert.equal(storefrontConfig.config.branding.logo, '/uploads/store-logo.jpg');
+  const design = await get('/api/seller/design', seller.token, headers);
+  design.draftConfig.colors.primary = '#123456';
+  await call('PUT', '/api/seller/design', { config: design.draftConfig }, seller.token, 200, headers);
+  await call('POST', '/api/seller/design/publish', {}, seller.token, 200, headers);
+  assert.equal((await get(`/api/website-config?store=${seller.store.slug}`)).config.colors.primary, '#123456');
+  assert.notEqual((await get('/api/seller/design', other.token, otherHeaders)).draftConfig.colors.primary, '#123456');
+
+  const overview = await get('/api/seller/business/overview', seller.token, headers);
+  assert.equal(overview.store.id, seller.store.id);
+  assert.equal(overview.platform.id, 'PREMIUM');
+  assert.equal(overview.health.metrics.abandonedCarts, 1);
+  assert.equal(overview.health.performance.current.orders, 2);
+  assert.equal(overview.health.performance.current.paidRevenue, 1200);
+  assert.equal(overview.health.period.key, '30d');
+  assert.equal(overview.health.priorities.some((item) => item.id === 'inventory'), true);
+  const sevenDays = await get('/api/seller/business/overview?range=7d', seller.token, headers);
+  assert.equal(sevenDays.health.performance.current.orders, 1);
+  assert.equal(sevenDays.health.performance.previous.orders, 1);
+  assert.equal(sevenDays.health.performance.change.paidRevenue, 100);
+  const abandoned = await get('/api/seller/business/abandoned-carts', seller.token, headers);
+  assert.equal(abandoned.total, 1);
+  assert.equal(abandoned.items[0].items[0].productId, String(product._id));
+  assert.equal((await get('/api/seller/business/abandoned-carts', other.token, otherHeaders)).total, 0);
+
+  const reminder = await call('POST', `/api/seller/business/abandoned-carts/${bag._id}/reminder`, { channel: 'IN_APP' }, seller.token, 200, headers);
+  assert.equal(reminder.sent, true);
+  assert.equal(await Notification.countDocuments({ storeId: seller.store.id, event: 'ABANDONED_CART_REMINDER' }), 1);
+  await call('POST', `/api/seller/business/abandoned-carts/${bag._id}/reminder`, { channel: 'IN_APP' }, seller.token, 409, headers);
+
+  await Order.create({
+    storeId: seller.store.id, user: customer.user._id,
+    orderItems: [{ product: product._id, name: product.name, quantity: 1, price: 900 }],
+    finalAmount: 900, paymentStatus: 'Paid', paymentState: 'PAID', orderStatus: 'Confirmed',
+    attribution: { campaign: 'diwali' },
+  });
+  const recovered = await get('/api/seller/business/overview?range=7d', seller.token, headers);
+  assert.equal(recovered.health.recovery.remindersSent, 1);
+  assert.equal(recovered.health.recovery.recoveredOrders, 1);
+  assert.equal(recovered.health.recovery.recoveredRevenue, 900);
+
+  const assistant = await call('POST', '/api/seller/business/assistant', { question: 'What should I restock?' }, seller.token, 200, headers);
+  assert.equal(assistant.source, 'live_store_data');
+  assert.equal(assistant.facts.activeProducts, 1);
+  assert.equal((await get('/api/seller/business/overview', seller.token, headers)).health.assistantHistory[0].question, 'What should I restock?');
+  const endsAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+  const campaign = await call('PUT', '/api/seller/business/festival', { enabled: true, preset: 'diwali', title: 'Diwali edit is live', badgeText: 'Festive offer', countdownEndsAt: endsAt, effects: true }, seller.token, 200, headers);
+  assert.equal(campaign.enabled, true);
+  assert.equal(campaign.campaignKey, 'diwali');
+  assert.equal((await get(`/api/stores/${seller.store.slug}`)).festivalCampaign.title, 'Diwali edit is live');
+  assert.equal((await get('/api/seller/business/overview?range=7d', seller.token, headers)).health.campaign.orders, 1);
 });
 
 test('storefront catalog scope honors query and header navigation and never exposes hidden products', async () => {
@@ -268,6 +375,9 @@ test('admin catalog editing, inventory actions, coupon lifecycle and dashboard a
   assert.equal(saved.name, 'Edited Workflow Silk Saree');
   assert.equal((await get(`/api/admin/products/${product._id}`, admin.token)).description, 'Updated catalog details.');
   await call('PATCH', `/api/admin/products/${product._id}/stock`, { stock: 3 }, admin.token);
+  const inventoryHistory = await get('/api/admin/inventory/history?limit=10', admin.token);
+  assert.equal(inventoryHistory.items[0].type, 'MANUAL_ADJUSTMENT');
+  assert.equal(inventoryHistory.items[0].stockAfter, 3);
   assert.equal((await get('/api/admin/inventory/low-stock', admin.token)).length, 1);
   await call('PATCH', `/api/admin/products/${product._id}/mark-out-of-stock`, {}, admin.token);
   assert.equal((await get(`/api/products/${saved.slug}`)).stock, 0);
@@ -283,6 +393,11 @@ test('admin catalog editing, inventory actions, coupon lifecycle and dashboard a
   assert.equal((await call('POST', '/api/coupons/apply', { code: coupon.code, cartTotal: 1000, paymentMethod: 'COD' }, customer.token)).discountAmount, 75);
   const order = await call('POST', '/api/orders/cod', { orderItems: [{ product: product._id, quantity: 1, color: 'Rose' }], coupon: { code: coupon.code }, shippingAddress: validAddress(), paymentMethod: 'COD' }, customer.token, 201);
   assert.equal(order.couponDiscount, 75);
+  const automatic = await call('POST', '/api/admin/coupons', { code: 'AUTO-BUY-ONE', activationMode: 'AUTOMATIC', benefitType: 'BUY_X_GET_Y', type: 'Flat', discountValue: 0, buyQuantity: 1, getQuantity: 1, applicableProducts: [product._id], expiryDate: new Date(Date.now()+86400000).toISOString(), isActive: true, isPublic: true }, admin.token, 201);
+  const automaticQuote = await call('POST', '/api/orders/quote', { orderItems: [{ product: product._id, quantity: 2, color: 'Rose' }], shippingAddress: validAddress(), paymentMethod: 'COD' }, customer.token);
+  assert.equal(automaticQuote.totals.coupon.code, 'AUTO-BUY-ONE');
+  assert.equal(automaticQuote.totals.couponDiscount, 1000);
+  await call('DELETE', `/api/admin/coupons/${automatic._id}`, undefined, admin.token);
   await call('PUT', `/api/admin/orders/${order._id}/payment-status`, { paymentStatus: 'Paid' }, admin.token);
   const stats = await get('/api/admin/dashboard/stats', admin.token); assert.equal(stats.orders, 1); assert.equal(stats.revenue, order.finalAmount);
   assert.ok(await get('/api/admin/dashboard/overview', admin.token));

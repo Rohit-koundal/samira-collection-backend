@@ -118,7 +118,7 @@ async function loadOrderItems(orderItems, { tenantFilter = {} } = {}) {
  * creation, payment verification and the checkout quote endpoint.
  */
 async function buildOrderDraft({ orderItems, couponCode, paymentMethod, settings, userId, shippingAddress, tenantFilter } = {}) {
-  const storeSettings = settings || await getStoreSettings();
+  const storeSettings = settings || await getStoreSettings(tenantFilter || {});
   if (storeSettings.acceptingOrders === false) throw new ApiError('VALIDATION_ERROR', storeSettings.orderPauseMessage || 'The store is temporarily not accepting new orders.');
   const method = normalizeMethod(paymentMethod);
   const { items, totalMRP, sellingTotal } = await loadOrderItems(orderItems, { tenantFilter });
@@ -126,11 +126,11 @@ async function buildOrderDraft({ orderItems, couponCode, paymentMethod, settings
 
   let coupon = null;
   let couponDiscount = 0;
+  const couponTenantFilter = tenantFilter || (items[0]?.storeId ? defaultStoreFilter(items[0].storeId) : {});
   if (couponCode) {
     // A checkout can originate from the main storefront or a seller domain.
     // When no request tenant was resolved, derive it from the authoritative
     // product rows while continuing to support legacy coupons without storeId.
-    const couponTenantFilter = tenantFilter || (items[0]?.storeId ? defaultStoreFilter(items[0].storeId) : {});
     const priced = await couponService.validateAndPrice({
       code: couponCode,
       cartTotal: sellingTotal,
@@ -141,11 +141,17 @@ async function buildOrderDraft({ orderItems, couponCode, paymentMethod, settings
     });
     coupon = priced.coupon;
     couponDiscount = priced.discountAmount;
+  } else {
+    const automatic = await couponService.findBestAutomatic({ cartTotal: sellingTotal, paymentMethod: method, items, userId, tenantFilter: couponTenantFilter });
+    if (automatic) {
+      coupon = automatic.coupon;
+      couponDiscount = automatic.discountAmount;
+    }
   }
 
   const productDiscount = round(Math.max(0, totalMRP - sellingTotal));
   const shippingQuote = await require('./deliveryService').checkoutShipping({ items, settings: storeSettings, address: shippingAddress, paymentMethod: method, amount: sellingTotal });
-  const deliveryCharge = shippingQuote.deliveryCharge;
+  const deliveryCharge = coupon?.benefitType === 'FREE_SHIPPING' ? 0 : shippingQuote.deliveryCharge;
   const prepaidDiscount = resolvePrepaidDiscount(method, sellingTotal - couponDiscount, storeSettings);
   const platformFee = items.length ? Math.max(0, Number(storeSettings.platformFee ?? 23)) : 0;
   const taxRate = Math.max(0, Number(storeSettings.gstRate ?? 5));
@@ -172,6 +178,7 @@ async function buildOrderDraft({ orderItems, couponCode, paymentMethod, settings
     orderAmount: payableBeforeCod,
     pincode: shippingAddress?.pincode,
     userId,
+    tenantFilter: tenantFilter || {},
   });
 
   const codCharge = resolveCodCharge(method, storeSettings);
@@ -195,7 +202,7 @@ async function buildOrderDraft({ orderItems, couponCode, paymentMethod, settings
       taxAmount,
       taxRate,
       finalAmount,
-      coupon: coupon ? { code: coupon.code, discountAmount: couponDiscount } : undefined,
+      coupon: coupon ? { code: coupon.code, discountAmount: couponDiscount, activationMode: coupon.activationMode || 'CODE', benefitType: coupon.benefitType || 'DISCOUNT' } : undefined,
     },
   };
 }

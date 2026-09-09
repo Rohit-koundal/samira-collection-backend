@@ -16,7 +16,7 @@ const {
 const { andFilter } = require('../services/storeService');
 const { logAudit } = require('../services/auditService');
 const { auditSnapshot } = require('../utils/auditData');
-const COUPON_AUDIT_FIELDS = ['code', 'type', 'discountValue', 'minOrderAmount', 'maxDiscountAmount', 'validFrom', 'expiryDate', 'usageLimit', 'customerLimit', 'firstOrderOnly', 'isActive', 'isPublic', 'applicablePaymentMethods', 'applicableProducts', 'applicableCategories'];
+const COUPON_AUDIT_FIELDS = ['code', 'activationMode', 'benefitType', 'type', 'discountValue', 'buyQuantity', 'getQuantity', 'minOrderAmount', 'maxDiscountAmount', 'validFrom', 'expiryDate', 'usageLimit', 'customerLimit', 'firstOrderOnly', 'isActive', 'isPublic', 'applicablePaymentMethods', 'applicableProducts', 'applicableCategories'];
 
 const PAYMENT_METHODS = ['COD', 'UPI', 'CARD', 'NETBANKING', 'WALLET'];
 
@@ -49,6 +49,10 @@ function publicCouponView(coupon, eligibility = {}) {
     terms: value.terms || '',
     type: value.type,
     discountValue: value.discountValue,
+    activationMode: value.activationMode || 'CODE',
+    benefitType: value.benefitType || 'DISCOUNT',
+    buyQuantity: value.buyQuantity || 1,
+    getQuantity: value.getQuantity || 1,
     minOrderAmount: value.minOrderAmount || 0,
     maxDiscountAmount: value.maxDiscountAmount || 0,
     validFrom: value.validFrom || null,
@@ -102,6 +106,8 @@ exports.createCoupon = asyncHandler(async (req, res) => {
   const payload = readCouponPayload(req.body);
   delete payload.storeId;
   if (req.store?._id) payload.storeId = req.store._id;
+  const duplicate = await Coupon.exists(andFilter({ code: payload.code }, req.tenantFilter));
+  if (duplicate) throw new ApiError('DUPLICATE_REQUEST', 'A coupon with this code already exists');
   try {
     const coupon = await Coupon.create(payload);
     logAudit({ req, action: 'COUPON_CREATE', entityType: 'Coupon', entityId: coupon._id, storeId: coupon.storeId, after: auditSnapshot(coupon, COUPON_AUDIT_FIELDS) });
@@ -199,13 +205,17 @@ function readCouponPayload(body = {}) {
     title: optionalString(body.title, 'title', { max: 120 }),
     description: optionalString(body.description, 'description', { max: 500 }),
     terms: optionalString(body.terms, 'terms', { max: 1200 }),
+    activationMode: requireEnum(body.activationMode || 'CODE', ['CODE', 'AUTOMATIC'], 'activation mode'),
+    benefitType: requireEnum(body.benefitType || 'DISCOUNT', ['DISCOUNT', 'FREE_SHIPPING', 'BUY_X_GET_Y'], 'offer benefit'),
     type: requireEnum(body.type, ['Percentage', 'Flat'], 'type'),
   };
 
   const discountValue = Number(body.discountValue);
-  if (!Number.isFinite(discountValue) || discountValue <= 0) throw new ApiError('VALIDATION_ERROR', 'Discount value must be positive');
+  if (!Number.isFinite(discountValue) || (payload.benefitType === 'DISCOUNT' ? discountValue <= 0 : discountValue < 0)) throw new ApiError('VALIDATION_ERROR', 'Discount value must be positive');
   if (payload.type === 'Percentage' && discountValue > 100) throw new ApiError('VALIDATION_ERROR', 'Percentage discount cannot exceed 100');
   payload.discountValue = discountValue;
+  payload.buyQuantity = readPositiveQuantity(body.buyQuantity, 'Buy quantity');
+  payload.getQuantity = readPositiveQuantity(body.getQuantity, 'Free quantity');
 
   const minOrderAmount = Number(body.minOrderAmount || 0);
   if (!Number.isFinite(minOrderAmount) || minOrderAmount < 0) throw new ApiError('VALIDATION_ERROR', 'Minimum order amount cannot be negative');
@@ -236,6 +246,12 @@ function readCouponPayload(body = {}) {
   payload.isPublic = requireBoolean(body.isPublic ?? true, 'isPublic');
   payload.isActive = requireBoolean(body.isActive ?? true, 'isActive');
   return payload;
+}
+
+function readPositiveQuantity(value, field) {
+  const number = Number(value ?? 1);
+  if (!Number.isInteger(number) || number < 1 || number > 100) throw new ApiError('VALIDATION_ERROR', `${field} must be a whole number between 1 and 100`);
+  return number;
 }
 
 exports.livePublicQuery = livePublicQuery;

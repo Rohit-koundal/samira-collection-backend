@@ -44,7 +44,7 @@ exports.fill = asyncHandler(async (req, res) => {
   res.on('close', cancel);
   try {
     const [categories, configuration] = await Promise.all([
-      Category.find(andFilter({ isActive: { $ne: false } }, req.tenantFilter)).select('_id name').limit(100).lean(), readConfiguration(),
+      Category.find(andFilter({ isActive: { $ne: false } }, req.tenantFilter)).select('_id name').limit(100).lean(), readConfiguration(req.store?._id),
     ]);
     const attributes = configuration.structure.attributes || [];
     const caption = sourceText(req.body || {}, categories, attributes);

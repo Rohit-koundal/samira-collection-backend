@@ -83,6 +83,9 @@ async function buildCustomerRows(storeId) {
       acquisition: profile.acquisition || row.acquisition || '',
       tags,
       notes: profile.notes || '',
+      marketingConsent: profile.marketingConsent === true,
+      marketingConsentSource: profile.marketingConsentSource || '',
+      marketingConsentAt: profile.marketingConsentAt || null,
     };
   }).sort((a, b) => b.spend - a.spend);
 }

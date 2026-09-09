@@ -29,6 +29,21 @@ test('health reports redis without exposing the URL', async () => {
   assert.equal(health.status, 200);
   assert.ok(['skipped', 'connected', 'disconnected'].includes(health.data.redis));
   assert.equal(JSON.stringify(health.data).includes('redis://'), false);
+  assert.equal(health.headers.get('x-powered-by'), null);
+  assert.equal(health.headers.get('x-content-type-options'), 'nosniff');
+  assert.equal(health.headers.get('x-frame-options'), 'SAMEORIGIN');
+  assert.match(health.headers.get('content-security-policy'), /default-src 'none'/);
+});
+
+test('private APIs are not cached and unconfigured Render origins are not trusted', async () => {
+  const privateResponse = await request('/api/auth/me');
+  assert.equal(privateResponse.status, 401);
+  assert.match(privateResponse.headers.get('cache-control'), /no-store/);
+
+  const rejected = await request('/health', { headers: { Origin: 'https://untrusted-client.onrender.com' } });
+  assert.equal(rejected.headers.get('access-control-allow-origin'), null);
+  const allowed = await request('/health', { headers: { Origin: 'https://samira-collection.onrender.com' } });
+  assert.equal(allowed.headers.get('access-control-allow-origin'), 'https://samira-collection.onrender.com');
 });
 
 test('sitemap and share URLs are path-based', async () => {
@@ -133,5 +148,6 @@ test('shipping provider never invents an AWB', async () => {
   const provider = await request('/api/seller/shipping/provider', { token });
   assert.equal(provider.status, 200);
   assert.equal(provider.data.liveBooking, false);
-  assert.ok(['manual', 'shiprocket', 'delhivery'].includes(provider.data.name));
+  assert.ok(['manual', 'bluedart', 'shiprocket', 'delhivery', 'xpressbees'].includes(provider.data.name));
+  assert.ok(Array.isArray(provider.data.providers));
 });

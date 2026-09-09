@@ -12,10 +12,13 @@ function scope(req, extra = {}) {
 }
 
 exports.stats = async (req, res) => {
+  const scopedCustomers = req.tenantFilter && Object.keys(req.tenantFilter).length
+    ? Order.distinct('user', scope(req, { user: { $ne: null } })).then((ids) => ids.length)
+    : User.countDocuments({ role: 'customer' });
   const [products, orders, customers, coupons, returns, revenue] = await Promise.all([
     Product.countDocuments(scope(req)),
     Order.countDocuments(scope(req)),
-    User.countDocuments({ role: 'customer' }),
+    scopedCustomers,
     Coupon.countDocuments(scope(req, { isActive: true })),
     ReturnExchange.countDocuments(scope(req, { status: 'Requested' })),
     Order.aggregate([{ $match: andFilter({ paymentStatus: 'Paid' }, req.tenantFilter) }, { $group: { _id: null, total: { $sum: '$finalAmount' } } }]),
@@ -33,8 +36,8 @@ exports.overview = asyncHandler(async (req, res) => {
 exports.salesReport = async (req, res) => {
   const { from, to, preset } = parseReportRange(req.query);
   const createdAt = { $gte: from, $lte: to };
-  const liveOrders = { createdAt, orderStatus: { $ne: 'Cancelled' } };
-  const paidOrders = { createdAt, paymentStatus: 'Paid' };
+  const liveOrders = scope(req, { createdAt, orderStatus: { $ne: 'Cancelled' } });
+  const paidOrders = scope(req, { createdAt, paymentStatus: 'Paid' });
   const useDaily = (to.getTime() - from.getTime()) <= 14 * 24 * 60 * 60 * 1000;
 
   const [orderCount, paidCount, revenue, customers, byStatus, byPayment, byCoupon, series] = await Promise.all([
@@ -44,7 +47,7 @@ exports.salesReport = async (req, res) => {
       { $match: paidOrders },
       { $group: { _id: null, total: { $sum: '$finalAmount' } } },
     ]),
-    User.countDocuments({ role: 'customer', createdAt }),
+    Order.distinct('user', scope(req, { createdAt, user: { $ne: null } })).then((ids) => ids.length),
     Order.aggregate([
       { $match: liveOrders },
       { $group: { _id: '$orderStatus', total: { $sum: 1 } } },
@@ -54,7 +57,7 @@ exports.salesReport = async (req, res) => {
       { $group: { _id: '$paymentMethod', total: { $sum: 1 }, revenue: { $sum: { $cond: [{ $eq: ['$paymentStatus', 'Paid'] }, '$finalAmount', 0] } } } },
     ]),
     Order.aggregate([
-      { $match: { ...liveOrders, 'coupon.code': { $exists: true, $nin: [null, ''] } } },
+      { $match: scope(req, { createdAt, orderStatus: { $ne: 'Cancelled' }, 'coupon.code': { $exists: true, $nin: [null, ''] } }) },
       { $group: { _id: '$coupon.code', total: { $sum: 1 }, discount: { $sum: { $ifNull: ['$couponDiscount', 0] } } } },
       { $sort: { total: -1 } },
       { $limit: 8 },
@@ -102,7 +105,7 @@ exports.productReport = async (req, res) => {
   const { from, to, preset } = parseReportRange(req.query);
   const [bestSellers, lowStock] = await Promise.all([
     Order.aggregate([
-      { $match: { createdAt: { $gte: from, $lte: to }, orderStatus: { $ne: 'Cancelled' } } },
+      { $match: scope(req, { createdAt: { $gte: from, $lte: to }, orderStatus: { $ne: 'Cancelled' } }) },
       { $unwind: '$orderItems' },
       {
         $group: {
@@ -114,7 +117,7 @@ exports.productReport = async (req, res) => {
       { $sort: { sold: -1, revenue: -1 } },
       { $limit: 20 },
     ]),
-    Product.find({ $or: [{ stock: { $lt: 5 } }, { 'variants.stock': { $lt: 5 } }] }).select('name sku stock lowStockAlert variants').limit(50),
+    Product.find(scope(req, { $or: [{ stock: { $lt: 5 } }, { 'variants.stock': { $lt: 5 } }] })).select('name sku stock lowStockAlert variants').limit(50),
   ]);
 
   res.json({

@@ -3,6 +3,7 @@ const StoreMember = require('../models/StoreMember');
 const User = require('../models/User');
 const slugify = require('../utils/slugify');
 const { ApiError } = require('../utils/apiError');
+const { DEFAULT_STRUCTURE } = require('../config/industryPresets');
 
 const DEFAULT_STORE_SLUG = 'samira-collection';
 const DEFAULT_STORE_NAME = 'Samira Collection';
@@ -43,7 +44,7 @@ async function ensureDefaultStore() {
     }
     return store;
   }
-  return Store.create({
+  const defaults = {
     name: DEFAULT_STORE_NAME,
     slug: DEFAULT_STORE_SLUG,
     legalName: DEFAULT_STORE_NAME,
@@ -51,8 +52,27 @@ async function ensureDefaultStore() {
     isDefault: true,
     paymentReady: true,
     shippingReady: true,
+    industry: 'fashion',
+    catalogStructure: JSON.parse(JSON.stringify(DEFAULT_STRUCTURE)),
+    industryLocked: true,
+    plan: 'PREMIUM',
+    license: { status: 'ACTIVE', startsAt: new Date(), billingCycle: 'LIFETIME' },
     publishedAt: new Date(),
-  });
+  };
+  try {
+    return await Store.findOneAndUpdate(
+      { slug: DEFAULT_STORE_SLUG },
+      { $setOnInsert: defaults },
+      { new: true, upsert: true, setDefaultsOnInsert: true, runValidators: true },
+    );
+  } catch (error) {
+    // Two first requests may try to provision the default store together.
+    // The unique slug decides the winner; the other request reuses it.
+    if (error?.code !== 11000) throw error;
+    const concurrent = await Store.findOne({ slug: DEFAULT_STORE_SLUG });
+    if (!concurrent) throw error;
+    return concurrent;
+  }
 }
 
 const RESERVED_SUBDOMAINS = new Set(['www', 'api', 'admin', 'app', 'mail', 'seller', 'static', 'cdn', 'health']);
@@ -146,6 +166,32 @@ async function listMemberships(userId) {
   return StoreMember.find({ user: userId, status: 'ACTIVE' }).populate('store').sort('-createdAt');
 }
 
+/**
+ * Replace the unique indexes inherited from the original single-store app
+ * with tenant-aware indexes. Only the known legacy indexes are removed.
+ */
+async function ensureTenantIndexes() {
+  const models = [
+    { model: require('../models/Category'), legacy: ['slug_1'] },
+    { model: require('../models/Product'), legacy: ['slug_1', 'sku_1'] },
+    { model: require('../models/Cart'), legacy: ['user_1', 'sessionId_1'] },
+    { model: require('../models/Subscriber'), legacy: ['email_1'] },
+  ];
+  for (const { model, legacy } of models) {
+    let indexes = [];
+    try {
+      indexes = await model.collection.indexes();
+    } catch (error) {
+      if (error?.code !== 26 && error?.codeName !== 'NamespaceNotFound') throw error;
+    }
+    const names = new Set(indexes.map((index) => index.name));
+    for (const name of legacy) {
+      if (names.has(name)) await model.collection.dropIndex(name);
+    }
+    await model.createIndexes();
+  }
+}
+
 function onboardingProgress(store, { productCount = 0 } = {}) {
   const steps = {
     name: Boolean(String(store?.name || '').trim()),
@@ -186,6 +232,22 @@ function publicStoreView(store, extra = {}) {
     customDomain: data.customDomain || '',
     status: data.status,
     isDefault: Boolean(data.isDefault),
+    industry: data.industry || 'fashion',
+    catalog: data.catalogStructure ? {
+      filters: data.catalogStructure.filters || [],
+      homepageSections: data.catalogStructure.homepageSections || [],
+    } : undefined,
+    festivalCampaign: data.festivalCampaign?.enabled ? {
+      enabled: true,
+      campaignKey: data.festivalCampaign.campaignKey,
+      preset: data.festivalCampaign.preset,
+      title: data.festivalCampaign.title,
+      badgeText: data.festivalCampaign.badgeText,
+      couponCode: data.festivalCampaign.couponCode,
+      startsAt: data.festivalCampaign.startsAt,
+      countdownEndsAt: data.festivalCampaign.countdownEndsAt,
+      effects: Boolean(data.festivalCampaign.effects),
+    } : { enabled: false },
     ...extra,
   };
 }
@@ -197,6 +259,7 @@ module.exports = {
   andFilter,
   defaultStoreFilter,
   ensureDefaultStore,
+  ensureTenantIndexes,
   grantSellerMode,
   identifyHost,
   isPlatformAdmin,

@@ -10,9 +10,9 @@ const { auditSnapshot } = require('../utils/auditData');
 const { normalizeSettingsUpdates } = require('../services/storeSettingsValidation');
 
 exports.getSettings = asyncHandler(async (req, res) => {
-  const settings = (await Settings.findOne()) || await Settings.create({});
+  const settings = (await Settings.findOne(req.tenantFilter || {})) || await Settings.create({ ...(req.store?._id ? { storeId: req.store._id } : {}) });
   const data = settings.toObject();
-  if (!req.user || req.user.role !== 'admin') {
+  if ((!req.user || req.user.role !== 'admin') && !req.storeMember) {
     delete data.shippingPickup;
     delete data.shippingRateZones;
   }
@@ -24,7 +24,7 @@ exports.getSettings = asyncHandler(async (req, res) => {
  * settings the checkout API enforces.
  */
 exports.getPaymentMethods = asyncHandler(async (req, res) => {
-  const settings = await getStoreSettings();
+  const settings = await getStoreSettings(req.tenantFilter || {});
   const razorpayConfigured = isRazorpayConfigured();
   const requestedAmount = req.query.amount === undefined || req.query.amount === ''
     ? null
@@ -53,7 +53,7 @@ exports.getPaymentMethods = asyncHandler(async (req, res) => {
 });
 
 exports.getPaymentReadiness = asyncHandler(async (req, res) => {
-  const settings = await getStoreSettings();
+  const settings = await getStoreSettings(req.tenantFilter || {});
   const configured = isRazorpayConfigured();
   const keyId = String(process.env.RAZORPAY_KEY_ID || '');
   res.json({
@@ -69,7 +69,7 @@ exports.getPaymentReadiness = asyncHandler(async (req, res) => {
 
 exports.updateSettings = asyncHandler(async (req, res) => {
   const { _id, __v, createdAt, updatedAt, expectedUpdatedAt, storeId, ...input } = req.body || {};
-  const previous = await Settings.findOne();
+  const previous = await Settings.findOne(req.tenantFilter || {});
   const current = previous?.toObject() || {};
   if (storeId && String(storeId) !== String(current.storeId || '')) throw new ApiError('FORBIDDEN', 'Store identity cannot be changed here');
   if (Object.keys(input).some(key => key.includes('.') || key.startsWith('$') || !Settings.schema.path(key))) throw new ApiError('FORBIDDEN', 'Only supported store settings can be changed here');
@@ -78,14 +78,14 @@ exports.updateSettings = asyncHandler(async (req, res) => {
   }
   const updates = normalizeSettingsUpdates(input, current);
   if (!isMasterOwner(req.user)) {
-    const permissions = (await readConfiguration()).structure.clientPermissions;
+    const permissions = (await readConfiguration(req.store?._id)).structure.clientPermissions;
     const paymentFields = ['razorpayEnabled', 'upiEnabled', 'cardPaymentEnabled', 'netBankingEnabled', 'walletEnabled', 'codEnabled', 'codCharge', 'codMinAmount', 'codMaxAmount', 'codPincodes', 'prepaidDiscountType', 'prepaidDiscountValue', 'codConfirmationRequired', 'rtoBlockEnabled', 'rtoBlockMinOrders', 'rtoBlockThreshold', 'platformFee', 'gstRate'];
     const changed = fields => fields.some(key => updates[key] !== undefined && JSON.stringify(updates[key]) !== JSON.stringify(current[key]));
     if (!permissions.payments && changed(paymentFields)) throw new ApiError('FORBIDDEN', 'Payment configuration is managed by the store owner');
     if (!permissions.content && changed(Object.keys(updates).filter(key => !paymentFields.includes(key)))) throw new ApiError('FORBIDDEN', 'Store settings are managed by the store owner');
   }
-  const filter = previous ? { _id: previous._id, ...(current.updatedAt ? { updatedAt: current.updatedAt } : {}) } : {};
-  const saved = await Settings.findOneAndUpdate(filter, { $set: updates }, { new: true, upsert: !previous, runValidators: true });
+  const filter = previous ? { _id: previous._id, ...(current.updatedAt ? { updatedAt: current.updatedAt } : {}) } : { ...(req.store?._id ? { storeId: req.store._id } : {}) };
+  const saved = await Settings.findOneAndUpdate(filter, { $set: updates, ...(!previous && req.store?._id ? { $setOnInsert: { storeId: req.store._id } } : {}) }, { new: true, upsert: !previous, runValidators: true, setDefaultsOnInsert: true });
   if (!saved) throw new ApiError('DUPLICATE_REQUEST', 'Settings changed while saving. Reload and review your changes.');
   require('./websiteCustomizationController')._invalidateActiveCache();
   logAudit({ req, action: 'SETTINGS_UPDATE', entityType: 'Settings', entityId: saved._id, before: auditSnapshot(previous, Object.keys(updates)), after: auditSnapshot(saved, Object.keys(updates)) });

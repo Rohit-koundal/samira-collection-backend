@@ -28,6 +28,35 @@ test('missing or invalid selected drafts fail before any product is published', 
   assert.equal(await Product.countDocuments(), 0);
 });
 
+test('manual product draft preserves commercial, fulfilment and scheduling details when published', async () => {
+  const { token } = await createAdmin();
+  const category = await Category.create({ name: 'Kurtis', slug: 'manual-kurtis' });
+  const created = await request('/api/admin/product-drafts', {
+    method: 'POST', token, body: {
+      name: 'Manual cotton kurti', sku: 'MANUAL-1', category: String(category._id),
+      images: [{ url: '/uploads/manual.jpg', primary: true }], price: 999, originalPrice: 1499,
+      costPrice: 500, gstRate: 5, hsnCode: '6204', stock: 6, lowStockAlert: 2,
+      reorderQuantity: 12, shippingWeightKg: 0.45, packageDimensions: { lengthCm: 30, widthCm: 24, heightCm: 4 },
+      countryOfOrigin: 'India', supplierName: 'Local artisan', supplierSku: 'ART-22',
+      publishAt: '2030-01-01T10:00:00.000Z', saleStartAt: '2030-01-02T10:00:00.000Z', saleEndAt: '2030-01-03T10:00:00.000Z',
+      description: 'A breathable cotton kurti prepared as a complete manual catalog draft.', sizingMode: 'free-size',
+    },
+  });
+  assert.equal(created.status, 201, JSON.stringify(created.data));
+  assert.equal(created.data.data.sourceType, 'manual');
+
+  const published = await publish(token, [created.data.data._id]);
+  assert.equal(published.status, 200, JSON.stringify(published.data));
+  const product = await Product.findById(published.data.data.products[0]._id);
+  assert.equal(product.costPrice, 500);
+  assert.equal(product.gstRate, 5);
+  assert.equal(product.hsnCode, '6204');
+  assert.equal(product.reorderQuantity, 12);
+  assert.equal(product.packageDimensions.lengthCm, 30);
+  assert.equal(product.supplierName, 'Local artisan');
+  assert.equal(product.publishAt.toISOString(), '2030-01-01T10:00:00.000Z');
+});
+
 test('concurrent ordinary draft publications and retry create exactly one product', async () => {
   const { token } = await createAdmin(), draft = await draftFixture();
   await Product.init();

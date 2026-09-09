@@ -1,10 +1,13 @@
 const User = require('../models/User');
 const CustomerCrm = require('../models/CustomerCrm');
+const Cart = require('../models/Cart');
+const Order = require('../models/Order');
 const { asyncHandler } = require('../middleware/validate');
 const { notFound } = require('../utils/apiError');
-const { optionalString, requireEnum, requireObjectId } = require('../utils/validators');
+const { optionalString, requireBoolean, requireEnum, requireObjectId } = require('../utils/validators');
 const { CRM_TAGS, buildCustomerRows } = require('../services/crmService');
 const { logAudit } = require('../services/auditService');
+const { andFilter } = require('../services/storeService');
 
 exports.list = asyncHandler(async (req, res) => {
   const rows = await buildCustomerRows(req.store._id);
@@ -37,12 +40,21 @@ exports.update = asyncHandler(async (req, res) => {
   const userId = requireObjectId(req.params.userId, 'user id');
   const user = await User.findById(userId).select('name email phone');
   if (!user) throw notFound('Customer not found');
+  const belongsToStore = (await Promise.all([
+    Order.exists(andFilter({ user: userId }, req.tenantFilter)),
+    Cart.exists(andFilter({ user: userId }, req.tenantFilter)),
+  ])).some(Boolean);
+  if (!belongsToStore) throw notFound('Customer not found in this store');
 
   const tags = Array.isArray(req.body?.tags)
     ? req.body.tags.map((tag) => requireEnum(tag, CRM_TAGS, 'tag'))
     : undefined;
   const notes = req.body?.notes !== undefined ? optionalString(req.body.notes, 'notes', { max: 2000 }) : undefined;
   const acquisition = req.body?.acquisition !== undefined ? optionalString(req.body.acquisition, 'acquisition', { max: 80 }) : undefined;
+  const marketingConsent = req.body?.marketingConsent !== undefined
+    ? requireBoolean(req.body.marketingConsent, 'marketing consent')
+    : undefined;
+  const marketingConsentSource = marketingConsent === true ? 'MANUAL' : '';
 
   const profile = await CustomerCrm.findOneAndUpdate(
     { storeId: req.store._id, user: userId },
@@ -51,6 +63,11 @@ exports.update = asyncHandler(async (req, res) => {
         ...(tags ? { tags } : {}),
         ...(notes !== undefined ? { notes } : {}),
         ...(acquisition !== undefined ? { acquisition } : {}),
+        ...(marketingConsent !== undefined ? {
+          marketingConsent,
+          marketingConsentSource,
+          marketingConsentAt: marketingConsent ? new Date() : null,
+        } : {}),
       },
     },
     { new: true, upsert: true, setDefaultsOnInsert: true },
@@ -61,7 +78,7 @@ exports.update = asyncHandler(async (req, res) => {
     action: 'CRM_UPDATE',
     entityType: 'CustomerCrm',
     entityId: profile._id,
-    after: { tags: profile.tags, notes: profile.notes },
+    after: { tags: profile.tags, notes: profile.notes, marketingConsent: profile.marketingConsent },
   });
 
   res.json({
@@ -72,5 +89,8 @@ exports.update = asyncHandler(async (req, res) => {
     tags: profile.tags,
     notes: profile.notes,
     acquisition: profile.acquisition,
+    marketingConsent: profile.marketingConsent,
+    marketingConsentSource: profile.marketingConsentSource,
+    marketingConsentAt: profile.marketingConsentAt,
   });
 });

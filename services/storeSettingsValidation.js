@@ -4,14 +4,14 @@ const TEXT_LIMITS = {
   storeName: 100, legalBusinessName: 160, tagline: 180, seoTitle: 100, seoDescription: 300,
   contactEmail: 254, contactPhone: 24, whatsappNumber: 24, address: 1000, billingAddress: 1000,
   gstin: 15, invoicePrefix: 16, invoiceNote: 500, supportHours: 200, footerText: 1000,
-  announcementText: 240, orderPauseMessage: 300, logoUrl: 2000, faviconUrl: 2000,
+  announcementText: 240, orderPauseMessage: 300, logoUrl: 2000, faviconUrl: 2000, socialShareImage: 2000,
   returnPolicy: 20000, privacyPolicy: 20000, termsConditions: 20000, shippingPolicy: 20000,
   cancellationPolicy: 20000, sizeGuide: 20000, faqs: 20000, ourStory: 20000,
 };
 const NUMBERS = ['deliveryCharge', 'freeShippingMinAmount', 'codCharge', 'codMaxAmount', 'codMinAmount',
   'returnWindowDays', 'prepaidDiscountValue', 'rtoBlockMinOrders', 'rtoBlockThreshold', 'platformFee', 'gstRate', 'minimumOrderAmount'];
 const BOOLEANS = ['brandIdentityEnabled', 'contactDetailsEnabled', 'announcementEnabled', 'acceptingOrders', 'razorpayEnabled', 'upiEnabled',
-  'cardPaymentEnabled', 'netBankingEnabled', 'walletEnabled', 'codEnabled', 'codConfirmationRequired', 'rtoBlockEnabled'];
+  'cardPaymentEnabled', 'netBankingEnabled', 'walletEnabled', 'codEnabled', 'codConfirmationRequired', 'rtoBlockEnabled', 'searchIndexingEnabled'];
 function invalid(message) { throw new ApiError('VALIDATION_ERROR', message); }
 function safeUrl(value, label, image = false) {
   if (!value) return '';
@@ -35,7 +35,7 @@ function normalizeSettingsUpdates(input, current = {}) {
   for (const key of ['contactPhone', 'whatsappNumber']) {
     if (updates[key] && (!/^[+\d ()-]+$/.test(updates[key]) || !/^\d{10,15}$/.test(updates[key].replace(/\D/g, '')))) invalid(`${key} must contain 10 to 15 digits.`);
   }
-  for (const key of ['logoUrl', 'faviconUrl']) if (updates[key] !== undefined) updates[key] = safeUrl(updates[key], key, true);
+  for (const key of ['logoUrl', 'faviconUrl', 'socialShareImage']) if (updates[key] !== undefined) updates[key] = safeUrl(updates[key], key, true);
   for (const [key, allowed] of Object.entries({ socialLinks: ['instagram', 'facebook', 'youtube', 'pinterest', 'twitter'], appLinks: ['googlePlay', 'playStore', 'appStore', 'appleStore'] })) {
     if (updates[key] === undefined) continue;
     if (!updates[key] || typeof updates[key] !== 'object' || Array.isArray(updates[key]) || Object.keys(updates[key]).some(name => !allowed.includes(name))) invalid(`Invalid ${key}.`);

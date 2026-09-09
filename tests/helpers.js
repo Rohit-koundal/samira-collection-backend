@@ -129,7 +129,7 @@ async function request(path, { method = 'GET', body, token, headers = {} } = {})
   } catch {
     data = text;
   }
-  return { status: response.status, data };
+  return { status: response.status, data, headers: response.headers };
 }
 
 module.exports = {

@@ -5,7 +5,7 @@ const { andFilter } = require('../services/storeService');
 
 exports.subscribe = asyncHandler(async (req, res) => {
   const email = requireEmail(req.body?.email);
-  const existing = await Subscriber.findOne({ email });
+  const existing = await Subscriber.findOne(andFilter({ email }, req.tenantFilter));
   if (existing) {
     if (!existing.isActive) {
       existing.isActive = true;
@@ -21,7 +21,7 @@ exports.subscribe = asyncHandler(async (req, res) => {
 
 exports.unsubscribe = asyncHandler(async (req, res) => {
   const email = requireEmail(req.body?.email);
-  const subscriber = await Subscriber.findOne({ email });
+  const subscriber = await Subscriber.findOne(andFilter({ email }, req.tenantFilter));
   if (subscriber && subscriber.isActive) {
     subscriber.isActive = false;
     subscriber.unsubscribedAt = new Date();

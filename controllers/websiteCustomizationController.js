@@ -6,6 +6,7 @@ const { applyStorePresentation } = require('../services/storeSettingsValidation'
 const { asyncHandler } = require('../middleware/validate');
 const { ApiError, notFound } = require('../utils/apiError');
 const { logAudit } = require('../services/auditService');
+const { hasStoreFeature, planSummary } = require('../config/storePlans');
 const {
   DEFAULT_WEBSITE_CONFIG,
   buildPresetConfig,
@@ -14,8 +15,7 @@ const {
 } = require('../config/websiteCustomization');
 
 const PUBLIC_CACHE_MS = 60 * 1000;
-let activeCache = null;
-let activeCacheExpiresAt = 0;
+const activeCache = new Map();
 
 function clone(value) {
   return JSON.parse(JSON.stringify(value));
@@ -130,25 +130,58 @@ function publicPayload(theme) {
   };
 }
 
+const CLIENT_DESIGN_GROUPS = ['colors', 'header', 'homepage', 'typography', 'buttons', 'productCards', 'footer', 'layout', 'mobile', 'tablet', 'theme'];
+
+function requireClientDesign(store) {
+  if (hasStoreFeature(store, 'advancedCustomization')) return;
+  const plan = planSummary(store);
+  throw new ApiError('FORBIDDEN', `Store design is unavailable on the ${plan.name} plan while its licence is ${plan.status.toLowerCase()}.`);
+}
+
+function designOnly(config) {
+  const normalized = normalizeWebsiteConfig(config);
+  return Object.fromEntries(CLIENT_DESIGN_GROUPS.map((key) => [key, clone(normalized[key])]));
+}
+
+function mergeClientDesign(base, design) {
+  if (!design) return normalizeWebsiteConfig(base);
+  return normalizeWebsiteConfig({ ...base, ...designOnly(design), branding: base.branding });
+}
+
+async function globalPublishedConfig() {
+  const active = await WebsiteTheme.findOne({ isActive: true, publishedConfig: { $exists: true, $ne: null } }).sort('-publishedAt').lean();
+  return active ? publicPayload(active).config : clone(DEFAULT_WEBSITE_CONFIG);
+}
+
 function invalidateActiveCache() {
-  activeCache = null;
-  activeCacheExpiresAt = 0;
+  activeCache.clear();
 }
 
 exports.getActiveConfig = asyncHandler(async (req, res) => {
-  if (activeCache && Date.now() < activeCacheExpiresAt) {
+  const cacheKey = String(req.store?._id || 'default');
+  const cached = activeCache.get(cacheKey);
+  if (cached && Date.now() < cached.expiresAt) {
     res.setHeader('Cache-Control', 'public, max-age=0, must-revalidate');
-    return res.json(activeCache);
+    return res.json(cached.payload);
   }
   const active = await WebsiteTheme.findOne({ isActive: true, publishedConfig: { $exists: true, $ne: null } }).sort('-publishedAt').lean();
-  const settings = await Settings.findOne().lean() || {};
-  activeCache = active ? publicPayload(active) : { config: buildInitialConfig(settings), theme: null };
-  activeCache.config = applyStorePresentation(activeCache.config, settings);
-  activeCache.metadata = { title: settings.seoTitle || '', description: settings.seoDescription || '' };
-  activeCache.brandIdentityManaged = Boolean(settings.brandIdentityEnabled);
-  activeCacheExpiresAt = Date.now() + PUBLIC_CACHE_MS;
+  const settings = await Settings.findOne(req.tenantFilter || {}).lean() || {};
+  const payload = active ? publicPayload(active) : { config: buildInitialConfig(settings), theme: null };
+  if (req.store?.storefrontDesign?.publishedConfig) {
+    payload.config = mergeClientDesign(payload.config, req.store.storefrontDesign.publishedConfig);
+    payload.theme = { ...(payload.theme || {}), storePreset: req.store.storefrontDesign.preset || 'custom', storePublishedAt: req.store.storefrontDesign.publishedAt };
+  }
+  payload.config = applyStorePresentation(payload.config, settings);
+  payload.metadata = {
+    title: settings.seoTitle || '',
+    description: settings.seoDescription || '',
+    image: settings.socialShareImage || payload.config?.branding?.logo || '',
+    indexing: settings.searchIndexingEnabled !== false,
+  };
+  payload.brandIdentityManaged = Boolean(settings.brandIdentityEnabled);
+  activeCache.set(cacheKey, { payload, expiresAt: Date.now() + PUBLIC_CACHE_MS });
   res.setHeader('Cache-Control', 'public, max-age=0, must-revalidate');
-  return res.json(activeCache);
+  return res.json(payload);
 });
 
 exports.getWorkspace = asyncHandler(async (req, res) => {
@@ -175,6 +208,56 @@ exports.getTheme = asyncHandler(async (req, res) => {
 
 exports.getPresets = asyncHandler(async (req, res) => {
   res.json(getPresetList());
+});
+
+exports.getSellerDesign = asyncHandler(async (req, res) => {
+  requireClientDesign(req.store);
+  const base = await globalPublishedConfig();
+  const saved = req.store.storefrontDesign || {};
+  res.set('Cache-Control', 'private, no-store, max-age=0');
+  res.json({
+    store: { id: String(req.store._id), name: req.store.name, slug: req.store.slug },
+    platform: planSummary(req.store),
+    draftConfig: mergeClientDesign(base, saved.draftConfig || saved.publishedConfig),
+    publishedConfig: saved.publishedConfig ? mergeClientDesign(base, saved.publishedConfig) : base,
+    preset: saved.preset || 'default',
+    updatedAt: saved.updatedAt || null,
+    publishedAt: saved.publishedAt || null,
+    presets: getPresetList({ appearanceOnly: true }),
+  });
+});
+
+exports.updateSellerDesign = asyncHandler(async (req, res) => {
+  requireClientDesign(req.store);
+  const incoming = req.body?.config;
+  if (!incoming || typeof incoming !== 'object' || Array.isArray(incoming)) throw new ApiError('VALIDATION_ERROR', 'A website design is required');
+  const design = designOnly(incoming);
+  req.store.storefrontDesign = {
+    ...(req.store.storefrontDesign?.toObject?.() || req.store.storefrontDesign || {}),
+    preset: String(design.theme?.preset || req.body?.preset || 'custom').slice(0, 40),
+    draftConfig: design,
+    updatedAt: new Date(),
+    updatedBy: req.user._id,
+  };
+  req.store.markModified('storefrontDesign');
+  await req.store.save();
+  invalidateActiveCache();
+  logAudit({ req, action: 'STOREFRONT_DESIGN_DRAFT_SAVE', entityType: 'Store', entityId: req.store._id, after: { preset: req.store.storefrontDesign.preset } });
+  res.json({ draftConfig: mergeClientDesign(await globalPublishedConfig(), design), updatedAt: req.store.storefrontDesign.updatedAt });
+});
+
+exports.publishSellerDesign = asyncHandler(async (req, res) => {
+  requireClientDesign(req.store);
+  if (!req.store.storefrontDesign?.draftConfig) throw new ApiError('VALIDATION_ERROR', 'Save the website design before publishing');
+  req.store.storefrontDesign.publishedConfig = clone(req.store.storefrontDesign.draftConfig);
+  req.store.storefrontDesign.publishedAt = new Date();
+  req.store.storefrontDesign.updatedAt = new Date();
+  req.store.storefrontDesign.updatedBy = req.user._id;
+  req.store.markModified('storefrontDesign');
+  await req.store.save();
+  invalidateActiveCache();
+  logAudit({ req, action: 'STOREFRONT_DESIGN_PUBLISH', entityType: 'Store', entityId: req.store._id, after: { preset: req.store.storefrontDesign.preset, publishedAt: req.store.storefrontDesign.publishedAt } });
+  res.json({ success: true, publishedAt: req.store.storefrontDesign.publishedAt, config: mergeClientDesign(await globalPublishedConfig(), req.store.storefrontDesign.publishedConfig) });
 });
 
 exports.createTheme = asyncHandler(async (req, res) => {

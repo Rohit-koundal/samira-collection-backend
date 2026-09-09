@@ -5,6 +5,7 @@ const variantSchema = new mongoose.Schema({
   sku: String,
   size: { type: String, default: '' },
   color: { type: String, default: '' },
+  optionValues: { type: Map, of: String, default: {} },
   stock: { type: Number, default: 0, min: 0 },
   price: Number,
   originalPrice: Number,
@@ -29,17 +30,24 @@ const sizeChartRowSchema = new mongoose.Schema({
 const productSchema = new mongoose.Schema({
   name: { type: String, required: true },
   sourceDraftId: { type: mongoose.Schema.Types.ObjectId, ref: 'ProductDraft', unique: true, sparse: true, default: undefined },
-  slug: { type: String, required: true, unique: true },
+  slug: { type: String, required: true },
   brand: { type: String, default: 'Samira Collection' },
   shortDescription: String,
+  industry: { type: String, default: 'fashion', index: true },
+  industryRevision: { type: Number, default: 0 },
+  categoryDefinitionKey: { type: String, default: '' },
   attributeValues: { type: Map, of: String, default: {} },
-  specifications: [{ _id: false, key: String, label: String, value: String, unit: String }],
+  specifications: [{ _id: false, key: String, label: String, value: String, unit: String, group: String, active: { type: Boolean, default: true }, showOnDetail: { type: Boolean, default: true } }],
   description: String,
   category: { type: mongoose.Schema.Types.ObjectId, ref: 'Category' },
   subCategory: String,
   price: { type: Number, required: true },
   originalPrice: Number,
+  costPrice: { type: Number, min: 0, default: 0 },
   discountPercentage: Number,
+  gstRate: { type: Number, min: 0, max: 100, default: 0 },
+  hsnCode: { type: String, trim: true, default: '' },
+  barcode: { type: String, trim: true, default: '' },
   images: [{ url: String, publicId: String, primary: { type: Boolean, default: false }, sourceFrame: { type: new mongoose.Schema({ timestampSeconds: Number, qualityScore: Number, viewType: String, width: Number, height: Number, selectionVersion: String }, { _id: false }), default: undefined } }],
   videos: [{ url: String, publicId: String, thumbnail: String }],
   sizes: [String],
@@ -65,8 +73,25 @@ const productSchema = new mongoose.Schema({
   variants: { type: [variantSchema], default: [] },
   stock: { type: Number, required: true, default: 0 },
   lowStockAlert: { type: Number, default: 5 },
+  reorderQuantity: { type: Number, min: 0, default: 0 },
   shippingWeightKg: { type: Number, min: 0, max: 1000, default: 0 },
-  sku: { type: String, unique: true, sparse: true },
+  packageDimensions: {
+    lengthCm: { type: Number, min: 0, max: 1000, default: 0 },
+    widthCm: { type: Number, min: 0, max: 1000, default: 0 },
+    heightCm: { type: Number, min: 0, max: 1000, default: 0 },
+  },
+  countryOfOrigin: { type: String, trim: true, default: 'India' },
+  manufacturerDetails: { type: String, trim: true, default: '' },
+  warranty: { type: String, trim: true, default: '' },
+  supplierName: { type: String, trim: true, default: '' },
+  supplierSku: { type: String, trim: true, default: '' },
+  restockAt: Date,
+  publishAt: Date,
+  saleStartAt: Date,
+  saleEndAt: Date,
+  expiryDate: Date,
+  batchNumber: String,
+  sku: { type: String },
   tags: [String],
   primaryImage: String,
   highlights: [String],
@@ -89,10 +114,12 @@ const productSchema = new mongoose.Schema({
 }, { timestamps: true });
 
 productSchema.plugin(storeIdPlugin);
-productSchema.index({ storeId: 1, slug: 1 });
-productSchema.index({ storeId: 1, sku: 1 });
+productSchema.index({ storeId: 1, slug: 1 }, { unique: true });
+productSchema.index({ storeId: 1, sku: 1 }, { unique: true, partialFilterExpression: { sku: { $type: 'string' } } });
 productSchema.index({ storeId: 1, category: 1, createdAt: -1 });
 productSchema.index({ storeId: 1, isActive: 1, createdAt: -1 });
+productSchema.index({ storeId: 1, isArchived: 1, updatedAt: -1 });
+productSchema.index({ storeId: 1, barcode: 1 }, { unique: true, partialFilterExpression: { barcode: { $type: 'string', $gt: '' } } });
 
 productSchema.pre('save', function syncVariantStock(next) {
   if (Array.isArray(this.variants) && this.variants.length) {

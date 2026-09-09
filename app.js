@@ -3,10 +3,11 @@ const express = require('express');
 const cors = require('cors');
 const mongoose = require('mongoose');
 const { notFound, errorHandler } = require('./middleware/errorMiddleware');
-const { protect } = require('./middleware/authMiddleware');
+const { optionalProtect, protect } = require('./middleware/authMiddleware');
 const { adminOnly } = require('./middleware/adminMiddleware');
 const { optionalResolveStore, requireStoreMember } = require('./middleware/storeMiddleware');
 const { requestContext } = require('./middleware/requestContext');
+const { securityHeaders } = require('./middleware/securityHeaders');
 const { corsOptions, getAllowedOrigins } = require('./config/corsOptions');
 const { isR2Configured } = require('./services/r2Upload');
 const { isCloudinaryConfigured } = require('./services/cloudinaryUpload');
@@ -16,7 +17,9 @@ const instagram = require('./controllers/instagramController');
 const app = express();
 
 app.set('trust proxy', 1);
+app.disable('x-powered-by');
 app.use(requestContext);
+app.use(securityHeaders);
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
 
@@ -39,7 +42,6 @@ app.post(['/api/social/deauthorize', '/api/social/data-deletion'], express.urlen
 app.get('/api/social/deletion-status/:code', socialOAuth.wrap(socialOAuth.deletionStatus));
 app.use(express.json({ limit: '30mb' }));
 app.use(require('./middleware/auditMiddleware').auditAdminRequests);
-app.use('/api/social', require('./modules/social-workspace/routes'));
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 app.get('/uploads/:filename', sendImagePlaceholder);
 app.get('/placeholder.jpg', sendImagePlaceholder);
@@ -63,8 +65,13 @@ app.get('/health', async (req, res) => {
   });
 });
 
+app.use('/api/platform', require('./routes/platformControlRoutes'));
+app.use('/api', optionalProtect);
+app.use('/api/system', require('./routes/clientSystemRoutes'));
+app.use('/api', require('./middleware/externalLicenseMiddleware'));
+app.use('/api/social', require('./modules/social-workspace/routes'));
 app.use('/api/master', require('./routes/masterRoutes'));
-app.get('/api/catalog-configuration', require('./controllers/masterController').publicCatalog);
+app.get('/api/catalog-configuration', optionalResolveStore, require('./controllers/masterController').publicCatalog);
 app.use('/api/auth', require('./routes/authRoutes'));
 app.use('/api/admin/customers', protect, adminOnly, require('./routes/customerAdminRoutes'));
 app.use('/api/admin/users', protect, adminOnly, require('./routes/customerAdminRoutes'));
@@ -76,7 +83,8 @@ app.use('/api/admin/coupons', protect, adminOnly, optionalResolveStore, require(
 app.use('/api/admin/banners', protect, adminOnly, require('./routes/bannerRoutes'));
 app.use('/api/admin/reviews', protect, adminOnly, require('./routes/reviewRoutes'));
 app.use('/api/admin/returns', protect, adminOnly, require('./routes/returnRoutes'));
-app.use('/api/admin/settings', protect, adminOnly, require('./routes/settingsRoutes'));
+app.use('/api/admin/settings', protect, adminOnly, optionalResolveStore, require('./routes/settingsRoutes'));
+app.use('/api/admin/business', protect, adminOnly, optionalResolveStore, require('./routes/businessRoutes'));
 app.use('/api/admin/store-content', protect, adminOnly, require('./routes/storeContentRoutes'));
 app.use('/api/admin/customization', protect, adminOnly, require('./routes/websiteCustomizationRoutes'));
 app.use('/api/admin/uploads', require('./routes/uploadRoutes'));
@@ -93,23 +101,23 @@ app.use('/api/analytics', require('./routes/analyticsRoutes'));
 app.use('/api/products', optionalResolveStore, require('./routes/publicProductRoutes'));
 app.use('/api/variant-groups', require('./routes/variantGroupRoutes'));
 app.use('/api/categories', optionalResolveStore, require('./routes/categoryRoutes'));
-app.use('/api/cart', require('./routes/cartRoutes'));
+app.use('/api/cart', optionalResolveStore, require('./routes/cartRoutes'));
 app.use('/api/user/addresses', require('./routes/addressRoutes'));
-app.use('/api/wishlist', require('./routes/wishlistRoutes'));
-app.use('/api/orders', require('./routes/orderRoutes'));
-app.use('/api/payments', require('./routes/paymentRoutes'));
+app.use('/api/wishlist', optionalResolveStore, require('./routes/wishlistRoutes'));
+app.use('/api/orders', optionalResolveStore, require('./routes/orderRoutes'));
+app.use('/api/payments', optionalResolveStore, require('./routes/paymentRoutes'));
 
 const paymentController = require('./controllers/paymentController');
 const { wrapPaymentHandler } = require('./utils/paymentRouteHandler');
-app.post('/api/create-order', protect, wrapPaymentHandler(paymentController.createPaymentOrder));
-app.post('/api/verify-payment', protect, wrapPaymentHandler(paymentController.verifyPayment));
+app.post('/api/create-order', protect, optionalResolveStore, wrapPaymentHandler(paymentController.createPaymentOrder));
+app.post('/api/verify-payment', protect, optionalResolveStore, wrapPaymentHandler(paymentController.verifyPayment));
 
 app.use('/api/coupons', optionalResolveStore, require('./routes/couponRoutes'));
 app.use('/api/banners', optionalResolveStore, require('./routes/bannerRoutes'));
 app.use('/api/reviews', optionalResolveStore, require('./routes/reviewRoutes'));
-app.use('/api/returns', require('./routes/returnRoutes'));
-app.use('/api/settings', require('./routes/settingsRoutes'));
-app.get('/api/website-config', require('./controllers/websiteCustomizationController').getActiveConfig);
+app.use('/api/returns', optionalResolveStore, require('./routes/returnRoutes'));
+app.use('/api/settings', optionalResolveStore, require('./routes/settingsRoutes'));
+app.get('/api/website-config', optionalResolveStore, require('./controllers/websiteCustomizationController').getActiveConfig);
 app.use('/api/contact', optionalResolveStore, require('./routes/contactRoutes'));
 app.use('/api/newsletter', optionalResolveStore, require('./routes/newsletterRoutes'));
 app.use('/api/notifications', require('./routes/notificationRoutes'));

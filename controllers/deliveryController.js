@@ -6,7 +6,7 @@ const { requireObjectId } = require('../utils/validators');
 const { ApiError, notFound, forbidden } = require('../utils/apiError');
 const { andFilter } = require('../services/storeService');
 const { getStoreSettings } = require('../services/paymentSettingsService');
-const { getShippingProvider } = require('../services/shippingProvider');
+const { getShippingProvider, getShippingProviders, providerLabel } = require('../services/shippingProvider');
 const delivery = require('../services/deliveryService');
 const { packageForItems } = require('../services/shippingRules');
 const { logAudit } = require('../services/auditService');
@@ -22,10 +22,11 @@ async function context(req) {
   return { order, returnRequest, admin };
 }
 exports.readiness = asyncHandler(async (req, res) => {
-  const settings = await getStoreSettings();
+  const settings = await getStoreSettings(req.tenantFilter || {});
   const selected = getShippingProvider(settings.shippingProvider || 'manual');
-  const blueDart = getShippingProvider('bluedart');
-  res.set('Cache-Control', 'private, no-store').json({ selected, blueDart });
+  // The top-level selected fields preserve the existing seller endpoint shape;
+  // Settings also receives the full provider list for its connection cards.
+  res.set('Cache-Control', 'private, no-store').json({ ...selected, selected, providers: getShippingProviders(selected.name) });
 });
 exports.details = asyncHandler(async (req, res) => {
   const { order, returnRequest, admin } = await context(req);
@@ -35,12 +36,12 @@ exports.details = asyncHandler(async (req, res) => {
     try { booking = await delivery.syncBooking(booking, returnRequest ? Shipment.ReverseShipment : Shipment); }
     catch { warning = 'Latest courier updates are unavailable. Showing the last confirmed status.'; }
   }
-  const settings = admin ? await getStoreSettings() : {};
+  const settings = admin ? await getStoreSettings(req.tenantFilter || {}) : {};
   let parcel;
   if (admin) { try { parcel = order.shippingQuote?.parcel || packageForItems(order.orderItems, settings); } catch { parcel = null; } }
   const data = { shipment: delivery.publicShipment(booking), warning };
   if (!returnRequest && req.query.refresh === '1') data.order = await Order.findById(order._id).select('orderStatus statusTimeline deliveredAt').lean();
-  if (admin) Object.assign(data, { readiness: getShippingProvider(settings.shippingProvider || 'manual'), parcel, pickupAddress: settings.shippingPickup, reverse: !!returnRequest });
+  if (admin) Object.assign(data, { readiness: getShippingProvider(booking?.provider || settings.shippingProvider || 'manual'), selectedProvider: getShippingProvider(settings.shippingProvider || 'manual'), providers: getShippingProviders(settings.shippingProvider || 'manual'), parcel, pickupAddress: settings.shippingPickup, reverse: !!returnRequest });
   else if (data.shipment) {
     for (const key of ['operation', 'operationStartedAt', 'lastError', 'providerCharge', 'providerRef', 'service', 'pickup']) delete data.shipment[key];
   }
@@ -63,9 +64,10 @@ exports.label = asyncHandler(async (req, res) => {
   if (!admin) throw forbidden();
   const Model = returnRequest ? Shipment.ReverseShipment : Shipment;
   const booking = await Model.findOne(returnRequest ? { returnRequest: returnRequest._id } : { order: order._id }).select('+labelPdf');
-  if (!booking?.labelPdf || booking.labelPdf.subarray(0, 5).toString() !== '%PDF-') throw notFound('The carrier label is not available. Use the original label from your Blue Dart account; do not rebook the shipment to get another label.');
+  if (!booking?.labelPdf || booking.labelPdf.subarray(0, 5).toString() !== '%PDF-') throw notFound(`The carrier label is not available. Use the original label from your ${booking?.courierName || providerLabel(booking?.provider)} account; do not rebook the shipment to get another label.`);
   if (booking.status === 'CANCELLED') throw new ApiError('SHIPPING_VALIDATION', 'A cancelled shipping label must not be used.');
   // JSON uses the existing authenticated API client, including token renewal;
   // the PDF is never exposed through a public URL or a token in a query string.
-  res.set('Cache-Control', 'private, no-store').json({ filename: `Blue-Dart-${booking.awb}.pdf`, mimeType: 'application/pdf', base64: booking.labelPdf.toString('base64') });
+  const carrier = String(booking.courierName || providerLabel(booking.provider)).replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '') || 'Courier';
+  res.set('Cache-Control', 'private, no-store').json({ filename: `${carrier}-${booking.awb}.pdf`, mimeType: 'application/pdf', base64: booking.labelPdf.toString('base64') });
 });

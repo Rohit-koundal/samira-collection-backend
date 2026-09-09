@@ -14,8 +14,8 @@ const ONLINE_METHODS = [
   { key: 'WALLET', label: 'Wallet', settingKey: 'walletEnabled' },
 ];
 
-async function getStoreSettings() {
-  return (await Settings.findOne().lean()) || {};
+async function getStoreSettings(tenantFilter = {}) {
+  return (await Settings.findOne(tenantFilter || {}).lean()) || {};
 }
 
 function isOnlineMethod(method) {
@@ -57,15 +57,16 @@ function resolvePrepaidDiscount(method, amount, settings) {
   return 0;
 }
 
-async function customerRtoBlocked(userId, settings) {
+async function customerRtoBlocked(userId, settings, tenantFilter = {}) {
   if (!userId || settings?.rtoBlockEnabled !== true) return false;
   const minOrders = Number(settings?.rtoBlockMinOrders || 0);
   const threshold = Number(settings?.rtoBlockThreshold || 0);
   if (minOrders <= 0 || threshold <= 0) return false;
   const Order = require('../models/Order');
-  const total = await Order.countDocuments({ user: userId, orderStatus: { $ne: 'Cancelled' } });
+  const { andFilter } = require('./storeService');
+  const total = await Order.countDocuments(andFilter({ user: userId, orderStatus: { $ne: 'Cancelled' } }, tenantFilter));
   if (total < minOrders) return false;
-  const returned = await Order.countDocuments({ user: userId, orderStatus: { $in: ['Returned', 'Refunded'] } });
+  const returned = await Order.countDocuments(andFilter({ user: userId, orderStatus: { $in: ['Returned', 'Refunded'] } }, tenantFilter));
   return (returned / total) >= threshold;
 }
 
@@ -131,7 +132,7 @@ function buildPaymentOptions(settings, { razorpayConfigured, orderAmount = null,
  * Server-side gate. Mirrors buildPaymentOptions so a hand-crafted request for
  * a hidden method is rejected instead of silently accepted.
  */
-async function assertPaymentMethodAllowed(method, settings, { razorpayConfigured, orderAmount = null, pincode = '', userId = null } = {}) {
+async function assertPaymentMethodAllowed(method, settings, { razorpayConfigured, orderAmount = null, pincode = '', userId = null, tenantFilter = {} } = {}) {
   if (method === 'COD') {
     if (settings?.codEnabled === false) {
       throw new ApiError('PAYMENT_METHOD_UNAVAILABLE', 'Cash on Delivery is currently unavailable');
@@ -147,7 +148,7 @@ async function assertPaymentMethodAllowed(method, settings, { razorpayConfigured
     if (!codPincodeAllowed(settings, pincode)) {
       throw new ApiError('PAYMENT_METHOD_UNAVAILABLE', 'Cash on Delivery is not available for this delivery pincode.');
     }
-    if (await customerRtoBlocked(userId, settings)) {
+    if (await customerRtoBlocked(userId, settings, tenantFilter)) {
       throw new ApiError('PAYMENT_METHOD_UNAVAILABLE', 'Cash on Delivery is unavailable on this account. Please pay online.');
     }
     return;

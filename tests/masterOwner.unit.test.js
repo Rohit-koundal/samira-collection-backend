@@ -2,6 +2,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const crypto = require('crypto');
+const zlib = require('zlib');
 const mongoose = require('mongoose');
 const Configuration = require('../models/MasterConfiguration');
 const Product = require('../models/Product');
@@ -10,6 +11,7 @@ const Otp = require('../models/Otp');
 const policy = require('../config/masterOwner');
 const { DEFAULT_STRUCTURE, INDUSTRY_PRESETS } = require('../config/industryPresets');
 const service = require('../services/masterConfigurationService');
+const projectGenerator = require('../services/projectGeneratorService');
 const copy = (value) => JSON.parse(JSON.stringify(value));
 const owner = () => policy.attachMasterSession({
   _id: '0123456789abcdef01234567', phone: '9816978086', role: 'admin', activeMode: 'admin',
@@ -18,6 +20,24 @@ const owner = () => policy.attachMasterSession({
 const configuration = (locked = false) => ({ _id: 'store', locked, revision: 2, history: [], structure: service.validateStructure(copy(DEFAULT_STRUCTURE)) });
 const stubConfig = (t, value) => t.mock.method(Configuration, 'findById', () => ({ lean: async () => value }));
 const response = () => ({ statusCode: 200, status(code) { this.statusCode = code; return this; }, json(body) { this.body = body; return this; }, setHeader() {} });
+
+function readZip(buffer) {
+  const entries = new Map();
+  let offset = 0;
+  while (offset + 30 <= buffer.length && buffer.readUInt32LE(offset) === 0x04034b50) {
+    const method = buffer.readUInt16LE(offset + 8);
+    const compressedSize = buffer.readUInt32LE(offset + 18);
+    const filenameLength = buffer.readUInt16LE(offset + 26);
+    const extraLength = buffer.readUInt16LE(offset + 28);
+    const filenameStart = offset + 30;
+    const dataStart = filenameStart + filenameLength + extraLength;
+    const name = buffer.subarray(filenameStart, filenameStart + filenameLength).toString('utf8');
+    const compressed = buffer.subarray(dataStart, dataStart + compressedSize);
+    entries.set(name, method === 8 ? zlib.inflateRawSync(compressed) : Buffer.from(compressed));
+    offset = dataStart + compressedSize;
+  }
+  return entries;
+}
 
 test('owner requires the pinned phone, verified DB identity, admin mode and a current signed session', () => {
   assert.equal(policy.isOwnerPhone('+91 9816978086'), true);
@@ -33,7 +53,7 @@ test('owner requires the pinned phone, verified DB identity, admin mode and a cu
 
 test('master route middleware and controller handlers reject client admins before database work', async () => {
   const controller = require('../controllers/masterController');
-  for (const action of ['workspace', 'update', 'export', 'import', 'createPreset', 'deletePreset', 'provisionAdmin']) {
+  for (const action of ['workspace', 'previewProject', 'generateProject', 'updateInstallation', 'rotateInstallationKey', 'deployInstallation', 'createRelease', 'update', 'export', 'import', 'createPreset', 'deletePreset', 'provisionAdmin']) {
     let error;
     await controller[action]({ user: { role: 'admin', systemRole: 'USER' }, body: {}, params: {} }, response(), (err) => { error = err; });
     assert.equal(error?.statusCode, 403, action);
@@ -52,11 +72,81 @@ test('service-level guard rejects direct configuration calls without a master se
 });
 
 test('all industry presets are independent, valid and have the intended sizing profile', () => {
+  assert.deepEqual(
+    INDUSTRY_PRESETS.map((preset) => preset.industry),
+    ['fashion', 'mobile', 'electronics', 'jewellery', 'cosmetics', 'art', 'bakery', 'footwear', 'home'],
+  );
   for (const preset of INDUSTRY_PRESETS) {
     const result = service.validateStructure({ ...copy(preset), clientPermissions: { content: true, payments: true } });
-    assert.equal(result.features.sizing, preset.industry === 'fashion');
-    assert.ok(result.attributes.length >= 3);
+    assert.equal(result.features.sizing, preset.features.sizing);
+    assert.ok(result.attributes.length >= 12, `${preset.industry} needs a complete product schema`);
+    assert.ok(result.categoryDefinitions.length >= 5, `${preset.industry} needs category definitions`);
+    assert.ok(result.filters.length >= 5, `${preset.industry} needs storefront filters`);
+    assert.ok(result.sortingOptions.length >= 4, `${preset.industry} needs sort options`);
+    assert.ok(result.productSections.length >= 6, `${preset.industry} needs product detail sections`);
+    assert.ok(result.homepageSections.length >= 4, `${preset.industry} needs homepage sections`);
+    assert.ok(result.attributes.every((field) => field.type && field.group && field.validation));
   }
+  const electronics = service.validateStructure({ ...copy(INDUSTRY_PRESETS.find((preset) => preset.industry === 'electronics')), clientPermissions: { content: true, payments: true } });
+  const mobiles = electronics.categoryDefinitions.find((category) => category.key === 'mobiles');
+  assert.deepEqual(mobiles.variantAttributes, ['ram', 'storage', 'colour']);
+  assert.ok(mobiles.attributes.some((field) => field.key === 'battery'));
+  const mobileStore = service.validateStructure({ ...copy(INDUSTRY_PRESETS.find((preset) => preset.industry === 'mobile')), clientPermissions: { content: true, payments: true } });
+  const smartphones = mobileStore.categoryDefinitions.find((category) => category.key === 'smartphones');
+  const chargers = mobileStore.categoryDefinitions.find((category) => category.key === 'chargers');
+  assert.deepEqual(smartphones.variantAttributes, ['ram', 'storage', 'colour']);
+  assert.ok(smartphones.attributes.some((field) => field.key === 'charging_power'));
+  assert.ok(chargers.attributes.some((field) => field.key === 'output_power'));
+  assert.equal(mobileStore.attributes.some((field) => field.key === 'processor'), false);
+  const bakery = INDUSTRY_PRESETS.find((preset) => preset.industry === 'bakery');
+  assert.equal(bakery.inventory.trackExpiry, true);
+  assert.ok(bakery.attributes.some((field) => field.key === 'batch_number' && field.required));
+  assert.ok(bakery.attributes.some((field) => field.key === 'expiry_date' && field.required));
+});
+
+test('standalone project generator creates a renamed isolated source package without private runtime data', async () => {
+  const mobile = INDUSTRY_PRESETS.find((preset) => preset.industry === 'mobile');
+  const input = { companyName: 'Rohit Mobiles', projectName: 'Rohit Mobile Commerce', projectSlug: 'rohit-mobiles', industry: 'mobile', includeAiWorker: false };
+  const preview = await projectGenerator.previewProject(input, mobile);
+  assert.equal(preview.downloadName, 'rohit-mobiles.zip');
+  assert.ok(preview.sourceFiles > 100);
+  const result = await projectGenerator.generateProject(input, mobile);
+  assert.equal(result.buffer.readUInt32LE(0), 0x04034b50);
+  const entries = readZip(result.buffer);
+  const prefix = 'rohit-mobiles/';
+  for (const name of ['package.json', 'backend/package.json', 'src/App.jsx', 'src/components/pwa/MobileAppCompanion.jsx', 'public/sw.js', 'public/offline.html', 'README.md', '.gitignore', '.env.example', 'backend/.env.example', 'backend/controllers/catalogConfigurationController.js', 'project-manifest.json']) assert.ok(entries.has(prefix + name), name);
+  assert.equal(JSON.parse(entries.get(prefix + 'package.json')).name, 'rohit-mobiles');
+  assert.equal(JSON.parse(entries.get(prefix + 'backend/package.json')).name, 'rohit-mobiles-backend');
+  assert.match(entries.get(prefix + 'src/config/websiteCustomization.js').toString('utf8'), /Rohit Mobiles/);
+  assert.match(entries.get(prefix + 'backend/services/storeService.js').toString('utf8'), /DEFAULT_STORE_SLUG = 'rohit-mobiles'/);
+  assert.match(entries.get(prefix + 'backend/config/industryPresets.js').toString('utf8'), /"industry":"mobile"/);
+  assert.doesNotMatch(entries.get(prefix + 'src/App.jsx').toString('utf8'), /MasterConfiguration|MasterRoute|PlatformStores|masterPages|isMaster/);
+  assert.doesNotMatch(entries.get(prefix + 'src/App.jsx').toString('utf8'), /SellerSubscription|seller\/subscription/);
+  assert.doesNotMatch(entries.get(prefix + 'src/components/seller/SellerLayout.jsx').toString('utf8'), /Plan & billing|seller\/subscription/);
+  assert.doesNotMatch(entries.get(prefix + 'backend/routes/sellerRoutes.js').toString('utf8'), /subscription|requireActiveStoreLicenseForWrites|requireProductCapacity/);
+  assert.doesNotMatch(entries.get(prefix + 'backend/controllers/orderController.js').toString('utf8'), /assertMonthlyOrderCapacity|assertStoreCanAcceptOrders/);
+  assert.doesNotMatch(entries.get(prefix + 'backend/controllers/paymentController.js').toString('utf8'), /subscriptionService|CLIENT_PROJECT_REMOVE_SUBSCRIPTION/);
+  assert.doesNotMatch(entries.get(prefix + 'src/components/admin/AdminSidebar.jsx').toString('utf8'), /Master configuration|Store portfolio|\/master/);
+  assert.doesNotMatch(entries.get(prefix + 'backend/app.js').toString('utf8'), /\/api\/master|masterController/);
+  assert.doesNotMatch(entries.get(prefix + 'backend/routes/websiteCustomizationRoutes.js').toString('utf8'), /masterOnly|unlocked/);
+  assert.doesNotMatch(entries.get(prefix + 'src/pages/admin/WebsiteCustomizer.jsx').toString('utf8'), /Master configuration|\/master/);
+  for (const name of ['src/pages/admin/MasterConfiguration.jsx', 'src/pages/admin/PlatformStores.jsx', 'src/pages/seller/Subscription.jsx', 'src/components/layout/MasterRoute.jsx', 'backend/controllers/masterController.js', 'backend/controllers/subscriptionController.js', 'backend/models/SubscriptionPayment.js', 'backend/routes/masterRoutes.js', 'backend/services/projectGeneratorService.js', 'backend/services/subscriptionService.js']) assert.ok(!entries.has(prefix + name), name);
+  assert.ok(![...entries.keys()].some((name) => name.includes('/node_modules/') || name.includes('/uploads/') || name.includes('/.git/') || name.startsWith(prefix + 'ai-video-worker/')));
+  assert.ok(!entries.has(prefix + '.env'));
+  assert.ok(!entries.has(prefix + 'backend/.env'));
+  const manifest = JSON.parse(entries.get(prefix + 'project-manifest.json'));
+  assert.equal(manifest.dataIncluded, false);
+  assert.equal(manifest.features.masterConfiguration, false);
+  assert.equal(manifest.features.projectGenerator, false);
+  assert.equal(manifest.features.installablePhoneApp, true);
+  assert.equal(manifest.features.cartWishlistCheckout, true);
+  assert.equal(manifest.features.backendTrustValidation, true);
+  const generatedManifest = JSON.parse(entries.get(prefix + 'public/manifest.json'));
+  assert.equal(generatedManifest.name, 'Rohit Mobiles');
+  assert.ok(generatedManifest.shortcuts.some((shortcut) => shortcut.url.startsWith('/cart')));
+  assert.match(entries.get(prefix + 'backend/config/corsOptions.js').toString('utf8'), /https:\/\/rohit-mobiles\.onrender\.com/);
+  assert.doesNotMatch(entries.get(prefix + 'backend/config/corsOptions.js').toString('utf8'), /endsWith\('\.onrender\.com'\)/);
+  assert.match(entries.get(prefix + '.env.example').toString('utf8'), /GENERATE_SOURCEMAP=false/);
 });
 
 test('rejects malicious, duplicate and incomplete structural definitions', () => {
@@ -65,14 +155,20 @@ test('rejects malicious, duplicate and incomplete structural definitions', () =>
     [{ key: 'ram', label: 'RAM' }, { key: 'ram', label: 'Other' }],
     [{ key: 'ram', label: '' }], [{ key: 'ram', label: 'RAM', required: 'true' }],
   ]) assert.throws(() => service.validateStructure({ ...copy(DEFAULT_STRUCTURE), attributes }), { statusCode: 400 });
-  assert.throws(() => service.validateStructure({ ...copy(DEFAULT_STRUCTURE), industry: 'unknown' }), { statusCode: 400 });
+  assert.equal(service.validateStructure({ ...copy(DEFAULT_STRUCTURE), id: 'custom-store', name: 'Custom Store', industry: 'custom-store' }).industry, 'custom-store');
   assert.throws(() => service.validateStructure({ ...copy(DEFAULT_STRUCTURE), industry: 'electronics' }), { statusCode: 400 });
   assert.throws(() => service.validateStructure({ ...copy(DEFAULT_STRUCTURE), features: { sizing: true, specifications: false } }), { statusCode: 400 });
 });
 
 test('public configuration never includes lock history, owner identity or client permissions', () => {
   const result = service.publicStructure({ ...configuration(), updatedBy: 'owner', history: [{ actor: 'owner' }] });
-  assert.deepEqual(Object.keys(result).sort(), ['attributes', 'features', 'industry', 'revision']);
+  assert.equal(result.industry, 'fashion');
+  assert.equal(result.revision, 2);
+  assert.ok(result.categoryDefinitions.length > 0);
+  assert.ok(result.variantConfig);
+  assert.equal('clientPermissions' in result, false);
+  assert.equal('history' in result, false);
+  assert.equal('updatedBy' in result, false);
 });
 
 test('locked configuration cannot be edited, even by master, without a separate unlock', async (t) => {
@@ -108,12 +204,14 @@ test('concurrent configuration write conflicts instead of silently overwriting',
   await assert.rejects(service.updateConfiguration(owner(), { revision: 2, locked: true }), { statusCode: 409 });
 });
 
-test('conversion with an existing catalog is refused without deleting products', async (t) => {
+test('conversion with an existing catalog requires confirmation and then preserves products', async (t) => {
   stubConfig(t, configuration());
   t.mock.method(Configuration, 'findOneAndUpdate', async () => ({}));
-  t.mock.method(Product, 'exists', async () => ({ _id: 'existing' }));
+  const existing = t.mock.method(Product, 'exists', async () => ({ _id: 'existing' }));
   const structure = { ...copy(INDUSTRY_PRESETS.find((preset) => preset.industry === 'electronics')), clientPermissions: { content: true, payments: true } };
   await assert.rejects(service.updateConfiguration(owner(), { revision: 2, structure }), /archive incompatible products/);
+  await assert.doesNotReject(service.updateConfiguration(owner(), { revision: 2, structure, confirmIndustryChange: true }));
+  assert.equal(existing.mock.callCount(), 1);
 });
 
 test('used attribute definitions cannot be renamed or removed silently', async (t) => {
@@ -121,7 +219,7 @@ test('used attribute definitions cannot be renamed or removed silently', async (
   stubConfig(t, before);
   t.mock.method(Configuration, 'findOneAndUpdate', async () => ({}));
   t.mock.method(Product, 'exists', async () => ({ _id: 'existing' }));
-  await assert.rejects(service.updateConfiguration(owner(), { revision: 2, structure: { ...before.structure, attributes: [] } }), /used by products/);
+  await assert.rejects(service.updateConfiguration(owner(), { revision: 2, structure: { ...before.structure, attributes: [], categoryDefinitions: [], variantConfig: { enabled: false, attributes: [] }, productCard: { fields: ['name', 'price'], attributeKeys: [] }, seo: { titlePattern: '{product}', descriptionAttributes: [] } } }), /used by products/);
 });
 
 test('fashion product sizes and variants remain unchanged and specifications use owner labels', async (t) => {
@@ -137,14 +235,15 @@ test('fashion product sizes and variants remain unchanged and specifications use
 
 test('nonfashion products have configured attributes and no garment size selection', async (t) => {
   const config = configuration();
-  config.structure = { ...copy(INDUSTRY_PRESETS.find((preset) => preset.industry === 'electronics')), clientPermissions: { content: true, payments: true } };
+  config.structure = { ...copy(INDUSTRY_PRESETS.find((preset) => preset.industry === 'mobile')), clientPermissions: { content: true, payments: true } };
   stubConfig(t, config);
-  const result = await service.applyProductStructure({ sizes: ['S'], sizingMode: 'sized', variants: [{ size: 'S' }], attributeValues: { ram: 8 } });
+  const result = await service.applyProductStructure({ categoryDefinitionKey: 'smartphones', subCategory: 'Android Phones', sizes: ['S'], sizingMode: 'sized', variants: [{ sku: 'PHONE-8-128-BLACK', optionValues: { ram: '8', storage: '128', colour: 'Black' }, stock: 2 }], attributeValues: { brand: 'Example', model: 'M1', condition: 'New', processor: 'Octa core', warranty: '1 year', ram: 8 } });
   assert.equal(result.sizingMode, 'free-size');
   assert.deepEqual(result.sizes, []);
-  assert.deepEqual(result.variants, []);
+  assert.equal(result.variants[0].optionValues.storage, '128');
   assert.equal(result.attributeValues.ram, '8');
-  assert.equal(result.specifications[0].unit, 'GB');
+  assert.equal(result.specifications.find((item) => item.key === 'ram').unit, 'GB');
+  assert.equal(result.categoryDefinitionKey, 'smartphones_android_phones');
 });
 
 test('attribute values reject unknown keys, missing required fields and oversized values', async (t) => {

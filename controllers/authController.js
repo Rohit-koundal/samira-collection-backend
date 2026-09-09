@@ -243,6 +243,7 @@ exports.me = async (req, res) => {
       slug: item.store?.slug,
       role: item.role,
       status: item.store?.status,
+      platform: require('../config/storePlans').planSummary(item.store),
     }));
   }
   res.json(data);

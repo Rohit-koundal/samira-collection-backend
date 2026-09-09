@@ -29,6 +29,9 @@ async function startServer() {
   await connectDB();
 
   if (mongoose.connection.readyState === 1) {
+    await require('./services/storeService').ensureTenantIndexes().catch((error) => {
+      console.error(`Tenant index migration failed: ${error.message}`);
+    });
     require('./services/deliveryService').startDeliveryWorker();
     require('./modules/social-workspace/publishing').startWorker();
     const socialImports = require('./modules/social-product-import/socialImport.service');

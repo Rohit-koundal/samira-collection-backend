@@ -1,6 +1,7 @@
 const { asyncHandler } = require('../middleware/validate');
-const { applyProductStructure } = require('../services/masterConfigurationService');
+const { applyProductStructure, readConfiguration } = require('../services/masterConfigurationService');
 const Product = require('../models/Product');
+const InventoryTransaction = require('../models/InventoryTransaction');
 const Category = require('../models/Category');
 const slugify = require('../utils/slugify');
 const mongoose = require('mongoose');
@@ -11,7 +12,7 @@ const { andFilter } = require('../services/storeService');
 const { assertStoreOwned } = require('../middleware/storeMiddleware');
 const { logAudit } = require('../services/auditService');
 const { auditSnapshot } = require('../utils/auditData');
-const PRODUCT_AUDIT_FIELDS = ['name', 'sku', 'slug', 'brand', 'category', 'subCategory', 'price', 'originalPrice', 'stock', 'lowStockAlert', 'isActive', 'isArchived', 'isFeatured', 'isBestSeller', 'isNewArrival', 'showOnHomepage', 'showInTrending', 'showInFestive', 'sizes', 'colors', 'fabric', 'occasion', 'description', 'shortDescription', 'variants', 'variantGroupId', 'sizingMode', 'sizeChartProfile', 'sizeChart', 'sizeFitNotes', 'attributeValues', 'specifications', 'highlights', 'careInstructions', 'returnPolicy', 'tags'];
+const PRODUCT_AUDIT_FIELDS = ['name', 'sku', 'slug', 'brand', 'category', 'subCategory', 'price', 'originalPrice', 'costPrice', 'gstRate', 'hsnCode', 'barcode', 'stock', 'lowStockAlert', 'reorderQuantity', 'shippingWeightKg', 'packageDimensions', 'countryOfOrigin', 'manufacturerDetails', 'warranty', 'supplierName', 'supplierSku', 'restockAt', 'publishAt', 'saleStartAt', 'saleEndAt', 'isActive', 'isArchived', 'isFeatured', 'isBestSeller', 'isNewArrival', 'showOnHomepage', 'showInTrending', 'showInFestive', 'sizes', 'colors', 'fabric', 'occasion', 'description', 'shortDescription', 'variants', 'variantGroupId', 'sizingMode', 'sizeChartProfile', 'sizeChart', 'sizeFitNotes', 'attributeValues', 'specifications', 'highlights', 'careInstructions', 'returnPolicy', 'tags'];
 const { analyzeQuickAddImage, getQuickAddVisionStatus } = require('../services/quickAddVision.service');
 const { wantsPagination, readPagination, buildPaginatedResponse } = require('../utils/validators');
 const { normalizeProductSizing, validateProductSizing } = require('../services/productSizingService');
@@ -42,23 +43,47 @@ function normalizeProductResponse(product, req) {
 exports.getProducts = asyncHandler(async (req, res) => {
   const isAdminRequest = String(req.baseUrl || '').startsWith('/api/admin/products')
     || String(req.baseUrl || '').startsWith('/api/seller/products');
-  const query = catalogQuery(req, isAdminRequest ? {} : { isActive: true, isArchived: { $ne: true } });
+  const archiveMode = String(req.query.archive || '').toLowerCase();
+  const archiveFilter = archiveMode === 'only'
+    ? { isArchived: true }
+    : archiveMode === 'all' ? {} : { isArchived: { $ne: true } };
+  const publicVisibility = {
+    $and: [
+      { isActive: true, isArchived: { $ne: true } },
+      { $or: [{ publishAt: { $exists: false } }, { publishAt: null }, { publishAt: { $lte: new Date() } }] },
+    ],
+  };
+  const query = catalogQuery(req, isAdminRequest ? archiveFilter : publicVisibility);
+  const dynamicFilterKeys = Object.keys(req.query || {}).filter((key) => key.startsWith('attr_'));
+  const catalogConfiguration = req.query.search || dynamicFilterKeys.length
+    ? await readConfiguration(req.store?._id)
+    : null;
+  const configuredAttributes = collectConfiguredAttributes(catalogConfiguration?.structure);
+  const searchableAttributes = configuredAttributes.filter((attribute) => attribute.searchable).map((attribute) => attribute.key);
   if (req.query.search) query.$or = [
     { name: { $regex: escapeRegex(String(req.query.search)), $options: 'i' } },
     { sku: { $regex: escapeRegex(String(req.query.search)), $options: 'i' } },
     { fabric: { $regex: escapeRegex(String(req.query.search)), $options: 'i' } },
     { occasion: { $regex: escapeRegex(String(req.query.search)), $options: 'i' } },
+    ...searchableAttributes.map((key) => ({ [`attributeValues.${key}`]: { $regex: escapeRegex(String(req.query.search)), $options: 'i' } })),
   ];
+  const filterableAttributes = new Set(configuredAttributes.filter((attribute) => attribute.filterable).map((attribute) => attribute.key));
+  dynamicFilterKeys.forEach((queryKey) => {
+    const attributeKey = queryKey.slice(5);
+    if (!filterableAttributes.has(attributeKey)) return;
+    const values = String(req.query[queryKey] || '').split(',').map((value) => value.trim()).filter(Boolean).slice(0, 30);
+    if (values.length) query[`attributeValues.${attributeKey}`] = values.length === 1 ? values[0] : { $in: values };
+  });
   if (req.query.category) {
     if (mongoose.Types.ObjectId.isValid(req.query.category)) {
       query.category = req.query.category;
     } else {
-      const category = await Category.findOne({
+      const category = await Category.findOne(andFilter({
         $or: [
           { slug: req.query.category },
           { name: { $regex: `^${escapeRegex(req.query.category)}$`, $options: 'i' } },
         ],
-      });
+      }, req.tenantFilter));
       if (category) query.category = category._id;
       else query.category = null;
     }
@@ -76,9 +101,17 @@ exports.getProducts = asyncHandler(async (req, res) => {
   if (req.query.rating) query.rating = { $gte: Number(req.query.rating) };
   if (req.query.stock === 'in') query.stock = { $gt: 0 };
   if (req.query.stock === 'out') query.stock = 0;
+  if (req.query.stock === 'low') {
+    query.stock = { $gt: 0 };
+    query.$expr = { $lte: ['$stock', { $ifNull: ['$lowStockAlert', 5] }] };
+  }
+  if (req.query.status === 'active') query.isActive = true;
+  if (req.query.status === 'inactive') query.isActive = false;
   if (req.query.featured === 'true') query.isFeatured = true;
   if (req.query.newArrival === 'true') query.isNewArrival = true;
   if (req.query.bestSeller === 'true') query.isBestSeller = true;
+  if (req.query.completeness === 'missing-media') addQueryClause(query, { $or: [{ images: { $exists: false } }, { images: { $size: 0 } }] });
+  if (req.query.completeness === 'missing-seo') addQueryClause(query, { $or: [{ metaTitle: { $in: ['', null] } }, { metaDescription: { $in: ['', null] } }] });
 
   const sortMap = {
     newest: '-createdAt',
@@ -86,6 +119,8 @@ exports.getProducts = asyncHandler(async (req, res) => {
     priceHighLow: '-price',
     discount: '-discountPercentage',
     rating: '-rating',
+    stock: 'stock',
+    updated: '-updatedAt',
   };
   const sort = sortMap[req.query.sort] || '-createdAt';
   // Admin designer choices need identifiers and labels, not every image,
@@ -99,18 +134,60 @@ exports.getProducts = asyncHandler(async (req, res) => {
       Product.find(query).populate('category').sort(sort).skip(skip).limit(limit),
       Product.countDocuments(query),
     ]);
-    return res.json(buildPaginatedResponse(items.map((product) => normalizeProductResponse(product, req)), { page, limit, total }));
+    const response = buildPaginatedResponse(items.map((product) => normalizeProductResponse(product, req)), { page, limit, total });
+    if (req.query.includeSummary === 'true') response.summary = await getCatalogSummary(req);
+    return res.json(response);
   }
   const products = await Product.find(query).populate('category').sort(sort);
   res.json(products.map((product) => normalizeProductResponse(product, req)));
 });
 
+async function getCatalogSummary(req) {
+  const current = catalogQuery(req, { isArchived: { $ne: true } });
+  const archived = catalogQuery(req, { isArchived: true });
+  const low = catalogQuery(req, {
+    isArchived: { $ne: true },
+    stock: { $gt: 0 },
+    $expr: { $lte: ['$stock', { $ifNull: ['$lowStockAlert', 5] }] },
+  });
+  const out = catalogQuery(req, { isArchived: { $ne: true }, stock: { $lte: 0 } });
+  const [total, active, lowStock, outOfStock, archivedCount, value] = await Promise.all([
+    Product.countDocuments(current),
+    Product.countDocuments(catalogQuery(req, { isArchived: { $ne: true }, isActive: true })),
+    Product.countDocuments(low),
+    Product.countDocuments(out),
+    Product.countDocuments(archived),
+    Product.aggregate([
+      { $match: current },
+      { $group: { _id: null, retailValue: { $sum: { $multiply: [{ $ifNull: ['$price', 0] }, { $ifNull: ['$stock', 0] }] } }, costValue: { $sum: { $multiply: [{ $ifNull: ['$costPrice', 0] }, { $ifNull: ['$stock', 0] }] } } } },
+    ]),
+  ]);
+  return { total, active, low: lowStock, out: outOfStock, archived: archivedCount, retailValue: value[0]?.retailValue || 0, costValue: value[0]?.costValue || 0 };
+}
+
 function escapeRegex(value = '') {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+function addQueryClause(query, clause) {
+  query.$and = [...(Array.isArray(query.$and) ? query.$and : []), clause];
+}
+
+function collectConfiguredAttributes(structure = {}) {
+  const definitions = new Map((structure.attributes || []).map((attribute) => [attribute.key, attribute]));
+  (structure.categoryDefinitions || []).forEach((category) => (category.attributes || []).forEach((attribute) => {
+    if (attribute && typeof attribute === 'object' && attribute.key) definitions.set(attribute.key, { ...(definitions.get(attribute.key) || {}), ...attribute });
+  }));
+  return Array.from(definitions.values());
+}
+
 exports.getProductBySlug = asyncHandler(async (req, res) => {
-  const scoped = catalogQuery(req, { isActive: true, isArchived: { $ne: true } });
+  const scoped = catalogQuery(req, {
+    $and: [
+      { isActive: true, isArchived: { $ne: true } },
+      { $or: [{ publishAt: { $exists: false } }, { publishAt: null }, { publishAt: { $lte: new Date() } }] },
+    ],
+  });
   const productKey = String(req.params.slug || '').trim();
   let product = mongoose.Types.ObjectId.isValid(productKey)
     ? await Product.findOne(andFilter({ _id: productKey }, scoped)).populate('category')
@@ -233,9 +310,15 @@ exports.updateStock = asyncHandler(async (req, res) => {
   if (req.body.variantId) {
     const variant = product.variants.id(req.body.variantId);
     if (!variant) return res.status(404).json({ message: 'Variant not found' });
+    const variantBefore = Number(variant.stock || 0);
     variant.stock = stock;
     product.stock = totalVariantStock(product);
     await product.save();
+    if (stock !== variantBefore && mongoose.connection.readyState === 1) await InventoryTransaction.create({
+      storeId: product.storeId, product: product._id, variantId: String(variant._id), sku: product.sku,
+      type: 'MANUAL_ADJUSTMENT', quantity: stock - variantBefore, stockBefore: variantBefore, stockAfter: stock,
+      reason: 'Manual variant stock update', createdBy: req.user?._id,
+    });
     logAudit({ req, action: 'STOCK_UPDATE', entityType: 'Product', entityId: product._id, storeId: product.storeId, before: { stock: previousStock }, after: { stock: product.stock, variantId: req.body.variantId } });
     return res.json(product);
   }
@@ -249,6 +332,11 @@ exports.updateStock = asyncHandler(async (req, res) => {
 
   product.stock = stock;
   await product.save();
+  if (stock !== previousStock && mongoose.connection.readyState === 1) await InventoryTransaction.create({
+    storeId: product.storeId, product: product._id, sku: product.sku,
+    type: 'MANUAL_ADJUSTMENT', quantity: stock - previousStock, stockBefore: previousStock, stockAfter: stock,
+    reason: 'Manual stock update', createdBy: req.user?._id,
+  });
   logAudit({ req, action: 'STOCK_UPDATE', entityType: 'Product', entityId: product._id, storeId: product.storeId, before: { stock: previousStock }, after: { stock: product.stock } });
   res.json(product);
 });
@@ -258,11 +346,23 @@ exports.markOutOfStock = asyncHandler(async (req, res) => {
   if (!product) return res.status(404).json({ message: 'Product not found' });
   assertStoreOwned(product, req);
   const before = auditSnapshot(product, ['stock', 'variants']);
+  const movements = hasManagedVariants(product)
+    ? product.variants.filter((variant) => Number(variant.stock || 0) !== 0).map((variant) => ({
+      storeId: product.storeId, product: product._id, variantId: String(variant._id), sku: product.sku,
+      type: 'MANUAL_ADJUSTMENT', quantity: -Number(variant.stock || 0), stockBefore: Number(variant.stock || 0), stockAfter: 0,
+      reason: 'Marked out of stock', createdBy: req.user?._id,
+    }))
+    : Number(product.stock || 0) !== 0 ? [{
+      storeId: product.storeId, product: product._id, sku: product.sku,
+      type: 'MANUAL_ADJUSTMENT', quantity: -Number(product.stock || 0), stockBefore: Number(product.stock || 0), stockAfter: 0,
+      reason: 'Marked out of stock', createdBy: req.user?._id,
+    }] : [];
   if (hasManagedVariants(product)) {
     product.variants.forEach((variant) => { variant.stock = 0; });
   }
   product.stock = 0;
   await product.save();
+  if (movements.length) await InventoryTransaction.insertMany(movements);
   logAudit({ req, action: 'STOCK_UPDATE', entityType: 'Product', entityId: product._id, storeId: product.storeId, before, after: auditSnapshot(product, ['stock', 'variants']) });
   res.json(product);
 });
@@ -271,6 +371,147 @@ exports.hideProduct = (req, res, next) => {
   req.body = { ...req.body, isActive: false };
   return exports.updateStatus(req, res, next);
 };
+
+exports.restoreProduct = asyncHandler(async (req, res) => {
+  const product = await Product.findOne(catalogQuery(req, { _id: req.params.id, isArchived: true }));
+  if (!product) return res.status(404).json({ message: 'Archived product not found' });
+  assertStoreOwned(product, req);
+  const before = auditSnapshot(product, ['isActive', 'isArchived', 'deletedAt']);
+  product.isArchived = false;
+  product.isActive = false;
+  product.deletedAt = undefined;
+  await product.save();
+  logAudit({ req, action: 'PRODUCT_RESTORE', entityType: 'Product', entityId: product._id, storeId: product.storeId, before, after: auditSnapshot(product, ['isActive', 'isArchived', 'deletedAt']) });
+  res.json(normalizeProductResponse(product, req));
+});
+
+exports.duplicateProduct = asyncHandler(async (req, res) => {
+  const source = await Product.findOne(catalogQuery(req, { _id: req.params.id, isArchived: { $ne: true } }));
+  if (!source) return res.status(404).json({ message: 'Product not found' });
+  assertStoreOwned(source, req);
+  const data = source.toObject({ depopulate: true });
+  for (const key of ['_id', '__v', 'createdAt', 'updatedAt', 'deletedAt', 'sourceDraftId']) delete data[key];
+  const baseName = `${source.name} copy`;
+  data.name = baseName;
+  data.slug = await uniqueValue(req, 'slug', slugify(baseName));
+  data.sku = await uniqueValue(req, 'sku', `${source.sku || 'PRODUCT'}-COPY`);
+  if (data.barcode) data.barcode = '';
+  data.isActive = false;
+  data.isArchived = false;
+  data.publishAt = null;
+  const product = await Product.create(data);
+  logAudit({ req, action: 'PRODUCT_DUPLICATE', entityType: 'Product', entityId: product._id, storeId: product.storeId, after: auditSnapshot(product, PRODUCT_AUDIT_FIELDS), summary: `Duplicated from ${source.name}` });
+  res.status(201).json(normalizeProductResponse(product, req));
+});
+
+exports.bulkUpdateProducts = asyncHandler(async (req, res) => {
+  const ids = readProductIds(req.body?.ids);
+  const action = String(req.body?.action || '').trim();
+  const allowed = new Set(['activate', 'deactivate', 'archive', 'restore', 'out-of-stock', 'feature', 'unfeature', 'best-seller', 'remove-best-seller']);
+  if (!allowed.has(action)) return res.status(400).json({ message: 'Choose a valid bulk action' });
+  const products = await Product.find(catalogQuery(req, { _id: { $in: ids } }));
+  if (products.length !== ids.length) return res.status(404).json({ message: 'One or more products are unavailable. Refresh the catalog and try again.' });
+  if (action === 'activate' && products.some((product) => product.isArchived)) {
+    return res.status(409).json({ message: 'Restore archived products before making them active.' });
+  }
+  const inventoryMovements = [];
+  for (const product of products) {
+    assertStoreOwned(product, req);
+    const before = auditSnapshot(product, ['isActive', 'isArchived', 'deletedAt', 'stock', 'variants', 'isFeatured', 'isBestSeller']);
+    if (action === 'activate') {
+      product.isActive = true;
+    } else if (action === 'deactivate') product.isActive = false;
+    else if (action === 'archive') {
+      product.isActive = false;
+      product.isArchived = true;
+      product.deletedAt = product.deletedAt || new Date();
+    } else if (action === 'restore') {
+      product.isArchived = false;
+      product.isActive = false;
+      product.deletedAt = undefined;
+    } else if (action === 'feature') product.isFeatured = true;
+    else if (action === 'unfeature') product.isFeatured = false;
+    else if (action === 'best-seller') product.isBestSeller = true;
+    else if (action === 'remove-best-seller') product.isBestSeller = false;
+    else if (action === 'out-of-stock') {
+      if (hasManagedVariants(product)) {
+        product.variants.forEach((variant) => {
+          const previous = Number(variant.stock || 0);
+          if (previous) inventoryMovements.push({
+            storeId: product.storeId, product: product._id, variantId: String(variant._id), sku: product.sku,
+            type: 'MANUAL_ADJUSTMENT', quantity: -previous, stockBefore: previous, stockAfter: 0,
+            reason: 'Bulk marked out of stock', createdBy: req.user?._id,
+          });
+          variant.stock = 0;
+        });
+      } else {
+        const previous = Number(product.stock || 0);
+        if (previous) inventoryMovements.push({
+          storeId: product.storeId, product: product._id, sku: product.sku,
+          type: 'MANUAL_ADJUSTMENT', quantity: -previous, stockBefore: previous, stockAfter: 0,
+          reason: 'Bulk marked out of stock', createdBy: req.user?._id,
+        });
+      }
+      product.stock = 0;
+    }
+    await product.save();
+    logAudit({ req, action: `PRODUCT_BULK_${action.replaceAll('-', '_').toUpperCase()}`, entityType: 'Product', entityId: product._id, storeId: product.storeId, before, after: auditSnapshot(product, ['isActive', 'isArchived', 'deletedAt', 'stock', 'variants', 'isFeatured', 'isBestSeller']) });
+  }
+  if (inventoryMovements.length && mongoose.connection.readyState === 1) await InventoryTransaction.insertMany(inventoryMovements);
+  res.json({ message: `${products.length} product${products.length === 1 ? '' : 's'} updated`, count: products.length });
+});
+
+exports.exportProducts = asyncHandler(async (req, res) => {
+  const ids = String(req.query.ids || '').split(',').map((value) => value.trim()).filter(Boolean);
+  if (ids.some((id) => !mongoose.Types.ObjectId.isValid(id))) return res.status(400).json({ message: 'Export contains an invalid product id' });
+  const archiveMode = String(req.query.archive || '').toLowerCase();
+  const filter = ids.length
+    ? { _id: { $in: ids } }
+    : archiveMode === 'only' ? { isArchived: true } : { isArchived: { $ne: true } };
+  if (req.query.search) filter.$or = [
+    { name: { $regex: escapeRegex(String(req.query.search)), $options: 'i' } },
+    { sku: { $regex: escapeRegex(String(req.query.search)), $options: 'i' } },
+    { barcode: { $regex: escapeRegex(String(req.query.search)), $options: 'i' } },
+  ];
+  if (req.query.category && mongoose.Types.ObjectId.isValid(req.query.category)) filter.category = req.query.category;
+  if (req.query.status === 'active') filter.isActive = true;
+  if (req.query.status === 'inactive') filter.isActive = false;
+  if (req.query.stock === 'out') filter.stock = { $lte: 0 };
+  if (req.query.stock === 'low') {
+    filter.stock = { $gt: 0 };
+    filter.$expr = { $lte: ['$stock', { $ifNull: ['$lowStockAlert', 5] }] };
+  }
+  const products = await Product.find(catalogQuery(req, filter)).populate('category').sort('-updatedAt').limit(5000).lean();
+  res.json({
+    generatedAt: new Date().toISOString(),
+    items: products.map((product) => ({
+      id: String(product._id), name: product.name, sku: product.sku || '', barcode: product.barcode || '',
+      category: product.category?.name || '', subCategory: product.subCategory || '', price: product.price || 0,
+      originalPrice: product.originalPrice || 0, costPrice: product.costPrice || 0, gstRate: product.gstRate || 0,
+      hsnCode: product.hsnCode || '', stock: product.stock || 0, lowStockAlert: product.lowStockAlert ?? 5,
+      active: Boolean(product.isActive), archived: Boolean(product.isArchived), updatedAt: product.updatedAt,
+    })),
+  });
+});
+
+function readProductIds(value) {
+  if (!Array.isArray(value) || !value.length) throw Object.assign(new Error('Select at least one product'), { statusCode: 400 });
+  const ids = [...new Set(value.map((id) => String(id || '').trim()))];
+  if (ids.length > 100) throw Object.assign(new Error('Update up to 100 products at a time'), { statusCode: 400 });
+  if (ids.some((id) => !mongoose.Types.ObjectId.isValid(id))) throw Object.assign(new Error('One or more product ids are invalid'), { statusCode: 400 });
+  return ids;
+}
+
+async function uniqueValue(req, field, baseValue) {
+  const base = String(baseValue || 'product').trim();
+  let candidate = base;
+  let suffix = 1;
+  while (await Product.exists(catalogQuery(req, { [field]: candidate }))) {
+    suffix += 1;
+    candidate = `${base}-${suffix}`;
+  }
+  return candidate;
+}
 
 function applyVariantPayload(data = {}) {
   const payload = { ...data };
@@ -293,7 +534,12 @@ function validateProduct(data, creating = true) {
   if (Number(data.price) <= 0) return 'Selling price is required';
   if (Number(data.price) > Number(data.originalPrice)) return 'Selling price cannot exceed original price';
   if (Number(data.stock) < 0) return 'Stock cannot be negative';
+  if (data.costPrice !== undefined && (!Number.isFinite(Number(data.costPrice)) || Number(data.costPrice) < 0)) return 'Cost price must be zero or more';
+  if (data.gstRate !== undefined && (!Number.isFinite(Number(data.gstRate)) || Number(data.gstRate) < 0 || Number(data.gstRate) > 100)) return 'GST rate must be between 0 and 100';
+  if (data.reorderQuantity !== undefined && (!Number.isSafeInteger(Number(data.reorderQuantity)) || Number(data.reorderQuantity) < 0)) return 'Reorder quantity must be a whole number of zero or more';
   if (data.shippingWeightKg !== undefined && (!Number.isFinite(Number(data.shippingWeightKg)) || Number(data.shippingWeightKg) < 0 || Number(data.shippingWeightKg) > 1000)) return 'Packed unit weight must be between 0 and 1000 kg';
+  if (data.packageDimensions && ['lengthCm', 'widthCm', 'heightCm'].some((field) => !Number.isFinite(Number(data.packageDimensions[field] || 0)) || Number(data.packageDimensions[field] || 0) < 0 || Number(data.packageDimensions[field] || 0) > 1000)) return 'Package dimensions must be between 0 and 1000 cm';
+  if (data.saleStartAt && data.saleEndAt && new Date(data.saleStartAt) >= new Date(data.saleEndAt)) return 'Sale end must be after sale start';
   if (creating && (!Array.isArray(data.images) || !data.images.length)) return 'At least one product image is required';
   if (Array.isArray(data.images) && data.images.some((image) => image.url?.startsWith('data:'))) return 'Images must be uploaded files or valid URLs, not base64 data';
   if (Array.isArray(data.images) && data.images.some((image) => image?.url && !image.url.startsWith('http') && !image.url.startsWith('/uploads/'))) {

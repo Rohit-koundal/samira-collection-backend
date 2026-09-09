@@ -4,7 +4,13 @@ const { notFound } = require('../utils/apiError');
 const { readPagination, requireObjectId, requireEnum, wantsPagination, buildPaginatedResponse } = require('../utils/validators');
 
 function recipientFilter(req) {
-  return { user: req.user._id, channel: 'IN_APP', status: 'SENT', ...(req.user.role === 'admin' ? {} : { audience: { $ne: 'ADMIN' } }) };
+  return {
+    user: req.user._id,
+    channel: 'IN_APP',
+    status: 'SENT',
+    ...(req.tenantFilter || {}),
+    ...(req.user.role === 'admin' || ['admin', 'seller'].includes(req.user.activeMode) ? {} : { audience: { $ne: 'ADMIN' } }),
+  };
 }
 
 exports.myNotifications = asyncHandler(async (req, res) => {

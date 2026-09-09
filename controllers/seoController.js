@@ -1,9 +1,13 @@
 const Product = require('../models/Product');
+const Category = require('../models/Category');
+const Settings = require('../models/Settings');
 const Store = require('../models/Store');
 const { asyncHandler } = require('../middleware/validate');
 const { ensureDefaultStore } = require('../services/storeService');
+const { andFilter } = require('../services/storeService');
 
 function siteOrigin(req) {
+  if (req.store?.customDomain) return `https://${req.store.customDomain}`;
   const frontend = String(process.env.FRONTEND_URL || process.env.PUBLIC_SITE_URL || '').replace(/\/$/, '');
   if (frontend) return frontend;
   return `${req.protocol}://${req.get('host')}`;
@@ -18,26 +22,43 @@ function productPath(product, storeById) {
 
 exports.robots = asyncHandler(async (req, res) => {
   const origin = siteOrigin(req);
-  res.type('text/plain').send(`User-agent: *\nAllow: /\nDisallow: /api/\nSitemap: ${origin}/sitemap.xml\n`);
+  const settings = await Settings.findOne(req.tenantFilter || {}).select('searchIndexingEnabled').lean();
+  const rules = settings?.searchIndexingEnabled === false ? 'Disallow: /' : 'Allow: /\nDisallow: /api/';
+  res.type('text/plain').send(`User-agent: *\n${rules}\nSitemap: ${origin}/sitemap.xml\n`);
 });
 
 exports.sitemap = asyncHandler(async (req, res) => {
   const origin = siteOrigin(req);
-  const [stores, products] = await Promise.all([
-    Store.find({ status: 'PUBLISHED' }).select('_id slug updatedAt isDefault').lean(),
-    Product.find({ isActive: true, isArchived: { $ne: true } }).select('slug storeId updatedAt').lean(),
+  const isolated = req.store && !req.isDefaultStore;
+  const stores = await Store.find(isolated ? { _id: req.store._id, status: 'PUBLISHED' } : { status: 'PUBLISHED' })
+    .select('_id slug updatedAt isDefault').lean();
+  const visibleTenant = isolated ? req.tenantFilter : {
+    $or: [
+      { storeId: { $in: stores.map((store) => store._id) } },
+      { storeId: null },
+      { storeId: { $exists: false } },
+    ],
+  };
+  const [products, categories] = await Promise.all([
+    Product.find(andFilter({ isActive: true, isArchived: { $ne: true } }, visibleTenant)).select('slug storeId updatedAt').lean(),
+    Category.find(andFilter({ isActive: true }, visibleTenant)).select('slug storeId updatedAt').lean(),
   ]);
   const storeById = new Map(stores.map((store) => [String(store._id), store.slug]));
   const urls = [
     loc(`${origin}/`, new Date()),
     ...stores.map((store) => loc(`${origin}/store/${store.slug}`, store.updatedAt)),
+    ...categories.map((category) => {
+      const storeSlug = category.storeId ? storeById.get(String(category.storeId)) : '';
+      const base = storeSlug && storeSlug !== 'samira-collection' ? `/store/${storeSlug}/products` : '/products';
+      return loc(`${origin}${base}?category=${encodeURIComponent(category.slug)}`, category.updatedAt);
+    }),
     ...products.map((product) => loc(`${origin}${productPath(product, storeById)}`, product.updatedAt)),
   ];
   res.type('application/xml').send(`<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n${urls.join('\n')}\n</urlset>`);
 });
 
 exports.productShare = asyncHandler(async (req, res) => {
-  const product = await Product.findOne({ slug: req.params.slug, isActive: true, isArchived: { $ne: true } });
+  const product = await Product.findOne(andFilter({ slug: req.params.slug, isActive: true, isArchived: { $ne: true } }, req.tenantFilter));
   const origin = siteOrigin(req);
   const store = product?.storeId ? await Store.findById(product.storeId) : await ensureDefaultStore();
   const title = product?.metaTitle || product?.name || 'Samira Collection';

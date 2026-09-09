@@ -1,30 +1,48 @@
 const { ApiError } = require('../utils/apiError');
 
+const PROVIDERS = {
+  bluedart: { label: 'Blue Dart', load: () => require('./blueDartProvider') },
+  shiprocket: { label: 'Shiprocket', load: () => require('./shiprocketProvider') },
+  delhivery: { label: 'Delhivery', load: () => require('./delhiveryProvider') },
+  xpressbees: { label: 'Xpressbees', load: () => require('./xpressbeesProvider') },
+};
+
 function providerFor(name) {
-  if (name === 'bluedart') return require('./blueDartProvider');
+  if (PROVIDERS[name]) return PROVIDERS[name].load();
   throw new ApiError('SHIPPING_UNAVAILABLE', 'This delivery provider is not connected.', { statusCode: 503 });
 }
 
 function getShippingProvider(name) {
-  if (name === 'bluedart') return providerFor(name).readiness();
-  const shiprocket = Boolean(String(process.env.SHIPROCKET_EMAIL || '').trim() && String(process.env.SHIPROCKET_PASSWORD || '').trim());
-  const delhivery = Boolean(String(process.env.DELHIVERY_TOKEN || '').trim());
-
-  if (shiprocket || delhivery) {
-    return {
-      name: shiprocket ? 'shiprocket' : 'delhivery',
-      liveBooking: false,
-      trackingLookup: false,
-      note: 'Courier credentials are present, but live AWB booking is not enabled. Paste the real tracking number from your courier dashboard. This app never invents AWBs.',
-    };
+  if (PROVIDERS[name]) {
+    try { return providerFor(name).readiness(); }
+    catch {
+      return {
+        name, label: PROVIDERS[name].label, mode: 'invalid', configured: false,
+        missing: ['MODE / backend configuration'], liveBooking: false,
+        trackingLookup: false, cod: false, reverse: false, rateQuotes: ['shiprocket', 'delhivery', 'xpressbees'].includes(name),
+        note: `${PROVIDERS[name].label} backend configuration is invalid. Review its environment values and restart the backend.`,
+      };
+    }
   }
-
   return {
-    name: 'manual',
+    name: 'manual', label: 'Manual courier', mode: 'manual', configured: true, missing: [],
     liveBooking: false,
     trackingLookup: false,
+    cod: true, reverse: true, rateQuotes: false,
     note: 'Shipping is manual. Book the parcel with your courier, then paste the real AWB here. Fake tracking numbers are never generated.',
   };
+}
+
+function getShippingProviders(selected = 'manual') {
+  return [getShippingProvider('manual'), ...Object.keys(PROVIDERS).map(getShippingProvider)].map(provider => ({ ...provider, selected: provider.name === selected }));
+}
+
+function providerLabel(name) {
+  return name === 'manual' ? 'Manual courier' : PROVIDERS[name]?.label || 'Courier';
+}
+
+function isIntegratedProvider(name) {
+  return Boolean(PROVIDERS[name]);
 }
 
 function assertLiveBookingDisabled() {
@@ -38,4 +56,8 @@ module.exports = {
   providerFor,
   assertLiveBookingDisabled,
   getShippingProvider,
+  getShippingProviders,
+  providerLabel,
+  isIntegratedProvider,
+  PROVIDERS,
 };

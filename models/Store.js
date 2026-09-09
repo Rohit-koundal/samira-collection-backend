@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const { BILLING_CYCLES, LICENSE_STATUSES, PLAN_IDS } = require('../config/storePlans');
 
 const STORE_STATUSES = ['DRAFT', 'ONBOARDING', 'PUBLISHED', 'SUSPENDED'];
 
@@ -36,6 +37,65 @@ const storeSchema = new mongoose.Schema({
   publishedAt: Date,
   owner: { type: mongoose.Schema.Types.ObjectId, ref: 'User', index: true },
   customDomain: { type: String, trim: true, lowercase: true, maxlength: 120 },
+  industry: { type: String, default: 'fashion', trim: true, lowercase: true, maxlength: 40, index: true },
+  catalogStructure: { type: mongoose.Schema.Types.Mixed },
+  industryConfigurations: { type: mongoose.Schema.Types.Mixed, default: {} },
+  industryMigration: {
+    status: { type: String, enum: ['READY', 'REVIEW_REQUIRED', 'COMPLETED'], default: 'READY' },
+    fromIndustry: String,
+    toIndustry: String,
+    totalProducts: { type: Number, default: 0 },
+    missingRequired: { type: Number, default: 0 },
+    legacyAttributes: { type: Number, default: 0 },
+    switchedAt: Date,
+    completedAt: Date,
+  },
+  industryLocked: { type: Boolean, default: true },
+  industryRevision: { type: Number, default: 0, min: 0 },
+  plan: { type: String, enum: PLAN_IDS, default: 'BASIC', index: true },
+  license: {
+    status: { type: String, enum: LICENSE_STATUSES, default: 'TRIAL' },
+    startsAt: { type: Date, default: Date.now },
+    trialEndsAt: Date,
+    endsAt: Date,
+    billingCycle: { type: String, enum: BILLING_CYCLES, default: 'TRIAL' },
+    featureOverrides: { type: [String], default: [] },
+    disabledFeatures: { type: [String], default: [] },
+    limitOverrides: {
+      products: { type: Number, min: 0 },
+      ordersPerMonth: { type: Number, min: 0 },
+    },
+    lastPayment: {
+      orderId: String,
+      paymentId: String,
+      amount: Number,
+      currency: String,
+      paidAt: Date,
+    },
+    renewalMessage: { type: String, maxlength: 300 },
+  },
+  festivalCampaign: {
+    enabled: { type: Boolean, default: false },
+    campaignKey: { type: String, trim: true, lowercase: true, maxlength: 80 },
+    preset: { type: String, enum: ['', 'diwali', 'wedding', 'eid', 'christmas', 'valentines', 'black-friday', 'new-year', 'holi'], default: '' },
+    title: { type: String, maxlength: 100 },
+    badgeText: { type: String, maxlength: 60 },
+    couponCode: { type: String, maxlength: 40 },
+    startsAt: Date,
+    countdownEndsAt: Date,
+    effects: { type: Boolean, default: false },
+    publishedAt: Date,
+    pausedAt: Date,
+    updatedAt: Date,
+  },
+  storefrontDesign: {
+    preset: { type: String, default: 'default', maxlength: 40 },
+    draftConfig: mongoose.Schema.Types.Mixed,
+    publishedConfig: mongoose.Schema.Types.Mixed,
+    updatedAt: Date,
+    publishedAt: Date,
+    updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  },
 }, { timestamps: true });
 
 storeSchema.index({ isDefault: 1, status: 1 });

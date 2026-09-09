@@ -25,12 +25,17 @@ function packageForItems(items, settings = {}, override) {
   const volumetricWeightKg = result.lengthCm * result.widthCm * result.heightCm / positive(s.shippingVolumetricDivisor, 'Volumetric divisor');
   return { ...result, pieces: 1, volumetricWeightKg: Math.round(volumetricWeightKg * 1000) / 1000, chargeableWeightKg: Math.ceil(Math.max(result.weightKg, volumetricWeightKg) * 1000) / 1000 };
 }
-function deliveryPrice(amount, destination, parcel, settings = {}) {
+function deliveryPrice(amount, destination, parcel, settings = {}, providerRate) {
   const s = { ...DEFAULTS, ...settings };
   if (s.shippingFreeAboveEnabled && amount >= Number(s.freeShippingMinAmount ?? 999)) return { charge: 0, pricingSource: 'free-threshold' };
   let charge = Number(s.deliveryCharge ?? 99);
   let pricingSource = 'fixed';
-  if (s.shippingPricingMode === 'weight') {
+  if (s.shippingPricingMode === 'carrier') {
+    const quoted = Number(providerRate);
+    if (!Number.isFinite(quoted) || quoted < 0) throw error('The selected courier did not return a usable delivery rate. Choose fixed pricing or try again.');
+    charge = quoted;
+    pricingSource = `carrier:${s.shippingProvider}`;
+  } else if (s.shippingPricingMode === 'weight') {
     const pin = pincode(destination?.pincode);
     // Longest matching prefix wins, independent of the order of rows in Settings.
     const zone = [...(s.shippingRateZones || [])].filter(row => pin.startsWith(row.prefix)).sort((a, b) => b.prefix.length - a.prefix.length)[0];
@@ -47,7 +52,7 @@ function pickupAddress(source = {}) {
   if (fields.some(key => !result[key])) throw error('Complete the pickup contact, address, city, state and PIN code in delivery settings.');
   result.pincode = pincode(result.pincode);
   if (!/^[6-9]\d{9}$/.test(result.mobile)) throw error('Pickup mobile must be a valid Indian mobile number.');
-  if (result.fullName.length > 30) throw error('Blue Dart pickup contact name must be 30 characters or fewer.');
+  if (result.fullName.length > 100) throw error('Pickup contact name must be 100 characters or fewer.');
   return result;
 }
 function pickupSlot(date, time, closeTime, now = new Date()) {
@@ -59,8 +64,9 @@ function pickupSlot(date, time, closeTime, now = new Date()) {
 }
 function normalizeShippingSettings(updates, current) {
   const next = { ...DEFAULTS, ...current, ...updates };
-  if (!['manual', 'bluedart'].includes(next.shippingProvider)) throw error('Choose Manual or Blue Dart shipping.');
-  if (!['fixed', 'weight'].includes(next.shippingPricingMode)) throw error('Choose fixed or weight-based delivery pricing.');
+  if (!['manual', 'bluedart', 'shiprocket', 'delhivery', 'xpressbees'].includes(next.shippingProvider)) throw error('Choose a supported delivery provider.');
+  if (!['fixed', 'weight', 'carrier'].includes(next.shippingPricingMode)) throw error('Choose fixed, weight-based or live carrier delivery pricing.');
+  if (next.shippingPricingMode === 'carrier' && !['shiprocket', 'delhivery', 'xpressbees'].includes(next.shippingProvider)) throw error('Live carrier pricing is available with Shiprocket, Delhivery or Xpressbees.');
   if (typeof next.shippingFreeAboveEnabled !== 'boolean') throw error('Free delivery must be enabled or disabled.');
   for (const key of ['shippingDefaultWeightKg', 'shippingLengthCm', 'shippingWidthCm', 'shippingHeightCm', 'shippingVolumetricDivisor', 'shippingWeightStepKg']) {
     if (updates[key] !== undefined) updates[key] = positive(updates[key], key);
@@ -93,11 +99,11 @@ function normalizeShippingSettings(updates, current) {
       return result;
     });
   }
-  if (next.shippingProvider === 'bluedart') pickupAddress(updates.shippingPickup || next.shippingPickup);
+  if (next.shippingProvider !== 'manual') pickupAddress(updates.shippingPickup || next.shippingPickup);
   return updates;
 }
 function assertQuotedTotal(draft, expectedTotal) {
-  if (draft.shippingQuote?.provider !== 'bluedart' && expectedTotal === undefined) return;
+  if (draft.shippingQuote?.provider === 'manual' && expectedTotal === undefined) return;
   if (typeof expectedTotal !== 'number' || !Number.isFinite(expectedTotal) || Math.round(expectedTotal * 100) !== Math.round(draft.totals.finalAmount * 100)) throw new ApiError('SHIPPING_QUOTE_CHANGED', 'Your order total has changed. Review the updated delivery charge and total before placing the order.', { statusCode: 409 });
 }
 module.exports = { DEFAULTS, pincode, positive, packageForItems, deliveryPrice, pickupAddress, pickupSlot, normalizeShippingSettings, assertQuotedTotal };

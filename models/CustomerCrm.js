@@ -22,6 +22,11 @@ const customerCrmSchema = new mongoose.Schema({
   tags: [{ type: String, enum: CRM_TAGS }],
   notes: { type: String, maxlength: 2000 },
   acquisition: { type: String, maxlength: 80 },
+  marketingConsent: { type: Boolean, default: false },
+  marketingConsentSource: { type: String, enum: ['CUSTOMER', 'CHECKOUT', 'MANUAL', 'IMPORT', ''], default: '' },
+  marketingConsentAt: Date,
+  lastWhatsAppOfferPreparedAt: Date,
+  lastWhatsAppRecoveryPreparedAt: Date,
 }, { timestamps: true });
 
 customerCrmSchema.index({ storeId: 1, user: 1 }, { unique: true });

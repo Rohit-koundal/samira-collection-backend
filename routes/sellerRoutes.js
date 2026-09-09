@@ -15,23 +15,56 @@ const inbox = require('../controllers/inboxController');
 const audit = require('../controllers/auditController');
 const analytics = require('../controllers/analyticsController');
 const instagram = require('../controllers/instagramController');
-const { getShippingProvider } = require('../services/shippingProvider');
-const { requireStorePermission, stripClientStoreId } = require('../middleware/storeMiddleware');
+const business = require('../controllers/businessController');
+const settings = require('../controllers/settingsController');
+const delivery = require('../controllers/deliveryController');
+const inventory = require('../controllers/inventoryController');
+const customization = require('../controllers/websiteCustomizationController');
+const notifications = require('../controllers/notificationController');
+const subscription = require('../controllers/subscriptionController');
+const productDraft = require('../controllers/productDraftController');
+const { requireActiveStoreLicenseForWrites, requireProductCapacity, requireStoreFeature, requireStorePermission, stripClientStoreId } = require('../middleware/storeMiddleware');
+
+router.get('/subscription', requireStorePermission('settings.read'), subscription.status);
+router.post('/subscription/checkout', requireStorePermission('settings.write'), subscription.checkout);
+router.post('/subscription/verify', requireStorePermission('settings.write'), subscription.verify);
+router.use(requireActiveStoreLicenseForWrites);
 
 router.get('/products', requireStorePermission('catalog.read'), product.getProducts);
 router.get('/products/smart-fill/status', requireStorePermission('catalog.read'), smartFill.status);
-router.post('/products/smart-fill', requireStorePermission('catalog.write'), smartFill.limiter, smartFill.fill);
+router.post('/products/smart-fill', requireStorePermission('catalog.write'), requireStoreFeature('aiProduct'), smartFill.limiter, smartFill.fill);
 router.get('/products/quick-analyze/status', requireStorePermission('catalog.read'), product.getQuickAddVisionStatus);
-router.post('/products/quick-analyze', requireStorePermission('catalog.write'), product.analyzeQuickAdd);
+router.post('/products/quick-analyze', requireStorePermission('catalog.write'), requireStoreFeature('aiProduct'), product.analyzeQuickAdd);
+router.get('/products/export', requireStorePermission('catalog.read'), product.exportProducts);
+router.post('/products/bulk', requireStorePermission('catalog.write'), requireBulkInventoryPermission, product.bulkUpdateProducts);
 router.get('/products/:id', requireStorePermission('catalog.read'), product.getProductById);
-router.post('/products', requireStorePermission('catalog.write'), stripClientStoreId, product.createProduct);
+router.post('/products', requireStorePermission('catalog.write'), requireProductCapacity, stripClientStoreId, product.createProduct);
 router.put('/products/:id', requireStorePermission('catalog.write'), stripClientStoreId, product.updateProduct);
 router.delete('/products/:id', requireStorePermission('catalog.write'), product.deleteProduct);
+router.post('/products/:id/duplicate', requireStorePermission('catalog.write'), requireProductCapacity, product.duplicateProduct);
+router.patch('/products/:id/restore', requireStorePermission('catalog.write'), product.restoreProduct);
 router.patch('/products/:id/status', requireStorePermission('catalog.write'), product.updateStatus);
 router.patch('/products/:id/stock', requireStorePermission('inventory.write'), product.updateStock);
+router.patch('/products/:id/mark-out-of-stock', requireStorePermission('inventory.write'), product.markOutOfStock);
+router.patch('/products/:id/hide', requireStorePermission('catalog.write'), product.hideProduct);
+router.post('/product-drafts', requireStorePermission('catalog.write'), productDraft.createDraft);
+router.get('/product-drafts', requireStorePermission('catalog.read'), productDraft.listDrafts);
+router.put('/product-drafts/:id', requireStorePermission('catalog.write'), productDraft.updateDraft);
+router.delete('/product-drafts/:id', requireStorePermission('catalog.write'), productDraft.deleteDraft);
+router.post('/product-drafts/publish-selected', requireStorePermission('catalog.write'), requireProductCapacity, productDraft.publishSelected);
+router.get('/inventory/history', requireStorePermission('inventory.read'), inventory.history);
+
+router.get('/notifications', notifications.myNotifications);
+router.get('/notifications/summary', notifications.summary);
+router.patch('/notifications/read-all', notifications.markAllRead);
+router.patch('/notifications/:id/read', notifications.markRead);
 
 router.get('/orders', requireStorePermission('orders.read'), order.adminOrders);
 router.get('/orders/:id', requireStorePermission('orders.read'), order.getOrder);
+router.get('/orders/:id/receipt', requireStorePermission('orders.read'), order.receipt);
+router.get('/orders/:id/delivery', requireStorePermission('orders.read'), delivery.details);
+router.get('/orders/:id/delivery/label', requireStorePermission('orders.write'), requireStoreFeature('shippingAutomation'), delivery.label);
+router.post('/orders/:id/delivery/:action', requireStorePermission('orders.write'), requireStoreFeature('shippingAutomation'), delivery.action);
 router.put('/orders/:id/status', requireStorePermission('orders.write'), order.updateOrderStatus);
 router.put('/orders/:id/payment-status', requireStorePermission('orders.write'), order.updatePaymentStatus);
 router.put('/orders/:id/shipment', requireStorePermission('orders.write'), order.updateShipment);
@@ -40,6 +73,7 @@ router.delete('/orders/:id', requireStorePermission('orders.write'), order.delet
 router.get('/coupons', requireStorePermission('marketing.read'), coupon.getCoupons);
 router.post('/coupons', requireStorePermission('marketing.write'), stripClientStoreId, coupon.createCoupon);
 router.put('/coupons/:id', requireStorePermission('marketing.write'), stripClientStoreId, coupon.updateCoupon);
+router.delete('/coupons/:id', requireStorePermission('marketing.write'), coupon.deleteCoupon);
 
 router.get('/categories', requireStorePermission('catalog.read'), category.getCategories);
 router.post('/categories', requireStorePermission('catalog.write'), stripClientStoreId, category.createCategory);
@@ -58,8 +92,8 @@ router.get('/reports/products', requireStorePermission('catalog.read'), dashboar
 router.get('/contact', requireStorePermission('support.read'), contact.adminList);
 router.get('/newsletter', requireStorePermission('marketing.read'), newsletter.adminList);
 
-router.get('/crm', requireStorePermission('crm.read'), crm.list);
-router.put('/crm/:userId', requireStorePermission('crm.write'), crm.update);
+router.get('/crm', requireStorePermission('crm.read'), requireStoreFeature('crm'), crm.list);
+router.put('/crm/:userId', requireStorePermission('crm.write'), requireStoreFeature('crm'), crm.update);
 
 router.get('/inbox', requireStorePermission('inbox.read'), inbox.list);
 router.get('/inbox/:id', requireStorePermission('inbox.read'), inbox.get);
@@ -69,17 +103,34 @@ router.put('/inbox/:id/status', requireStorePermission('inbox.write'), inbox.upd
 router.get('/audit-logs', requireStorePermission('audit.read'), audit.list);
 router.get('/audit-logs/options', requireStorePermission('audit.read'), audit.options);
 router.get('/audit-logs/:id', requireStorePermission('audit.read'), audit.get);
-router.get('/analytics/funnel', requireStorePermission('marketing.read'), analytics.funnel);
+router.get('/analytics/funnel', requireStorePermission('marketing.read'), requireStoreFeature('analytics'), analytics.funnel);
+
+router.get('/business/overview', requireStorePermission('orders.read'), business.overview);
+router.get('/business/abandoned-carts', requireStorePermission('marketing.read'), business.abandonedCarts);
+router.post('/business/abandoned-carts/:id/reminder', requireStorePermission('marketing.write'), business.remindAbandonedCart);
+router.post('/business/assistant', requireStorePermission('orders.read'), business.assistant);
+router.post('/business/customer-offers', requireStorePermission('marketing.write'), business.customerOffer);
+router.put('/business/festival', requireStorePermission('marketing.write'), business.updateFestival);
+router.get('/settings', requireStorePermission('settings.read'), settings.getSettings);
+router.put('/settings', requireStorePermission('settings.write'), stripClientStoreId, settings.updateSettings);
+router.get('/settings/payment-readiness', requireStorePermission('settings.read'), settings.getPaymentReadiness);
+router.get('/settings/shipping-readiness', requireStorePermission('settings.read'), delivery.readiness);
+router.get('/design', requireStorePermission('settings.read'), customization.getSellerDesign);
+router.put('/design', requireStorePermission('settings.write'), customization.updateSellerDesign);
+router.post('/design/publish', requireStorePermission('settings.write'), customization.publishSellerDesign);
 
 router.use('/uploads', requireStorePermission('catalog.write'), require('./uploadRoutes'));
 
-router.get('/instagram', requireStorePermission('instagram.read'), instagram.status);
-router.get('/instagram/connect-url', requireStorePermission('instagram.write'), instagram.connectUrl);
-router.get('/instagram/media', requireStorePermission('instagram.read'), instagram.media);
-router.post('/instagram', requireStorePermission('instagram.write'), instagram.saveStub);
+router.get('/instagram', requireStorePermission('instagram.read'), requireStoreFeature('socialStudio'), instagram.status);
+router.get('/instagram/connect-url', requireStorePermission('instagram.write'), requireStoreFeature('socialStudio'), instagram.connectUrl);
+router.get('/instagram/media', requireStorePermission('instagram.read'), requireStoreFeature('socialStudio'), instagram.media);
+router.post('/instagram', requireStorePermission('instagram.write'), requireStoreFeature('socialStudio'), instagram.saveStub);
 
-router.get('/shipping/provider', requireStorePermission('orders.read'), (_req, res) => {
-  res.json(getShippingProvider());
-});
+router.get('/shipping/provider', requireStorePermission('orders.read'), delivery.readiness);
+
+function requireBulkInventoryPermission(req, res, next) {
+  if (String(req.body?.action || '') !== 'out-of-stock') return next();
+  return requireStorePermission('inventory.write')(req, res, next);
+}
 
 module.exports = router;

@@ -28,7 +28,7 @@ async function upsertShipmentForOrder(order, { courierName, trackingNumber, trac
     ? await Shipment.findById(order.shipment._id || order.shipment)
     : await Shipment.findOne({ order: order._id });
 
-  if (shipment?.provider === 'bluedart') throw new ApiError('SHIPPING_VALIDATION', 'This shipment is managed by Blue Dart. Use courier booking, pickup and tracking actions.');
+  if (shipment?.provider && shipment.provider !== 'manual') throw new ApiError('SHIPPING_VALIDATION', `This shipment is managed by ${shipment.courierName || 'an integrated courier'}. Use courier booking, pickup and tracking actions.`);
   if (!Shipment.SHIPMENT_STATUSES.includes(nextStatus)) throw new ApiError('VALIDATION_ERROR', 'Choose a valid shipment status.');
   if (trackingUrl) {
     let url;

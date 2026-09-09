@@ -6,6 +6,7 @@ const { getJwtSecret } = require('../config/env');
 const { allowsOwnerDemoSession } = require('../config/localOwnerDemo');
 
 async function protect(req, res, next) {
+  if (req.user) return next();
   const header = req.headers.authorization || '';
   const token = header.startsWith('Bearer ') ? header.split(' ')[1] : null;
   if (!token) return res.status(401).json({ success: false, code: 'UNAUTHORIZED', message: 'Not authorized' });

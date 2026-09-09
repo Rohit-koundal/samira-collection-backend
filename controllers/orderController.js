@@ -20,6 +20,7 @@ const { logAudit } = require('../services/auditService');
 const { recordEventLater } = require('../services/analyticsService');
 const { normalizeIndianMobile } = require('../utils/phoneUtils');
 const { adminOrderFilter } = require('../services/dashboardAnalytics');
+const { assertMonthlyOrderCapacity, assertStoreCanAcceptOrders } = require('../middleware/storeMiddleware');
 
 const ORDER_STATUSES = ['Pending', 'Confirmed', 'Packed', 'Shipped', 'Out for Delivery', 'Delivered', 'Cancelled', 'Return Requested', 'Exchange Requested', 'Returned', 'Refunded'];
 const PAYMENT_STATUSES = ['Pending', 'Paid', 'Failed', 'Refunded'];
@@ -57,7 +58,8 @@ function isOwnerOrAdmin(order, user, req) {
  * calculating totals in the browser.
  */
 exports.quoteOrder = asyncHandler(async (req, res) => {
-  const settings = await getStoreSettings();
+  assertStoreCanAcceptOrders(req.store);
+  const settings = await getStoreSettings(req.tenantFilter || {});
   const paymentOptions = buildPaymentOptions(settings, { razorpayConfigured: isRazorpayConfigured() });
 
   if (!Array.isArray(req.body?.orderItems) || !req.body.orderItems.length) {
@@ -93,6 +95,7 @@ exports.quoteOrder = asyncHandler(async (req, res) => {
  */
 exports.createOrder = asyncHandler(async (req, res) => {
   assertCheckoutReady(req);
+  await assertMonthlyOrderCapacity(req.store);
 
   const shippingAddress = assertShippingAddress(req.body?.shippingAddress);
   const draft = await buildOrderDraft({
@@ -265,8 +268,8 @@ exports.updateOrderStatus = asyncHandler(async (req, res) => {
     throw new ApiError('VALIDATION_ERROR', 'Confirm this cash-on-delivery order with the customer, then mark it Confirmed before fulfilment.');
   }
   const before = { orderStatus: order.orderStatus, codConfirmationStatus: order.codConfirmationStatus };
-  const courierShipment = await require('../models/Shipment').findOne({ order: order._id, provider: 'bluedart', bookingState: { $in: ['BOOKED', 'BOOKING', 'UNKNOWN'] } });
-  if (courierShipment && ['Shipped', 'Out for Delivery', 'Delivered'].includes(orderStatus)) throw new ApiError('SHIPPING_VALIDATION', 'Refresh Blue Dart tracking to update delivery status for this shipment.');
+  const courierShipment = await require('../models/Shipment').findOne({ order: order._id, provider: { $ne: 'manual' }, bookingState: { $in: ['BOOKED', 'BOOKING', 'UNKNOWN'] } });
+  if (courierShipment && ['Shipped', 'Out for Delivery', 'Delivered'].includes(orderStatus)) throw new ApiError('SHIPPING_VALIDATION', 'Refresh courier tracking to update delivery status for this shipment.');
   if (order.paymentMethod === 'COD' && order.codConfirmationStatus === 'PENDING' && orderStatus === 'Confirmed') order.codConfirmationStatus = 'CONFIRMED';
   order.orderStatus = orderStatus;
   order.statusTimeline.push({ status: orderStatus, date: new Date(), note });
