@@ -77,7 +77,12 @@ test('server keeps local owner demo loopback-only and hosted operation public', 
   const keys = ['LOCAL_OWNER_DEMO', 'OTP_MODE', 'PORT', 'SERVER_PORT'];
   const previous = Object.fromEntries(keys.map(key => [key, process.env[key]]));
   t.after(() => keys.forEach(key => { if (previous[key] === undefined) delete process.env[key]; else process.env[key] = previous[key]; }));
-  for (const [localDemo, mode, host] of [['true', 'demo', '127.0.0.1'], ['false', 'demo', '0.0.0.0'], ['true', 'production', '0.0.0.0']]) {
+  for (const [localDemo, mode, production, host] of [
+    ['true', 'demo', false, '127.0.0.1'],
+    ['true', 'demo', true, '0.0.0.0'],
+    ['false', 'demo', true, '0.0.0.0'],
+    ['true', 'production', false, '0.0.0.0'],
+  ]) {
     Object.assign(process.env, { LOCAL_OWNER_DEMO: localDemo, OTP_MODE: mode, PORT: '10000', SERVER_PORT: '5000' });
     const listening = await new Promise((resolve, reject) => {
       const app = { locals: {}, listen(port, address, callback) { callback(); resolve({ port, address, local: app.locals.localOwnerDemo }); } };
@@ -85,7 +90,7 @@ test('server keeps local owner demo loopback-only and hosted operation public', 
         dotenv: { config() {} }, path, './app': app, './config/db': async () => {},
         './services/r2Upload': { isR2Configured: () => true },
         './services/cloudinaryUpload': { isCloudinaryConfigured: () => false },
-        './config/env': { assertProductionSecrets() {}, getOtpMode: () => mode, isProduction: () => true },
+        './config/env': { assertProductionSecrets() {}, getOtpMode: () => mode, isProduction: () => production },
         './config/localOwnerDemo': require('../config/localOwnerDemo'),
         mongoose: { connection: { readyState: 0 } },
         './queues/reelImport.queue': {}, './services/reelImportProgress.service': {},

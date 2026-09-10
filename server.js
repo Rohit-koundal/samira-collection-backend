@@ -53,7 +53,14 @@ async function startServer() {
     console.warn('Persistent image storage is not configured. Product uploads will be rejected until Cloudinary or R2 is connected.');
   }
 
-  const localOwnerDemo = isLocalOwnerDemoEnabled();
+  const localOwnerDemoRequested = isLocalOwnerDemoEnabled();
+  // The local-owner shortcut is deliberately limited to a development machine.
+  // Hosted demo OTP remains controlled by OTP_MODE and does not require this
+  // shortcut. A production web service must stay reachable on all interfaces.
+  const localOwnerDemo = localOwnerDemoRequested && !isProduction();
+  if (localOwnerDemoRequested && !localOwnerDemo) {
+    console.warn('LOCAL_OWNER_DEMO is ignored in production. Hosted demo OTP remains available through OTP_MODE=demo.');
+  }
   app.locals.localOwnerDemo = localOwnerDemo;
   app.listen(PORT, localOwnerDemo ? '127.0.0.1' : '0.0.0.0', () => {
     console.log(`Backend API running on port ${PORT}`);
