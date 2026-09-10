@@ -114,7 +114,7 @@ test('standalone project generator creates a renamed isolated source package wit
   assert.equal(result.buffer.readUInt32LE(0), 0x04034b50);
   const entries = readZip(result.buffer);
   const prefix = 'rohit-mobiles/';
-  for (const name of ['package.json', 'backend/package.json', 'src/App.jsx', 'src/components/pwa/MobileAppCompanion.jsx', 'public/sw.js', 'public/offline.html', 'README.md', '.gitignore', '.env.example', 'backend/.env.example', 'backend/controllers/catalogConfigurationController.js', 'project-manifest.json']) assert.ok(entries.has(prefix + name), name);
+  for (const name of ['package.json', 'backend/package.json', 'src/App.jsx', 'src/components/pwa/MobileAppCompanion.jsx', 'src/components/admin/OrderWorkflowActions.jsx', 'backend/services/orderWorkflowService.js', 'public/sw.js', 'public/offline.html', 'README.md', '.gitignore', '.env.example', 'backend/.env.example', 'backend/controllers/catalogConfigurationController.js', 'project-manifest.json']) assert.ok(entries.has(prefix + name), name);
   assert.equal(JSON.parse(entries.get(prefix + 'package.json')).name, 'rohit-mobiles');
   assert.equal(JSON.parse(entries.get(prefix + 'backend/package.json')).name, 'rohit-mobiles-backend');
   assert.match(entries.get(prefix + 'src/config/websiteCustomization.js').toString('utf8'), /Rohit Mobiles/);

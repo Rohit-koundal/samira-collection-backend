@@ -8,6 +8,7 @@ router.post('/smart-fill', smartFill.limiter, smartFill.fill);
 router.get('/quick-analyze/status', product.getQuickAddVisionStatus);
 router.post('/quick-analyze', product.analyzeQuickAdd);
 router.get('/export', product.exportProducts);
+router.get('/duplicate-check', product.checkDuplicates);
 router.post('/bulk', product.bulkUpdateProducts);
 router.get('/:id', product.getProductById);
 router.post('/', product.createProduct);

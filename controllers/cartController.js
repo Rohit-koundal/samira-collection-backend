@@ -7,6 +7,7 @@ const { requireQuantity, requireObjectId } = require('../utils/validators');
 const { andFilter } = require('../services/storeService');
 const { normalizeProductImages } = require('../utils/imageUtils');
 const { getSelectableProductSizes } = require('../services/productSizingService');
+const { productAvailableForSale } = require('../services/productPricingService');
 
 function readSessionId(req) {
   const raw = String(req.headers['x-session-id'] || '').trim();
@@ -101,7 +102,7 @@ async function presentCart(cart, req) {
   const lookup = new Map(products.map(product => [String(product._id), product]));
   return { _id: cart._id, items: cart.items.map(line => {
     const product = lookup.get(String(line.product));
-    const visible = product && product.isActive !== false && !product.isArchived;
+    const visible = productAvailableForSale(product);
     const managed = Boolean(product?.variants?.length);
     const variant = visible && managed ? findVariant(product, line) : null;
     const unavailable = !visible || (managed && !variant);
@@ -133,7 +134,7 @@ async function changeCart(req, operation, { create = false } = {}) {
 }
 async function resolveSelection(productId, input, req) {
   const product = await Product.findOne(andFilter({ _id: requireObjectId(String(productId), 'product') }, req.tenantFilter)).populate('category', 'name');
-  if (!product || product.isActive === false || product.isArchived) throw notFound('This product is no longer available');
+  if (!productAvailableForSale(product)) throw notFound('This product is not available for sale yet');
   const size = String(input.size || '').trim(), color = String(input.color || '').trim();
   if (size.length > 60 || color.length > 100) throw new ApiError('VALIDATION_ERROR', 'Please choose a valid size and colour');
   let variant = null;

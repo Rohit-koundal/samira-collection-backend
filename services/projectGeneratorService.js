@@ -262,7 +262,7 @@ function transformEntry(entry, project, structure) {
       .replace('requireActiveStoreLicenseForWrites, requireProductCapacity, ', '')
       .replace(/^router\.(?:get|post)\('\/subscription.*\r?\n/gm, '')
       .replace(/^router\.use\(requireActiveStoreLicenseForWrites\);\r?\n/m, '')
-      .replace(', requireProductCapacity, stripClientStoreId, product.createProduct', ', stripClientStoreId, product.createProduct');
+      .replace(/,\s*requireProductCapacity(?=\s*,)/g, '');
     return { ...entry, data: Buffer.from(content) };
   }
   if (name === 'backend/controllers/orderController.js') {

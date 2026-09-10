@@ -45,15 +45,6 @@ function getPrimaryImageUrl(images = []) {
   return normalized.find((image) => image.primary)?.url || normalized[0]?.url || '';
 }
 
-function normalizeImageForResponse(image, req) {
-  const normalized = normalizeImageEntry(image);
-  const url = normalized?.url;
-  if (!url || isKnownMissingImage(url)) {
-    return { ...(normalized || {}), url: placeholderUrl(req), isPlaceholder: true, primary: Boolean(normalized?.primary) };
-  }
-  return normalized;
-}
-
 function isInaccessibleImageUrl(url) {
   return /https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?\//i.test(String(url || ''));
 }

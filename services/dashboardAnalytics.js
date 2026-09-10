@@ -73,6 +73,7 @@ const stockWarning = { $or: [
 
 async function adminOrderFilter(query = {}, tenantFilter) {
   const OrderUser = require('../models/User');
+  const Shipment = require('../models/Shipment');
   const filters = [];
   if (query.status) {
     if (!ORDER_STATUSES.includes(query.status)) throw new ApiError('VALIDATION_ERROR', 'Choose a valid order status.');
@@ -82,9 +83,34 @@ async function adminOrderFilter(query = {}, tenantFilter) {
     if (!PAYMENT_STATUSES.includes(query.payment)) throw new ApiError('VALIDATION_ERROR', 'Choose a valid payment status.');
     filters.push({ paymentStatus: query.payment });
   }
+  if (query.paymentMethod) {
+    const value = String(query.paymentMethod).toUpperCase();
+    if (!['COD', 'ONLINE'].includes(value)) throw new ApiError('VALIDATION_ERROR', 'Choose a valid payment method.');
+    filters.push(value === 'COD' ? { paymentMethod: 'COD' } : { paymentMethod: { $ne: 'COD' } });
+  }
+  if (query.city) {
+    if (typeof query.city !== 'string' || query.city.length > 100) throw new ApiError('VALIDATION_ERROR', 'City must be 100 characters or less.');
+    const city = query.city.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    if (city) filters.push({ 'shippingAddress.city': { $regex: city, $options: 'i' } });
+  }
+  if (query.pincode) {
+    const pincode = String(query.pincode).replace(/\D/g, '');
+    if (!/^\d{6}$/.test(pincode)) throw new ApiError('VALIDATION_ERROR', 'PIN code must contain 6 digits.');
+    filters.push({ 'shippingAddress.pincode': pincode });
+  }
+  if (query.provider) {
+    const provider = String(query.provider).toLowerCase();
+    if (!['manual', 'bluedart', 'shiprocket', 'delhivery', 'xpressbees'].includes(provider)) throw new ApiError('VALIDATION_ERROR', 'Choose a valid delivery provider.');
+    const shipments = await Shipment.find(andFilter({ provider }, tenantFilter)).select('_id').lean();
+    filters.push({ shipment: { $in: shipments.map(item => item._id) } });
+  }
   if (query.attention) {
     if (!ATTENTION[query.attention]) throw new ApiError('VALIDATION_ERROR', 'Choose a valid order task.');
     filters.push(ATTENTION[query.attention]);
+  }
+  if (query.returnOpen) {
+    if (query.returnOpen !== '1') throw new ApiError('VALIDATION_ERROR', 'Choose a valid return queue filter.');
+    filters.push({ orderStatus: { $in: ['Return Requested', 'Exchange Requested'] } });
   }
   if (query.from || query.to || query.range) filters.push(periodFilter(dashboardRange(query)));
   if (query.search) {
@@ -92,10 +118,15 @@ async function adminOrderFilter(query = {}, tenantFilter) {
     const text = query.search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     if (!text) return andFilter(filters.length ? { $and: filters } : {}, tenantFilter);
     const regex = new RegExp(text, 'i');
-    const users = await OrderUser.find({ $or: [{ name: regex }, { email: regex }, { phone: regex }] }).select('_id').lean();
+    const [users, shipments] = await Promise.all([
+      OrderUser.find({ $or: [{ name: regex }, { email: regex }, { phone: regex }] }).select('_id').lean(),
+      Shipment.find(andFilter({ $or: [{ awb: regex }, { trackingNumber: regex }, { courierName: regex }] }, tenantFilter)).select('_id').lean(),
+    ]);
     filters.push({ $or: [
       { user: { $in: users.map(user => user._id) } }, { invoiceNumber: regex },
       { 'shippingAddress.fullName': regex }, { 'shippingAddress.mobile': regex },
+      { 'orderItems.name': regex }, { 'orderItems.sku': regex },
+      { shipment: { $in: shipments.map(item => item._id) } },
       { $expr: { $regexMatch: { input: { $toString: '$_id' }, regex: text, options: 'i' } } },
     ] });
   }

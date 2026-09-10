@@ -33,7 +33,7 @@ async function upsertShipmentForOrder(order, { courierName, trackingNumber, trac
   if (trackingUrl) {
     let url;
     try { url = new URL(trackingUrl); } catch { throw new ApiError('VALIDATION_ERROR', 'Enter a valid tracking URL.'); }
-    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) throw new ApiError('VALIDATION_ERROR', 'Enter a valid HTTP or HTTPS tracking URL.');
+    if (url.protocol !== 'https:' || url.username || url.password) throw new ApiError('VALIDATION_ERROR', 'Tracking links must use a secure HTTPS URL.');
   }
 
   if (!shipment) {

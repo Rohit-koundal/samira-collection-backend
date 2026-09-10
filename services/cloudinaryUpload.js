@@ -50,4 +50,24 @@ async function uploadVideo(file, options = {}) {
   return uploadFile(file, 'video', options);
 }
 
-module.exports = { isCloudinaryConfigured, uploadImage, uploadVideo };
+async function deleteFile(identifier, resourceType = 'image') {
+  if (!isCloudinaryConfigured()) return false;
+  const publicId = typeof identifier === 'object' ? identifier?.publicId : identifier;
+  if (!String(publicId || '').trim()) return false;
+  const timestamp = Math.floor(Date.now() / 1000);
+  const signature = crypto.createHash('sha1')
+    .update(`public_id=${publicId}&timestamp=${timestamp}${process.env.CLOUDINARY_API_SECRET}`)
+    .digest('hex');
+  const form = new FormData();
+  form.append('public_id', String(publicId));
+  form.append('api_key', process.env.CLOUDINARY_API_KEY);
+  form.append('timestamp', String(timestamp));
+  form.append('signature', signature);
+  const safeResourceType = resourceType === 'video' ? 'video' : 'image';
+  const response = await fetch(`https://api.cloudinary.com/v1_1/${process.env.CLOUDINARY_CLOUD_NAME}/${safeResourceType}/destroy`, { method: 'POST', body: form });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error?.message || 'Cloudinary file deletion failed');
+  return ['ok', 'not found'].includes(data.result);
+}
+
+module.exports = { deleteFile, isCloudinaryConfigured, uploadImage, uploadVideo };

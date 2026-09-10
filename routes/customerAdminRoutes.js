@@ -21,7 +21,7 @@ function assertNotSelf(req, message) {
   if (String(req.params.userId) === String(req.user._id)) throw new ApiError('FORBIDDEN', message);
 }
 
-router.get('/', asyncHandler(async (req, res) => {
+router.get('/', masterOnly, asyncHandler(async (req, res) => {
   const search = String(req.query.search || '').trim();
   const pattern = search ? new RegExp(escapeRegex(search), 'i') : null;
   const filter = pattern ? { $or: [{ phone: pattern }, { name: pattern }, { email: pattern }] } : {};
@@ -44,6 +44,7 @@ router.get('/', asyncHandler(async (req, res) => {
 
 router.patch('/:userId/block', validateObjectIdParam('userId'), asyncHandler(async (req, res) => {
   const isBlocked = requireBoolean(req.body?.isBlocked, 'isBlocked');
+  if (!isMasterOwner(req.user)) throw forbidden('Master Owner permission required');
   if (isBlocked) assertNotSelf(req, 'You cannot block your own account');
 
   const target = await User.findById(req.params.userId).select('phone systemRole role isBlocked');

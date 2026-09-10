@@ -87,6 +87,7 @@ const productSchema = new mongoose.Schema({
   supplierSku: { type: String, trim: true, default: '' },
   restockAt: Date,
   publishAt: Date,
+  salePrice: { type: Number, min: 0 },
   saleStartAt: Date,
   saleEndAt: Date,
   expiryDate: Date,

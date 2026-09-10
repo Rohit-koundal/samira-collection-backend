@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const { request, resetDatabase, startTestEnvironment, stopTestEnvironment } = require('./helpers');
 const { createAdmin, createCustomer, createProduct, setSettings, validAddress } = require('./factories');
 const Product = require('../models/Product');
+const Order = require('../models/Order');
 
 test.before(startTestEnvironment);
 test.after(stopTestEnvironment);
@@ -22,12 +23,8 @@ async function deliverProduct(token, product) {
       paymentMethod: 'COD',
     },
   });
-  const { token: adminToken } = await createAdmin();
-  await request(`/api/admin/orders/${placed.data._id}/status`, {
-    method: 'PUT',
-    token: adminToken,
-    body: { orderStatus: 'Delivered' },
-  });
+  await createAdmin();
+  await Order.updateOne({ _id: placed.data._id }, { $set: { orderStatus: 'Delivered', deliveredAt: new Date() } });
   return placed.data._id;
 }
 

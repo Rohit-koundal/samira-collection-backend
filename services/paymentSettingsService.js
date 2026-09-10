@@ -64,10 +64,12 @@ async function customerRtoBlocked(userId, settings, tenantFilter = {}) {
   if (minOrders <= 0 || threshold <= 0) return false;
   const Order = require('../models/Order');
   const { andFilter } = require('./storeService');
-  const total = await Order.countDocuments(andFilter({ user: userId, orderStatus: { $ne: 'Cancelled' } }, tenantFilter));
+  const orders = await Order.find(andFilter({ user: userId, orderStatus: { $ne: 'Cancelled' } }, tenantFilter)).select('_id').lean();
+  const total = orders.length;
   if (total < minOrders) return false;
-  const returned = await Order.countDocuments(andFilter({ user: userId, orderStatus: { $in: ['Returned', 'Refunded'] } }, tenantFilter));
-  return (returned / total) >= threshold;
+  const Shipment = require('../models/Shipment');
+  const returnedToOrigin = await Shipment.countDocuments(andFilter({ order: { $in: orders.map((order) => order._id) }, status: { $in: ['RTO_IN_TRANSIT', 'RETURNED'] } }, tenantFilter));
+  return (returnedToOrigin / total) >= threshold;
 }
 
 /**
@@ -92,7 +94,6 @@ function buildPaymentOptions(settings, { razorpayConfigured, orderAmount = null,
   const codOverLimit = maxCod !== null && amount !== null && amount > maxCod;
   const codUnderMin = minCod > 0 && amount !== null && amount < minCod;
   const pincodeBlocked = !codPincodeAllowed(settings, pincode);
-  const rtoBlocked = false;
 
   const options = ONLINE_METHODS
     .filter((option) => settings?.[option.settingKey] !== false)
@@ -116,7 +117,7 @@ function buildPaymentOptions(settings, { razorpayConfigured, orderAmount = null,
     options.push({
       key: 'COD',
       label: 'Cash on Delivery',
-      enabled: !codOverLimit && !codUnderMin && !pincodeBlocked && !rtoBlocked,
+      enabled: !codOverLimit && !codUnderMin && !pincodeBlocked,
       provider: 'COD',
       charge: codCharge(settings),
       maxAmount: maxCod,
@@ -126,6 +127,15 @@ function buildPaymentOptions(settings, { razorpayConfigured, orderAmount = null,
   }
 
   return options;
+}
+
+async function applyCustomerRtoToPaymentOptions(options, { userId, settings, tenantFilter = {} } = {}) {
+  if (!(await customerRtoBlocked(userId, settings, tenantFilter))) return options;
+  return options.map((option) => option.key === 'COD' ? {
+    ...option,
+    enabled: false,
+    disabledReason: 'Cash on Delivery is unavailable on this account. Please pay online.',
+  } : option);
 }
 
 /**
@@ -180,6 +190,7 @@ function resolveDeliveryCharge(sellingTotal, settings) {
 
 module.exports = {
   ONLINE_METHODS,
+  applyCustomerRtoToPaymentOptions,
   assertPaymentMethodAllowed,
   buildPaymentOptions,
   codMaxAmount,

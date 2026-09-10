@@ -15,6 +15,7 @@ const { notifyLater } = require('../services/notificationService');
 const { readAttribution } = require('../utils/attribution');
 const { recordEventLater } = require('../services/analyticsService');
 const { assertMonthlyOrderCapacity } = require('../middleware/storeMiddleware');
+const { assertCustomerCanCheckout } = require('../services/customerAccessService');
 
 /**
  * Razorpay flow.
@@ -48,7 +49,11 @@ async function finalizePaidOrder(orderId, { razorpayPaymentId, note, req, source
           razorpayPaymentId,
           paymentFailureReason: undefined,
         },
-        $push: { statusTimeline: { status: 'Confirmed', date: new Date(), note } },
+        $inc: { revision: 1 },
+        $push: {
+          statusTimeline: { status: 'Confirmed', date: new Date(), note },
+          paymentEvents: { state: 'PAID', status: 'Paid', reference: razorpayPaymentId, note, source, date: new Date() },
+        },
       },
       { new: true, session },
     );
@@ -126,6 +131,7 @@ async function notifyPaid(order) {
  */
 async function createPaymentOrder(req, res) {
   assertCheckoutReady(req);
+  await assertCustomerCanCheckout({ storeId: req.store?._id, userId: req.user?._id, paymentMethod: req.body?.paymentMethod || 'UPI' });
   await assertMonthlyOrderCapacity(req.store);
 
   if (!isRazorpayConfigured()) {
@@ -174,6 +180,7 @@ async function createPaymentOrder(req, res) {
           inventoryDeductedAt: new Date(),
           couponConsumed: Boolean(draft.totals.coupon?.code),
           statusTimeline: [{ status: 'Pending', date: new Date(), note: 'Awaiting Razorpay payment' }],
+          paymentEvents: [{ state: 'PENDING', status: 'Pending', amount: draft.totals.finalAmount, reference: razorpayOrder.id, source: 'CHECKOUT', note: 'Awaiting Razorpay payment', date: new Date() }],
         },
       }),
     }], session ? { session } : {});
@@ -386,20 +393,32 @@ async function razorpayWebhook(req, res) {
       await failUnpaidOrder(order, paymentEntity?.error_description || 'Payment failed at gateway', { req, source: 'WEBHOOK' });
     } else if (event === 'refund.processed') {
       const refunded = Number(refundEntity?.amount || 0) / 100;
-      const isFullRefund = refunded >= Number(order.finalAmount || 0);
-      const result = await Order.updateOne({ _id: order._id }, {
-        $set: {
-          paymentState: isFullRefund ? 'REFUNDED' : 'PARTIALLY_REFUNDED',
-          ...(isFullRefund ? { paymentStatus: 'Refunded' } : {}),
-        },
-      });
-      if (result.modifiedCount) logAudit({ req, source: 'WEBHOOK', action: 'PAYMENT_REFUND_PROCESSED', entityType: 'Order', entityId: order._id, storeId: order.storeId, before: { paymentState: order.paymentState }, after: { paymentState: isFullRefund ? 'REFUNDED' : 'PARTIALLY_REFUNDED', refundAmount: refunded } });
-      notifyLater({
-        userId: order.user, storeId: order.storeId, event: 'REFUND_PROCESSED',
-        title: isFullRefund ? 'Refund processed' : 'Partial refund processed',
-        message: `Your refund of Rs. ${refunded.toLocaleString('en-IN')} has been processed by the payment provider. The time it takes to appear depends on your bank.`,
-        metadata: { orderId: String(order._id), refundId: refundEntity?.id, amount: refunded },
-      });
+      const refundId = String(refundEntity?.id || '').trim();
+      if (refunded > 0 && refundId) {
+        const claimed = await Order.findOneAndUpdate({
+          _id: order._id,
+          'refunds.providerRefundId': { $ne: refundId },
+          $expr: { $lte: [{ $add: [{ $ifNull: ['$refundedAmount', 0] }, refunded] }, { $ifNull: ['$finalAmount', 0] }] },
+        }, {
+          $inc: { refundedAmount: refunded, revision: 1 },
+          $push: {
+            refunds: { providerRefundId: refundId, paymentId: refundEntity?.payment_id, provider: 'razorpay', amount: refunded, currency: String(refundEntity?.currency || 'INR').toUpperCase(), status: 'PROCESSED', note: 'Confirmed by Razorpay webhook', processedAt: new Date((Number(refundEntity?.created_at) || Date.now() / 1000) * 1000) },
+            paymentEvents: { state: 'PARTIALLY_REFUNDED', status: 'Refund processed', amount: refunded, reference: refundId, note: 'Confirmed by Razorpay webhook', source: 'WEBHOOK', date: new Date() },
+          },
+        }, { new: true });
+        if (claimed) {
+          const totalRefunded = Math.min(Number(claimed.finalAmount || 0), Number(claimed.refundedAmount || 0));
+          const isFullRefund = totalRefunded >= Number(claimed.finalAmount || 0);
+          await Order.updateOne({ _id: claimed._id }, { $set: { refundedAmount: totalRefunded, paymentState: isFullRefund ? 'REFUNDED' : 'PARTIALLY_REFUNDED', ...(isFullRefund ? { paymentStatus: 'Refunded' } : {}) } });
+          logAudit({ req, source: 'WEBHOOK', action: 'PAYMENT_REFUND_PROCESSED', entityType: 'Order', entityId: claimed._id, storeId: claimed.storeId, before: { paymentState: order.paymentState, refundedAmount: order.refundedAmount || 0 }, after: { paymentState: isFullRefund ? 'REFUNDED' : 'PARTIALLY_REFUNDED', refundAmount: refunded, refundedAmount: totalRefunded, refundId } });
+          notifyLater({
+            userId: claimed.user, storeId: claimed.storeId, event: 'REFUND_PROCESSED',
+            title: isFullRefund ? 'Refund processed' : 'Partial refund processed',
+            message: `Your refund of Rs. ${refunded.toLocaleString('en-IN')} has been processed by the payment provider. The time it takes to appear depends on your bank.`,
+            metadata: { orderId: String(claimed._id), refundId, amount: refunded },
+          });
+        }
+      }
     }
   } catch (error) {
     console.error('Razorpay webhook processing failed:', error.message);
@@ -457,6 +476,8 @@ async function failUnpaidOrder(order, reason, { req, source = 'SYSTEM' } = {}) {
         paymentState: 'FAILED',
         paymentFailureReason: reason,
       },
+      $inc: { revision: 1 },
+      $push: { paymentEvents: { state: 'FAILED', status: 'Failed', note: reason, source, date: new Date() } },
     },
     { new: false },
   );

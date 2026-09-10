@@ -25,11 +25,7 @@ async function deliveredOrder(customerToken, product, quantity = 1) {
     },
   });
   const { token: adminToken } = await createAdmin();
-  await request(`/api/admin/orders/${data._id}/status`, {
-    method: 'PUT',
-    token: adminToken,
-    body: { orderStatus: 'Delivered', note: 'Delivered for test' },
-  });
+  await Order.updateOne({ _id: data._id }, { $set: { orderStatus: 'Delivered', deliveredAt: new Date() } });
   return { orderId: data._id, adminToken };
 }
 

@@ -52,25 +52,38 @@ test('missing product is reported and not logged as a successful change', async 
   await require('../controllers/productController').updateStatus(req({ isActive: false }), response, (error) => { throw error; });
   assert.equal(response.statusCode, 404); assert.equal(events.length, 0);
 });
-test('order status changes are logged only after persistence', async (t) => {
+test('order status changes are logged only after an atomic valid transition', async (t) => {
   const events = capture(t);
-  const order = doc({ _id: ID, storeId: STORE, orderStatus: 'Pending', statusTimeline: [] });
+  const order = doc({ _id: ID, storeId: STORE, orderStatus: 'Pending', paymentMethod: 'COD', paymentStatus: 'Pending', revision: 0, statusTimeline: [] });
+  const confirmed = doc({ ...order, orderStatus: 'Confirmed', codConfirmationStatus: 'CONFIRMED', revision: 1 });
   t.mock.method(Order, 'findOne', async () => order);
   t.mock.method(Shipment, 'findOne', async () => null);
-  t.mock.method(order, 'save', async () => { assert.equal(events.length, 0); return order; });
+  t.mock.method(Order, 'findOneAndUpdate', async (_filter, _update, options) => {
+    assert.equal(events.length, 0); assert.equal(options.new, true); return confirmed;
+  });
+  t.mock.method(Order, 'findById', () => ({ populate: async () => confirmed }));
   const response = res();
   await require('../controllers/orderController').updateOrderStatus(req({ orderStatus: 'Confirmed' }), response, (error) => { throw error; });
   assert.equal(events.length, 1); assert.equal(events[0].before.orderStatus, 'Pending'); assert.equal(events[0].after.orderStatus, 'Confirmed');
   assert.equal(response.body.orderStatus, 'Confirmed');
 });
-test('manual payment status records the atomic previous value without changing response data', async (t) => {
+test('COD collection records the financial event after delivery', async (t) => {
   const events = capture(t); let options;
-  const previous = doc({ _id: ID, storeId: STORE, paymentStatus: 'Pending', paymentState: 'PENDING', finalAmount: 450 });
-  t.mock.method(Order, 'findOneAndUpdate', async (_filter, _update, opts) => { options = opts; return previous; });
+  const previous = doc({ _id: ID, storeId: STORE, orderStatus: 'Delivered', paymentMethod: 'COD', paymentStatus: 'Pending', paymentState: 'PENDING', finalAmount: 450, revision: 0 });
+  const paid = doc({ ...previous, paymentStatus: 'Paid', paymentState: 'PAID', revision: 1 });
+  t.mock.method(Order, 'findOne', () => ({ select: async () => previous }));
+  t.mock.method(Order, 'findOneAndUpdate', (_filter, _update, opts) => { options = opts; return { select: async () => paid }; });
   const response = res();
-  await require('../controllers/orderController').updatePaymentStatus(req({ paymentStatus: 'Paid' }), response, (error) => { throw error; });
-  assert.equal(options.new, false); assert.equal(events[0].before.paymentStatus, 'Pending');
+  await require('../controllers/orderController').updatePaymentStatus(req({ paymentStatus: 'Paid', note: 'Cash received at delivery' }), response, (error) => { throw error; });
+  assert.equal(options.new, true); assert.equal(events[0].before.paymentStatus, 'Pending');
   assert.equal(events[0].after.paymentStatus, 'Paid'); assert.equal(response.body.paymentStatus, 'Paid'); assert.equal(response.body.finalAmount, 450);
+});
+test('order workflow rejects skipped fulfilment and unpaid online confirmation', () => {
+  const { allowedActions, assertOrderTransition } = require('../services/orderWorkflowService');
+  const cod = { orderStatus: 'Pending', paymentMethod: 'COD', paymentStatus: 'Pending' };
+  assert.deepEqual(allowedActions(cod), ['CONFIRM_ORDER', 'CANCEL_ORDER']);
+  assert.throws(() => assertOrderTransition(cod, 'Delivered'), error => error.errorCode === 'ORDER_TRANSITION_INVALID');
+  assert.deepEqual(allowedActions({ orderStatus: 'Pending', paymentMethod: 'ONLINE', paymentStatus: 'Pending' }), ['CANCEL_ORDER']);
 });
 test('coupon update records discount changes, not just the coupon code', async (t) => {
   const events = capture(t);

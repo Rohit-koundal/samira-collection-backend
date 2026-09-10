@@ -126,16 +126,24 @@ function signedWebhook(payload) {
   return { body, headers: { 'x-razorpay-signature': crypto.createHmac('sha256', process.env.RAZORPAY_WEBHOOK_SECRET).update(body).digest('hex') } };
 }
 
-test('verified refunds find the order by payment ID and emit the exact refund amount', async (t) => {
+test('verified partial refunds accumulate exactly once and finish at the charged total', async (t) => {
   const original = process.env.RAZORPAY_WEBHOOK_SECRET;
   process.env.RAZORPAY_WEBHOOK_SECRET = 'unit-test-only';
   t.after(() => { if (original === undefined) delete process.env.RAZORPAY_WEBHOOK_SECRET; else process.env.RAZORPAY_WEBHOOK_SECRET = original; });
   events.length = 0;
+  const order = { _id: notificationId, user: userId, finalAmount: 1000, refundedAmount: 0, refunds: [], paymentState: 'PAID', paymentStatus: 'Paid', storeId: 'store-1' };
   t.mock.method(Order, 'findOne', async (filter) => {
     assert.deepEqual(filter, { razorpayPaymentId: 'pay_test' });
-    return { _id: notificationId, user: userId, finalAmount: 1000, storeId: 'store-1' };
+    return order;
   });
-  t.mock.method(Order, 'updateOne', async () => ({ modifiedCount: 1 }));
+  t.mock.method(Order, 'findOneAndUpdate', async (_filter, update) => {
+    const entry = update.$push.refunds;
+    if (order.refunds.some(item => item.providerRefundId === entry.providerRefundId)) return null;
+    order.refundedAmount += update.$inc.refundedAmount;
+    order.refunds.push(entry);
+    return { ...order };
+  });
+  t.mock.method(Order, 'updateOne', async (_filter, update) => { Object.assign(order, update.$set); return { modifiedCount: 1 }; });
   const request = signedWebhook({ event: 'refund.processed', payload: { refund: { entity: { id: 'refund_test', payment_id: 'pay_test', amount: 25000 } } } });
   const res = { json(body) { this.body = body; }, status() { return this; } };
   await razorpayWebhook(request, res);
@@ -143,6 +151,13 @@ test('verified refunds find the order by payment ID and emit the exact refund am
   assert.equal(events[0].event, 'REFUND_PROCESSED'); assert.equal(events[0].title, 'Partial refund processed');
   assert.equal(events[0].metadata.amount, 250); assert.equal(events[0].metadata.refundId, 'refund_test');
   assert.equal(events[0].userId, userId);
+  await razorpayWebhook(request, res);
+  assert.equal(events.length, 1, 'a repeated refund webhook must be ignored');
+  const remainder = signedWebhook({ event: 'refund.processed', payload: { refund: { entity: { id: 'refund_remainder', payment_id: 'pay_test', amount: 75000 } } } });
+  await razorpayWebhook(remainder, res);
+  assert.equal(events.length, 2); assert.equal(events[1].title, 'Refund processed');
+  assert.equal(order.refundedAmount, 1000); assert.equal(order.paymentState, 'REFUNDED'); assert.equal(order.paymentStatus, 'Refunded');
+  assert.deepEqual(order.refunds.map(item => item.providerRefundId), ['refund_test', 'refund_remainder']);
 });
 
 test('a verified failed payment creates a customer alert only on the first state change', async (t) => {

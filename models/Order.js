@@ -21,6 +21,8 @@ const orderSchema = new mongoose.Schema({
   user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
   orderItems: [{
     product: { type: mongoose.Schema.Types.ObjectId, ref: 'Product' },
+    category: { type: mongoose.Schema.Types.ObjectId, ref: 'Category' },
+    categoryName: String,
     name: String,
     productName: String,
     sku: String,
@@ -64,6 +66,27 @@ const orderSchema = new mongoose.Schema({
   razorpayOrderId: String,
   razorpayPaymentId: String,
   paymentFailureReason: String,
+  refundedAmount: { type: Number, default: 0, min: 0 },
+  refunds: [{
+    providerRefundId: { type: String, maxlength: 120 },
+    paymentId: { type: String, maxlength: 120 },
+    provider: { type: String, maxlength: 40 },
+    amount: { type: Number, min: 0 },
+    currency: { type: String, default: 'INR', maxlength: 10 },
+    status: { type: String, enum: ['PROCESSED', 'FAILED'], default: 'PROCESSED' },
+    note: { type: String, maxlength: 500 },
+    processedAt: Date,
+  }],
+  paymentEvents: { type: [{
+    state: String,
+    status: String,
+    amount: Number,
+    reference: String,
+    note: String,
+    source: String,
+    actor: { id: String, name: String },
+    date: { type: Date, default: Date.now },
+  }], select: false },
 
   // Idempotency guards. Each side effect is claimed once via a conditional
   // update so retries, duplicate webhooks and double clicks are no-ops.
@@ -76,6 +99,11 @@ const orderSchema = new mongoose.Schema({
 
   statusTimeline: [{ status: String, date: Date, note: String }],
   adminNotes: String,
+  staffNotes: { type: [{
+    text: { type: String, maxlength: 1000 },
+    author: { id: String, name: String },
+    date: { type: Date, default: Date.now },
+  }], select: false },
   attribution: {
     source: String,
     campaign: String,
@@ -83,6 +111,7 @@ const orderSchema = new mongoose.Schema({
   },
   prepaidDiscount: { type: Number, default: 0 },
   codConfirmationStatus: { type: String, enum: ['NOT_REQUIRED', 'PENDING', 'CONFIRMED', 'CANCELLED'], default: 'NOT_REQUIRED' },
+  revision: { type: Number, default: 0, min: 0 },
 }, { timestamps: true });
 
 orderSchema.plugin(storeIdPlugin);

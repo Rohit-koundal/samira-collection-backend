@@ -2,6 +2,8 @@ const router = require('express').Router();
 const rateLimit = require('express-rate-limit');
 const auth = require('../controllers/authController');
 const { protect } = require('../middleware/authMiddleware');
+const { optionalResolveStore } = require('../middleware/storeMiddleware');
+const crm = require('../controllers/crmController');
 
 const otpSendLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -34,5 +36,7 @@ router.post('/switch-mode', protect, auth.switchMode);
 router.get('/profile', protect, auth.profile);
 router.put('/profile', protect, auth.updateProfile);
 router.delete('/profile', protect, auth.deleteProfile);
+router.get('/privacy-requests', protect, optionalResolveStore, crm.listOwnPrivacyRequests);
+router.post('/privacy-requests', protect, optionalResolveStore, crm.createOwnPrivacyRequest);
 
 module.exports = router;

@@ -4,12 +4,12 @@ const InventoryTransaction = require('../models/InventoryTransaction');
 const couponService = require('../services/couponService');
 const inventoryService = require('../services/inventoryService');
 const { buildOrderDraft } = require('../services/orderPricingService');
-const { buildPaymentOptions, getStoreSettings } = require('../services/paymentSettingsService');
+const { applyCustomerRtoToPaymentOptions, buildPaymentOptions, getStoreSettings } = require('../services/paymentSettingsService');
 const { isRazorpayConfigured } = require('../services/razorpayService');
 const { runInTransaction } = require('../utils/transaction');
 const { ApiError, forbidden, notFound } = require('../utils/apiError');
 const { asyncHandler } = require('../middleware/validate');
-const { readPagination, requireEnum, requireObjectId, optionalString, wantsPagination, buildPaginatedResponse } = require('../utils/validators');
+const { readPagination, requireEnum, requireObjectId, requireString, optionalString, wantsPagination, buildPaginatedResponse } = require('../utils/validators');
 const { syncPaidOnlineOrderStatus } = require('../utils/orderStatusUtils');
 const { buildPersistedOrderFields } = require('../services/orderSnapshotService');
 const { notifyLater } = require('../services/notificationService');
@@ -21,10 +21,40 @@ const { recordEventLater } = require('../services/analyticsService');
 const { normalizeIndianMobile } = require('../utils/phoneUtils');
 const { adminOrderFilter } = require('../services/dashboardAnalytics');
 const { assertMonthlyOrderCapacity, assertStoreCanAcceptOrders } = require('../middleware/storeMiddleware');
+const { assertOrderTransition, canCancelOrder, publicWorkflow } = require('../services/orderWorkflowService');
+const { applyCustomerRestrictionsToPaymentOptions, assertCustomerCanCheckout, getCustomerRestrictions } = require('../services/customerAccessService');
 
 const ORDER_STATUSES = ['Pending', 'Confirmed', 'Packed', 'Shipped', 'Out for Delivery', 'Delivered', 'Cancelled', 'Return Requested', 'Exchange Requested', 'Returned', 'Refunded'];
 const PAYMENT_STATUSES = ['Pending', 'Paid', 'Failed', 'Refunded'];
 const CANCELLABLE_STATUSES = ['Pending', 'Confirmed', 'Packed'];
+const MANUAL_PAYMENT_TRANSITIONS = { Pending: ['Paid'], Paid: ['Refunded'] };
+
+function revisionFilter(value) {
+  const revision = Number(value || 0);
+  return revision === 0 ? { $or: [{ revision: 0 }, { revision: { $exists: false } }] } : { revision };
+}
+
+function assertCurrentRevision(order, supplied) {
+  if (supplied === undefined || supplied === null || supplied === '') return Number(order.revision || 0);
+  const value = Number(supplied);
+  if (!Number.isInteger(value) || value < 0) throw new ApiError('VALIDATION_ERROR', 'A valid order revision is required.');
+  if (value !== Number(order.revision || 0)) throw new ApiError('ORDER_CHANGED', 'This order changed in another session. Reload it before continuing.', { statusCode: 409 });
+  return value;
+}
+
+function managerRequest(req) {
+  return req.user?.role === 'admin' || Boolean(req.storeMember);
+}
+
+function actorSnapshot(req) {
+  return { id: String(req.user?._id || ''), name: String(req.user?.name || req.user?.phone || 'Staff').slice(0, 100) };
+}
+
+function decorateOrder(order, options = {}) {
+  if (!order) return order;
+  const value = order.toObject ? order.toObject() : { ...order };
+  return { ...value, ...publicWorkflow(value, value.shipment, options) };
+}
 
 function assertCheckoutReady(req) {
   if (!req.user?.isPhoneVerified) {
@@ -36,13 +66,20 @@ function assertShippingAddress(address) {
   if (!address || typeof address !== 'object') {
     throw new ApiError('VALIDATION_ERROR', 'Please select a delivery address');
   }
-  const pincode = String(address.pincode || '').replace(/\D/g, '');
+  const clean = require('../services/orderSnapshotService').snapshotAddress(address);
+  const pincode = clean.pincode;
   if (!/^\d{6}$/.test(pincode)) throw new ApiError('VALIDATION_ERROR', 'Please select an address with a valid 6-digit pincode');
-  if (!String(address.fullName || '').trim()) throw new ApiError('VALIDATION_ERROR', 'Delivery address needs a contact name');
-  if (!/^[6-9]\d{9}$/.test(normalizeIndianMobile(address.mobile || address.phone))) {
+  if (!clean.fullName) throw new ApiError('VALIDATION_ERROR', 'Delivery address needs a contact name');
+  if (!/^[6-9]\d{9}$/.test(clean.mobile)) {
     throw new ApiError('VALIDATION_ERROR', 'Delivery address needs a valid 10-digit mobile number');
   }
-  return address;
+  for (const [field, label] of [['houseNo', 'house or flat number'], ['area', 'street or area'], ['city', 'city'], ['state', 'state']]) {
+    if (!clean[field]) throw new ApiError('VALIDATION_ERROR', `Delivery address needs a ${label}`);
+  }
+  const lengths = { fullName: 100, alternateMobile: 20, state: 100, city: 100, houseNo: 160, area: 300, landmark: 200, addressType: 30 };
+  for (const [field, max] of Object.entries(lengths)) if (clean[field]?.length > max) throw new ApiError('VALIDATION_ERROR', `Delivery address ${field} is too long`);
+  if (clean.alternateMobile && !/^[6-9]\d{9}$/.test(normalizeIndianMobile(clean.alternateMobile))) throw new ApiError('VALIDATION_ERROR', 'Alternate mobile number must be a valid 10-digit number');
+  return clean;
 }
 
 function isOwnerOrAdmin(order, user, req) {
@@ -59,8 +96,13 @@ function isOwnerOrAdmin(order, user, req) {
  */
 exports.quoteOrder = asyncHandler(async (req, res) => {
   assertStoreCanAcceptOrders(req.store);
+  const customerRestrictions = await getCustomerRestrictions({ storeId: req.store?._id, userId: req.user?._id });
+  await assertCustomerCanCheckout({ storeId: req.store?._id, userId: req.user?._id, paymentMethod: req.body?.paymentMethod });
   const settings = await getStoreSettings(req.tenantFilter || {});
-  const paymentOptions = buildPaymentOptions(settings, { razorpayConfigured: isRazorpayConfigured() });
+  const initialPaymentOptions = await applyCustomerRtoToPaymentOptions(buildPaymentOptions(settings, {
+    razorpayConfigured: isRazorpayConfigured(), pincode: req.body?.shippingAddress?.pincode,
+  }), { userId: req.user?._id, settings, tenantFilter: req.tenantFilter });
+  const paymentOptions = applyCustomerRestrictionsToPaymentOptions(initialPaymentOptions, customerRestrictions);
 
   if (!Array.isArray(req.body?.orderItems) || !req.body.orderItems.length) {
     return res.json({ paymentOptions, totals: null });
@@ -81,10 +123,11 @@ exports.quoteOrder = asyncHandler(async (req, res) => {
     shipping: draft.shippingQuote,
     totals: draft.totals,
     items: draft.items,
-    paymentOptions: buildPaymentOptions(settings, {
+    paymentOptions: applyCustomerRestrictionsToPaymentOptions(await applyCustomerRtoToPaymentOptions(buildPaymentOptions(settings, {
       razorpayConfigured: isRazorpayConfigured(),
       orderAmount: draft.totals.finalAmount - draft.totals.codCharge,
-    }),
+      pincode: req.body?.shippingAddress?.pincode,
+    }), { userId: req.user?._id, settings, tenantFilter: req.tenantFilter }), customerRestrictions),
   });
 });
 
@@ -95,6 +138,7 @@ exports.quoteOrder = asyncHandler(async (req, res) => {
  */
 exports.createOrder = asyncHandler(async (req, res) => {
   assertCheckoutReady(req);
+  await assertCustomerCanCheckout({ storeId: req.store?._id, userId: req.user?._id, paymentMethod: req.body?.paymentMethod || 'COD' });
   await assertMonthlyOrderCapacity(req.store);
 
   const shippingAddress = assertShippingAddress(req.body?.shippingAddress);
@@ -128,6 +172,7 @@ exports.createOrder = asyncHandler(async (req, res) => {
           inventoryDeductedAt: new Date(),
           couponConsumed: Boolean(draft.totals.coupon?.code),
           statusTimeline: [{ status: 'Pending', date: new Date(), note: 'Order placed' }],
+          paymentEvents: [{ state: 'PENDING', status: 'Pending', amount: draft.totals.finalAmount, source: 'CHECKOUT', note: draft.paymentMethod === 'COD' ? 'Payment due on delivery' : 'Awaiting online payment', date: new Date() }],
         },
       }),
     }], session ? { session } : {});
@@ -221,33 +266,107 @@ exports.myOrders = asyncHandler(async (req, res) => {
 
 exports.getOrder = asyncHandler(async (req, res) => {
   requireObjectId(req.params.id, 'order id');
-  const order = await Order.findOne(andFilter({ _id: req.params.id }, req.tenantFilter)).populate('user', 'name email phone').populate('shipment');
+  let query = Order.findOne(andFilter({ _id: req.params.id }, req.tenantFilter)).populate('user', 'name email phone').populate('shipment');
+  if (managerRequest(req)) query = query.select('+staffNotes +paymentEvents');
+  const order = await query;
   if (!order) throw notFound('Order not found');
   if (!isOwnerOrAdmin(order, req.user, req)) throw forbidden('Not allowed to view this order');
   await syncPaidOnlineOrderStatus(order);
-  res.json(order);
+  if (!managerRequest(req)) return res.json(order);
+  const ReturnExchange = require('../models/ReturnExchange');
+  const returnRequests = await ReturnExchange.find(andFilter({ order: order._id }, req.tenantFilter)).populate('product', 'name images sku').sort('-createdAt').lean();
+  const hasOpenReturn = returnRequests.some(item => !['Rejected', 'Refunded', 'Exchanged', 'Closed'].includes(item.status));
+  const canRecordRefund = returnRequests.some(item => item.status === 'Refunded' || item.resolutionStatus === 'Refunded');
+  res.json({ ...decorateOrder(order, { hasOpenReturn, canRecordRefund }), returnRequests });
 });
 
 exports.adminOrders = asyncHandler(async (req, res) => {
   let filter = await adminOrderFilter(req.query, req.tenantFilter);
-  if (req.query.deliveryStatus) {
+  if (req.query.deliveryStatus || req.query.deliveryIssue) {
     const Shipment = require('../models/Shipment');
-    const status = requireEnum(req.query.deliveryStatus, Shipment.SHIPMENT_STATUSES, 'delivery status');
-    const shipments = await Shipment.find(andFilter({ status }, req.tenantFilter)).select('_id').lean();
+    if (req.query.deliveryIssue && req.query.deliveryIssue !== '1') throw new ApiError('VALIDATION_ERROR', 'Choose a valid delivery issue filter.');
+    const status = req.query.deliveryIssue ? null : requireEnum(req.query.deliveryStatus, Shipment.SHIPMENT_STATUSES, 'delivery status');
+    const shipments = await Shipment.find(andFilter({ status: status || { $in: ['EXCEPTION', 'FAILED'] } }, req.tenantFilter)).select('_id').lean();
     const booked = { shipment: { $in: shipments.map(s => s._id) } };
     filter = andFilter(filter, status === 'WAITING' ? { $or: [booked, { shipment: null, orderStatus: { $in: ['Pending', 'Confirmed', 'Packed'] } }] } : booked);
   }
-  const finder = () => Order.find(filter).populate('user', 'name email phone').populate('shipment', 'provider status awb bookingState').sort({ createdAt: -1, _id: -1 });
+  const sort = { newest: { createdAt: -1, _id: -1 }, oldest: { createdAt: 1, _id: 1 }, dispatch_sla: { createdAt: 1, _id: 1 }, amount_high: { finalAmount: -1, createdAt: -1 }, amount_low: { finalAmount: 1, createdAt: -1 } }[req.query.sort || 'newest'];
+  if (!sort) throw new ApiError('VALIDATION_ERROR', 'Choose a valid order sort.');
+  const finder = () => Order.find(filter).populate('user', 'name email phone').populate('shipment', 'provider courierName status awb trackingNumber bookingState expectedDeliveryAt labelAvailable pickup operation').sort(sort);
   if (wantsPagination(req.query)) {
     const { page, limit, skip } = readPagination(req.query, { defaultLimit: 24, maxLimit: 100 });
     const [items, total] = await Promise.all([
       finder().skip(skip).limit(limit),
       Order.countDocuments(filter),
     ]);
-    return res.json(buildPaginatedResponse(items, { page, limit, total }));
+    return res.json({ ...buildPaginatedResponse(items.map(item => decorateOrder(item)), { page, limit, total }) });
   }
   const { limit, skip } = readPagination(req.query, { defaultLimit: 200, maxLimit: 500 });
-  res.json(await finder().skip(skip).limit(limit));
+  res.json((await finder().skip(skip).limit(limit)).map(item => decorateOrder(item)));
+});
+
+exports.orderWorkspaceSummary = asyncHandler(async (req, res) => {
+  const Shipment = require('../models/Shipment');
+  const ReturnExchange = require('../models/ReturnExchange');
+  const { dashboardRange, periodFilter } = require('../services/dashboardAnalytics');
+  const scope = filter => andFilter(filter, req.tenantFilter);
+  const booked = { orderStatus: { $nin: ['Cancelled', 'Returned', 'Refunded'] }, $or: [{ paymentMethod: 'COD' }, { paymentStatus: 'Paid' }] };
+  const today = periodFilter(dashboardRange({ range: 'today' }));
+  const [pending, packing, todayPacking, dispatch, transit, exceptions, returns, codRows] = await Promise.all([
+    Order.countDocuments(scope({ ...booked, orderStatus: 'Pending' })),
+    Order.countDocuments(scope({ ...booked, orderStatus: 'Confirmed' })),
+    Order.countDocuments(scope(andFilter({ ...booked, orderStatus: 'Confirmed' }, today))),
+    Order.countDocuments(scope({ ...booked, orderStatus: 'Packed' })),
+    Order.countDocuments(scope({ orderStatus: { $in: ['Shipped', 'Out for Delivery'] } })),
+    Shipment.countDocuments(scope({ status: { $in: ['EXCEPTION', 'FAILED'] } })),
+    ReturnExchange.countDocuments(scope({ status: { $in: ['Requested', 'Approved', 'Pickup Scheduled', 'Received'] } })),
+    Order.aggregate([
+      { $match: scope({ orderStatus: 'Delivered', paymentMethod: 'COD', paymentStatus: 'Pending' }) },
+      { $group: { _id: null, count: { $sum: 1 }, amount: { $sum: '$finalAmount' } } },
+    ]),
+  ]);
+  res.json({ pending, packing, todayPacking, dispatch, transit, exceptions, returns, codCollection: codRows[0]?.count || 0, codCollectionAmount: codRows[0]?.amount || 0 });
+});
+
+exports.addStaffNote = asyncHandler(async (req, res) => {
+  requireObjectId(req.params.id, 'order id');
+  const text = requireString(req.body?.text, 'note', { max: 1000 });
+  const order = await Order.findOne(andFilter({ _id: req.params.id }, req.tenantFilter)).select('+staffNotes +paymentEvents');
+  if (!order) throw notFound('Order not found');
+  const expectedRevision = assertCurrentRevision(order, req.body?.revision);
+  const entry = { text, author: actorSnapshot(req), date: new Date() };
+  const updated = await Order.findOneAndUpdate(andFilter({ _id: order._id, ...revisionFilter(expectedRevision) }, req.tenantFilter), {
+    $inc: { revision: 1 },
+    $push: { staffNotes: { $each: [entry], $slice: -100 } },
+  }, { new: true }).select('+staffNotes +paymentEvents').populate('user', 'name email phone').populate('shipment');
+  if (!updated) throw new ApiError('ORDER_CHANGED', 'This order changed in another session. Reload it before continuing.', { statusCode: 409 });
+  logAudit({ req, action: 'ORDER_STAFF_NOTE_ADD', entityType: 'Order', entityId: updated._id, storeId: updated.storeId, after: { note: text }, summary: 'Private order note added' });
+  res.json(decorateOrder(updated));
+});
+
+exports.updateShippingAddress = asyncHandler(async (req, res) => {
+  requireObjectId(req.params.id, 'order id');
+  const reason = requireString(req.body?.reason, 'reason', { max: 300 });
+  const address = assertShippingAddress(req.body?.shippingAddress);
+  const order = await Order.findOne(andFilter({ _id: req.params.id }, req.tenantFilter)).populate('shipment');
+  if (!order) throw notFound('Order not found');
+  const expectedRevision = assertCurrentRevision(order, req.body?.revision);
+  if (!['Pending', 'Confirmed', 'Packed'].includes(order.orderStatus)) throw new ApiError('ORDER_TRANSITION_INVALID', 'The delivery address is locked after the parcel leaves the store.', { statusCode: 409 });
+  if (order.shipment?.awb || ['BOOKING', 'BOOKED', 'UNKNOWN'].includes(order.shipment?.bookingState)) throw new ApiError('SHIPPING_VALIDATION', 'Cancel the uncollected courier booking before changing this address.');
+
+  const settings = await getStoreSettings(req.tenantFilter || {});
+  const merchandiseAmount = Math.max(0, Number(order.finalAmount || 0) - Number(order.deliveryCharge || 0) - Number(order.codCharge || 0) - Number(order.platformFee || 0) + Number(order.prepaidDiscount || 0));
+  const quote = await require('../services/deliveryService').checkoutShipping({ items: order.orderItems, settings, address, paymentMethod: order.paymentMethod, amount: merchandiseAmount });
+  if (Math.abs(Number(quote.deliveryCharge || 0) - Number(order.deliveryCharge || 0)) > 0.01) throw new ApiError('SHIPPING_QUOTE_CHANGED', 'This PIN code changes the agreed delivery charge. Cancel and place a corrected order instead of changing the customer total.', { statusCode: 409 });
+  const before = order.shippingAddress;
+  const updated = await Order.findOneAndUpdate(andFilter({ _id: order._id, ...revisionFilter(expectedRevision) }, req.tenantFilter), {
+    $set: { shippingAddress: address, shippingQuote: quote },
+    $inc: { revision: 1 },
+    $push: { statusTimeline: { status: order.orderStatus, date: new Date(), note: `Delivery address corrected: ${reason}` } },
+  }, { new: true }).select('+staffNotes +paymentEvents').populate('user', 'name email phone').populate('shipment');
+  if (!updated) throw new ApiError('ORDER_CHANGED', 'This order changed in another session. Reload it before continuing.', { statusCode: 409 });
+  logAudit({ req, action: 'ORDER_ADDRESS_UPDATE', entityType: 'Order', entityId: updated._id, storeId: updated.storeId, before: { shippingAddress: before }, after: { shippingAddress: address }, summary: reason });
+  res.json(decorateOrder(updated));
 });
 
 exports.updateOrderStatus = asyncHandler(async (req, res) => {
@@ -257,60 +376,103 @@ exports.updateOrderStatus = asyncHandler(async (req, res) => {
 
   const order = await Order.findOne(andFilter({ _id: req.params.id }, req.tenantFilter));
   if (!order) throw notFound('Order not found');
+  const expectedRevision = assertCurrentRevision(order, req.body?.revision);
+  const shipment = await require('../models/Shipment').findOne({ order: order._id });
 
-  // Cancelling from the admin screen must follow the same restore rules as a
-  // customer cancellation, otherwise stock silently disappears.
   if (orderStatus === 'Cancelled') {
-    return res.json(await cancelOrderInternal(order, { req, actor: req.user, note: note || 'Cancelled by admin', force: true }));
+    if (!canCancelOrder(order, shipment)) throw new ApiError('ORDER_NOT_CANCELLABLE', 'This order is already with the courier or completed. Use the return/RTO workflow instead of restoring stock through cancellation.');
+    return res.json(decorateOrder(await cancelOrderInternal(order, { req, actor: req.user, note: note || 'Cancelled by staff', expectedRevision })));
   }
-
-  if (order.paymentMethod === 'COD' && order.codConfirmationStatus === 'PENDING' && ['Packed', 'Shipped', 'Out for Delivery', 'Delivered'].includes(orderStatus)) {
-    throw new ApiError('VALIDATION_ERROR', 'Confirm this cash-on-delivery order with the customer, then mark it Confirmed before fulfilment.');
-  }
+  const transition = assertOrderTransition(order, orderStatus, shipment);
+  if (!transition.changed) return res.json(decorateOrder(order));
   const before = { orderStatus: order.orderStatus, codConfirmationStatus: order.codConfirmationStatus };
-  const courierShipment = await require('../models/Shipment').findOne({ order: order._id, provider: { $ne: 'manual' }, bookingState: { $in: ['BOOKED', 'BOOKING', 'UNKNOWN'] } });
-  if (courierShipment && ['Shipped', 'Out for Delivery', 'Delivered'].includes(orderStatus)) throw new ApiError('SHIPPING_VALIDATION', 'Refresh courier tracking to update delivery status for this shipment.');
-  if (order.paymentMethod === 'COD' && order.codConfirmationStatus === 'PENDING' && orderStatus === 'Confirmed') order.codConfirmationStatus = 'CONFIRMED';
-  order.orderStatus = orderStatus;
-  order.statusTimeline.push({ status: orderStatus, date: new Date(), note });
-  if (orderStatus === 'Delivered') order.deliveredAt = order.deliveredAt || new Date();
-  await order.save();
+  const now = new Date();
+  const set = { orderStatus };
+  if (order.paymentMethod === 'COD' && order.codConfirmationStatus === 'PENDING' && orderStatus === 'Confirmed') set.codConfirmationStatus = 'CONFIRMED';
+  if (orderStatus === 'Delivered') set.deliveredAt = order.deliveredAt || now;
+  const updated = await Order.findOneAndUpdate(andFilter({
+    _id: order._id,
+    orderStatus: order.orderStatus,
+    ...revisionFilter(expectedRevision),
+  }, req.tenantFilter), {
+    $set: set,
+    $inc: { revision: 1 },
+    $push: { statusTimeline: { status: orderStatus, date: now, note: note || `Marked ${orderStatus} by staff` } },
+  }, { new: true });
+  if (!updated) throw new ApiError('ORDER_CHANGED', 'This order changed in another session. Reload it before continuing.', { statusCode: 409 });
 
-  logAudit({ req, action: 'ORDER_STATUS_UPDATE', entityType: 'Order', entityId: order._id, storeId: order.storeId, before, after: { orderStatus: order.orderStatus, codConfirmationStatus: order.codConfirmationStatus } });
+  logAudit({ req, action: 'ORDER_STATUS_UPDATE', entityType: 'Order', entityId: updated._id, storeId: updated.storeId, before, after: { orderStatus: updated.orderStatus, codConfirmationStatus: updated.codConfirmationStatus }, summary: note || `Order moved to ${orderStatus}` });
 
   if (toShipmentStatus(orderStatus)) {
-    await upsertShipmentForOrder(order, { status: toShipmentStatus(orderStatus), note: note || `Order marked ${orderStatus}` }).catch(() => null);
+    await upsertShipmentForOrder(updated, { status: toShipmentStatus(orderStatus), note: note || `Order marked ${orderStatus}` }).catch(() => null);
   }
 
   if (orderStatus === 'Delivered') {
     notifyLater({
-      userId: order.user,
-      storeId: order.storeId,
+      userId: updated.user,
+      storeId: updated.storeId,
       event: 'ORDER_DELIVERED',
       title: 'Order delivered',
       message: 'Your order has been delivered. You can now rate products or request a return.',
-      metadata: { orderId: String(order._id) },
+      metadata: { orderId: String(updated._id) },
     });
   }
 
-  res.json(order);
+  const populated = await Order.findById(updated._id).populate('shipment', 'provider courierName status awb trackingNumber bookingState expectedDeliveryAt');
+  res.json(decorateOrder(populated));
 });
 
 exports.updatePaymentStatus = asyncHandler(async (req, res) => {
   requireObjectId(req.params.id, 'order id');
   const paymentStatus = requireEnum(req.body?.paymentStatus, PAYMENT_STATUSES, 'paymentStatus');
-  const paymentState = { Pending: 'PENDING', Paid: 'PAID', Failed: 'FAILED', Refunded: 'REFUNDED' }[paymentStatus];
+  const note = optionalString(req.body?.note, 'note', { max: 500 });
+  const reference = optionalString(req.body?.reference, 'reference', { max: 120 });
+  const order = await Order.findOne(andFilter({ _id: req.params.id }, req.tenantFilter)).select('+paymentEvents');
+  if (!order) throw notFound('Order not found');
+  const expectedRevision = assertCurrentRevision(order, req.body?.revision);
+  if (order.paymentStatus === paymentStatus) return res.json(decorateOrder(order));
+  if (order.paymentMethod !== 'COD') throw new ApiError('PAYMENT_MANAGED_BY_PROVIDER', 'Online payment status is controlled by the payment provider. Reconcile it from Razorpay instead of changing it manually.', { statusCode: 409 });
+  if (!MANUAL_PAYMENT_TRANSITIONS[order.paymentStatus]?.includes(paymentStatus)) throw new ApiError('PAYMENT_TRANSITION_INVALID', `A COD payment cannot move from ${order.paymentStatus} to ${paymentStatus}.`, { statusCode: 409 });
+  if (!note) throw new ApiError('VALIDATION_ERROR', 'Add a payment note so this financial change has a clear audit record.');
+  if (paymentStatus === 'Paid' && order.orderStatus !== 'Delivered') throw new ApiError('PAYMENT_TRANSITION_INVALID', 'Record COD collection after the order is delivered.', { statusCode: 409 });
 
-  const previous = await Order.findOneAndUpdate(
-    andFilter({ _id: req.params.id }, req.tenantFilter),
-    { paymentStatus, paymentState },
-    { new: false },
-  );
-  if (!previous) throw notFound('Order not found');
-  logAudit({ req, action: 'PAYMENT_STATUS_UPDATE', entityType: 'Order', entityId: previous._id, storeId: previous.storeId, before: { paymentStatus: previous.paymentStatus, paymentState: previous.paymentState }, after: { paymentStatus, paymentState } });
-  // Preserve the existing response shape, using the acknowledged update values.
-  const order = { ...previous.toObject(), paymentStatus, paymentState };
-  res.json(order);
+  let refundAmount = 0;
+  let paymentState = paymentStatus === 'Paid' ? 'PAID' : 'REFUNDED';
+  let resultingPaymentStatus = paymentStatus;
+  if (paymentStatus === 'Refunded') {
+    const ReturnExchange = require('../models/ReturnExchange');
+    const completedReturn = await ReturnExchange.exists(andFilter({ order: order._id, $or: [{ status: 'Refunded' }, { resolutionStatus: 'Refunded' }] }, req.tenantFilter));
+    if (!completedReturn) throw new ApiError('PAYMENT_TRANSITION_INVALID', 'Complete the approved return refund step before recording money returned to the customer.', { statusCode: 409 });
+    const remaining = Math.round(Math.max(0, Number(order.finalAmount || 0) - Number(order.refundedAmount || 0)) * 100) / 100;
+    refundAmount = Math.round(Number(req.body?.amount) * 100) / 100;
+    if (!Number.isFinite(refundAmount) || refundAmount < 0.01 || refundAmount > remaining) throw new ApiError('VALIDATION_ERROR', `Enter a refund amount between Rs. 0.01 and Rs. ${remaining.toFixed(2)}.`);
+    const completesRefund = refundAmount >= remaining;
+    paymentState = completesRefund ? 'REFUNDED' : 'PARTIALLY_REFUNDED';
+    resultingPaymentStatus = completesRefund ? 'Refunded' : 'Paid';
+  }
+  const now = new Date();
+  const mutation = {
+    $set: { paymentStatus: resultingPaymentStatus, paymentState, ...(paymentStatus === 'Refunded' ? { refundedAmount: Number(order.refundedAmount || 0) + refundAmount } : {}) },
+    $inc: { revision: 1 },
+    $push: {
+      paymentEvents: {
+        state: paymentState, status: paymentStatus, amount: paymentStatus === 'Refunded' ? refundAmount : Number(order.finalAmount || 0), reference,
+        note, source: 'MANUAL', actor: actorSnapshot(req), date: now,
+      },
+    },
+  };
+  if (paymentStatus === 'Refunded') mutation.$push.refunds = { providerRefundId: reference || `manual-${order._id}-${expectedRevision + 1}`, provider: 'manual', amount: refundAmount, currency: 'INR', status: 'PROCESSED', note, processedAt: now };
+  const paymentFilter = paymentStatus === 'Refunded'
+    ? { $and: [
+      { _id: order._id, paymentStatus: order.paymentStatus },
+      revisionFilter(expectedRevision),
+      Number(order.refundedAmount || 0) === 0 ? { $or: [{ refundedAmount: 0 }, { refundedAmount: { $exists: false } }] } : { refundedAmount: Number(order.refundedAmount) },
+    ] }
+    : { _id: order._id, paymentStatus: order.paymentStatus, ...revisionFilter(expectedRevision) };
+  const updated = await Order.findOneAndUpdate(andFilter(paymentFilter, req.tenantFilter), mutation, { new: true }).select('+paymentEvents');
+  if (!updated) throw new ApiError('ORDER_CHANGED', 'This order changed in another session. Reload it before continuing.', { statusCode: 409 });
+  logAudit({ req, action: paymentStatus === 'Paid' ? 'COD_PAYMENT_COLLECTED' : 'COD_REFUND_RECORDED', entityType: 'Order', entityId: updated._id, storeId: updated.storeId, before: { paymentStatus: order.paymentStatus, paymentState: order.paymentState, refundedAmount: order.refundedAmount || 0 }, after: { paymentStatus: resultingPaymentStatus, paymentState, refundedAmount: updated.refundedAmount || 0, refundAmount, reference }, summary: note });
+  res.json(decorateOrder(updated, { canRecordRefund: paymentStatus === 'Refunded' && resultingPaymentStatus === 'Paid' }));
 });
 
 /**
@@ -324,8 +486,9 @@ exports.deleteOrder = asyncHandler(async (req, res) => {
   if (order.orderStatus === 'Cancelled') {
     return res.json({ success: true, message: 'Order is already cancelled', order });
   }
-
-  const cancelled = await cancelOrderInternal(order, { req, actor: req.user, note: 'Cancelled by admin', force: true });
+  const shipment = await require('../models/Shipment').findOne({ order: order._id });
+  if (!canCancelOrder(order, shipment)) throw new ApiError('ORDER_NOT_CANCELLABLE', 'This order is already with the courier or completed. Use the return/RTO workflow instead.');
+  const cancelled = await cancelOrderInternal(order, { req, actor: req.user, note: 'Cancelled by staff' });
   res.json({ success: true, message: 'Order cancelled', order: cancelled });
 });
 
@@ -346,25 +509,24 @@ exports.cancelOrder = asyncHandler(async (req, res) => {
  * Stock restore and coupon release are each claimed with a conditional update,
  * so calling this twice cannot restock twice or hand back two redemptions.
  *
- * `force` widens the allowed source states for admins (for example cancelling
- * an order that already shipped). A delivered order is never cancellable in
- * either mode: the goods are with the customer, which is a return, not a
- * cancellation, and restocking there would invent inventory.
+ * A parcel that has left the store is handled through RTO/return workflows;
+ * cancellation never restores stock after carrier handoff.
  */
-async function cancelOrderInternal(order, { req, actor, note, force = false, source }) {
+async function cancelOrderInternal(order, { req, actor, note, source, expectedRevision }) {
   const delivery = require('../services/deliveryService');
   return delivery.withOrderLock(order._id, async freshOrder => {
+    if (expectedRevision !== undefined && Number(freshOrder.revision || 0) !== Number(expectedRevision)) {
+      throw new ApiError('ORDER_CHANGED', 'This order changed in another session. Reload it before continuing.', { statusCode: 409 });
+    }
     await delivery.cancelBooking(freshOrder);
-    return cancelAfterCourier(freshOrder, { req, actor, note, force, source });
+    return cancelAfterCourier(freshOrder, { req, actor, note, source, expectedRevision });
   });
 }
 
-async function cancelAfterCourier(order, { req, actor, note, force = false, source }) {
+async function cancelAfterCourier(order, { req, actor, note, source, expectedRevision }) {
   if (order.orderStatus === 'Cancelled') return order;
 
-  const allowed = force
-    ? ORDER_STATUSES.filter((status) => !['Delivered', 'Cancelled', 'Returned', 'Refunded'].includes(status))
-    : CANCELLABLE_STATUSES;
+  const allowed = CANCELLABLE_STATUSES;
 
   if (!allowed.includes(order.orderStatus)) {
     throw new ApiError('ORDER_NOT_CANCELLABLE', `An order that is already ${order.orderStatus.toLowerCase()} cannot be cancelled`);
@@ -392,14 +554,20 @@ async function cancelAfterCourier(order, { req, actor, note, force = false, sour
     }
 
     const updated = await Order.findOneAndUpdate(
-      { _id: order._id, orderStatus: { $ne: 'Cancelled' } },
+      { _id: order._id, orderStatus: { $ne: 'Cancelled' }, ...(expectedRevision === undefined ? {} : revisionFilter(expectedRevision)) },
       {
-        $set: { orderStatus: 'Cancelled' },
+        $set: { orderStatus: 'Cancelled', ...(order.paymentMethod === 'COD' && order.codConfirmationStatus === 'PENDING' ? { codConfirmationStatus: 'CANCELLED' } : {}) },
+        $inc: { revision: 1 },
         $push: { statusTimeline: { status: 'Cancelled', date: new Date(), note } },
       },
       { new: true, session },
     );
 
+    if (!updated && expectedRevision !== undefined) {
+      const current = await Order.findById(order._id).session(session || null);
+      if (current?.orderStatus !== 'Cancelled') throw new ApiError('ORDER_CHANGED', 'This order changed in another session. Reload it before continuing.', { statusCode: 409 });
+      return { changed: false, order: current };
+    }
     return { changed: Boolean(updated), order: updated || await Order.findById(order._id).session(session || null) };
   }).then((result) => {
     if (result.changed) logAudit({ req: req || { user: actor }, source, action: 'ORDER_CANCEL', entityType: 'Order', entityId: order._id, before: { orderStatus: order.orderStatus }, after: { orderStatus: 'Cancelled' }, storeId: order.storeId });
@@ -456,6 +624,8 @@ async function buildReceipt(order) {
     razorpayOrderId: order.razorpayOrderId,
     razorpayPaymentId: order.razorpayPaymentId,
     paymentFailureReason: order.paymentFailureReason,
+    refundedAmount: order.refundedAmount || 0,
+    refunds: order.refunds || [],
     invoiceNumber: order.invoiceNumber,
     invoiceDate: order.invoiceDate,
     billingAddress: order.billingAddress,

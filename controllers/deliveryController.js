@@ -43,7 +43,7 @@ exports.details = asyncHandler(async (req, res) => {
   if (!returnRequest && req.query.refresh === '1') data.order = await Order.findById(order._id).select('orderStatus statusTimeline deliveredAt').lean();
   if (admin) Object.assign(data, { readiness: getShippingProvider(booking?.provider || settings.shippingProvider || 'manual'), selectedProvider: getShippingProvider(settings.shippingProvider || 'manual'), providers: getShippingProviders(settings.shippingProvider || 'manual'), parcel, pickupAddress: settings.shippingPickup, reverse: !!returnRequest });
   else if (data.shipment) {
-    for (const key of ['operation', 'operationStartedAt', 'lastError', 'providerCharge', 'providerRef', 'service', 'pickup']) delete data.shipment[key];
+    for (const key of ['operation', 'operationStartedAt', 'lastError', 'providerCharge', 'providerRef', 'service', 'pickup', 'exceptionActions']) delete data.shipment[key];
   }
   res.set('Cache-Control', 'private, no-store').json(data);
 });
@@ -51,10 +51,11 @@ exports.action = asyncHandler(async (req, res) => {
   const { order, returnRequest, admin } = await context(req);
   if (!admin) throw forbidden();
   const action = req.params.action;
-  if (!['book', 'pickup', 'cancel', 'reconcile'].includes(action)) throw new ApiError('VALIDATION_ERROR', 'Unsupported delivery action');
+  if (!['book', 'pickup', 'cancel', 'exception', 'reconcile'].includes(action)) throw new ApiError('VALIDATION_ERROR', 'Unsupported delivery action');
   const shipment = action === 'book' ? await delivery.createBooking(order, req.body || {}, returnRequest)
     : action === 'pickup' ? await delivery.schedulePickup(order, req.body || {}, returnRequest)
       : action === 'cancel' ? await delivery.withOrderLock(order._id, () => delivery.cancelBooking(order, returnRequest))
+        : action === 'exception' ? await delivery.recordExceptionAction(order, req.body || {}, returnRequest, req.user)
         : await delivery.reconcile(order, req.body || {}, returnRequest);
   logAudit({ req, action: `SHIPPING_${action.toUpperCase()}`, entityType: returnRequest ? 'ReturnExchange' : 'Order', entityId: returnRequest?._id || order._id, storeId: order.storeId, after: { shipmentId: shipment?._id, awb: shipment?.awb, status: shipment?.status, provider: shipment?.provider } });
   res.json({ shipment });

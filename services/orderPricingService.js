@@ -1,4 +1,5 @@
 const Product = require('../models/Product');
+const Category = require('../models/Category');
 const { ApiError } = require('../utils/apiError');
 const { getPrimaryImageUrl } = require('../utils/imageUtils');
 const couponService = require('./couponService');
@@ -21,6 +22,7 @@ const {
 } = require('./paymentSettingsService');
 const { requireObjectId, requireQuantity } = require('../utils/validators');
 const { andFilter, defaultStoreFilter } = require('./storeService');
+const { productAvailableForSale } = require('./productPricingService');
 
 /**
  * Authoritative order pricing.
@@ -58,7 +60,7 @@ async function loadOrderItems(orderItems, { tenantFilter = {} } = {}) {
 
     const product = await Product.findOne(andFilter({ _id: productId }, tenantFilter));
     if (!product) throw new ApiError('NOT_FOUND', `${raw.name || 'A product'} is no longer available`);
-    if (product.isActive === false || product.isArchived) throw new ApiError('OUT_OF_STOCK', `${product.name} is no longer available`);
+    if (!productAvailableForSale(product)) throw new ApiError('OUT_OF_STOCK', `${product.name} is not available for sale yet`);
 
     const variant = requireVariant(product, {
       variantId: raw.variantId,
@@ -79,13 +81,15 @@ async function loadOrderItems(orderItems, { tenantFilter = {} } = {}) {
       );
     }
 
-    const unitPrice = variant ? variantUnitPrice(product, variant) : Number(product.price || 0);
-    const unitMRP = variant ? variantUnitMrp(product, variant) : Number(product.originalPrice || product.price || 0);
+    const unitPrice = variantUnitPrice(product, variant);
+    const unitMRP = variantUnitMrp(product, variant);
     totalMRP += unitMRP * quantity;
     sellingTotal += unitPrice * quantity;
 
     items.push({
       product: product._id,
+      category: product.category || undefined,
+      categoryName: '',
       name: product.name,
       productName: product.name,
       sku: variant ? variantSku(product, variant) : product.sku,
@@ -103,6 +107,13 @@ async function loadOrderItems(orderItems, { tenantFilter = {} } = {}) {
       storeId: product.storeId || null,
       shippingWeightKg: Number(product.shippingWeightKg || 0),
     });
+  }
+
+  const categoryIds = [...new Set(items.map((item) => String(item.category || '')).filter(Boolean))];
+  if (categoryIds.length) {
+    const categories = await Category.find(andFilter({ _id: { $in: categoryIds } }, tenantFilter)).select('name').lean();
+    const names = new Map(categories.map((category) => [String(category._id), category.name]));
+    for (const item of items) item.categoryName = names.get(String(item.category || '')) || '';
   }
 
   const storeKeys = new Set(items.map((item) => String(item.storeId || '')));

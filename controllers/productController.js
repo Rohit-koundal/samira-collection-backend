@@ -7,15 +7,16 @@ const slugify = require('../utils/slugify');
 const mongoose = require('mongoose');
 const { normalizeProductImages, normalizeProductPayload, sanitizeProductImages } = require('../utils/imageUtils');
 const { deleteImageFromR2, isR2Configured } = require('../services/r2Upload');
-const { hasManagedVariants, normalizeVariantsPayload, totalVariantStock } = require('../services/variantService');
+const { hasManagedVariants, normalizeVariantsPayload, totalVariantStock, validateVariantPayload } = require('../services/variantService');
 const { andFilter } = require('../services/storeService');
 const { assertStoreOwned } = require('../middleware/storeMiddleware');
 const { logAudit } = require('../services/auditService');
 const { auditSnapshot } = require('../utils/auditData');
-const PRODUCT_AUDIT_FIELDS = ['name', 'sku', 'slug', 'brand', 'category', 'subCategory', 'price', 'originalPrice', 'costPrice', 'gstRate', 'hsnCode', 'barcode', 'stock', 'lowStockAlert', 'reorderQuantity', 'shippingWeightKg', 'packageDimensions', 'countryOfOrigin', 'manufacturerDetails', 'warranty', 'supplierName', 'supplierSku', 'restockAt', 'publishAt', 'saleStartAt', 'saleEndAt', 'isActive', 'isArchived', 'isFeatured', 'isBestSeller', 'isNewArrival', 'showOnHomepage', 'showInTrending', 'showInFestive', 'sizes', 'colors', 'fabric', 'occasion', 'description', 'shortDescription', 'variants', 'variantGroupId', 'sizingMode', 'sizeChartProfile', 'sizeChart', 'sizeFitNotes', 'attributeValues', 'specifications', 'highlights', 'careInstructions', 'returnPolicy', 'tags'];
+const PRODUCT_AUDIT_FIELDS = ['name', 'sku', 'slug', 'brand', 'category', 'subCategory', 'price', 'originalPrice', 'salePrice', 'costPrice', 'gstRate', 'hsnCode', 'barcode', 'stock', 'lowStockAlert', 'reorderQuantity', 'shippingWeightKg', 'packageDimensions', 'countryOfOrigin', 'manufacturerDetails', 'warranty', 'supplierName', 'supplierSku', 'restockAt', 'publishAt', 'saleStartAt', 'saleEndAt', 'isActive', 'isArchived', 'isFeatured', 'isBestSeller', 'isNewArrival', 'showOnHomepage', 'showInTrending', 'showInFestive', 'sizes', 'colors', 'fabric', 'occasion', 'description', 'shortDescription', 'variants', 'variantGroupId', 'sizingMode', 'sizeChartProfile', 'sizeChart', 'sizeFitNotes', 'attributeValues', 'specifications', 'highlights', 'careInstructions', 'returnPolicy', 'tags'];
 const { analyzeQuickAddImage, getQuickAddVisionStatus } = require('../services/quickAddVision.service');
 const { wantsPagination, readPagination, buildPaginatedResponse } = require('../utils/validators');
 const { normalizeProductSizing, validateProductSizing } = require('../services/productSizingService');
+const { applyEffectivePricing } = require('../services/productPricingService');
 
 function catalogQuery(req, extra = {}) {
   return andFilter(extra, req.tenantFilter);
@@ -28,21 +29,24 @@ function withStoreId(payload, req) {
   return next;
 }
 
-async function getCategoryName(categoryId) {
+async function getCategoryName(categoryId, req) {
   if (!categoryId || !mongoose.Types.ObjectId.isValid(categoryId)) return '';
-  const category = await Category.findById(categoryId).select('name').lean();
+  const category = await Category.findOne(andFilter({ _id: categoryId, isArchived: { $ne: true } }, req?.tenantFilter)).select('name').lean();
   return category?.name || '';
 }
 
 function normalizeProductResponse(product, req) {
-  const data = normalizeProductImages(product, req);
+  const baseUrl = String(req?.baseUrl || '');
+  const isPrivateCatalog = baseUrl.startsWith('/api/admin/products') || baseUrl.startsWith('/api/seller');
+  const data = normalizeProductImages(isPrivateCatalog ? product : applyEffectivePricing(product), req);
   if (data.attributeValues instanceof Map) data.attributeValues = Object.fromEntries(data.attributeValues);
   return normalizeProductSizing(data, data.category?.name || '');
 }
 
 exports.getProducts = asyncHandler(async (req, res) => {
-  const isAdminRequest = String(req.baseUrl || '').startsWith('/api/admin/products')
-    || String(req.baseUrl || '').startsWith('/api/seller/products');
+  const baseUrl = String(req.baseUrl || '');
+  const isAdminRequest = baseUrl.startsWith('/api/admin/products')
+    || baseUrl.startsWith('/api/seller');
   const archiveMode = String(req.query.archive || '').toLowerCase();
   const archiveFilter = archiveMode === 'only'
     ? { isArchived: true }
@@ -81,6 +85,7 @@ exports.getProducts = asyncHandler(async (req, res) => {
       const category = await Category.findOne(andFilter({
         $or: [
           { slug: req.query.category },
+          { previousSlugs: req.query.category },
           { name: { $regex: `^${escapeRegex(req.query.category)}$`, $options: 'i' } },
         ],
       }, req.tenantFilter));
@@ -140,6 +145,16 @@ exports.getProducts = asyncHandler(async (req, res) => {
   }
   const products = await Product.find(query).populate('category').sort(sort);
   res.json(products.map((product) => normalizeProductResponse(product, req)));
+});
+
+exports.checkDuplicates = asyncHandler(async (req, res) => {
+  const name = String(req.query.name || '').trim().slice(0, 160);
+  const sku = String(req.query.sku || '').trim().slice(0, 100);
+  const barcode = String(req.query.barcode || '').trim().slice(0, 100);
+  const excludeId = mongoose.Types.ObjectId.isValid(req.query.excludeId) ? req.query.excludeId : null;
+  if (!name && !sku && !barcode) return res.json({ hasConflict: false, conflicts: [] });
+  const conflicts = await findProductConflicts(req, { name, sku, barcode, excludeId });
+  res.json({ hasConflict: conflicts.some((item) => item.blocking), conflicts });
 });
 
 async function getCatalogSummary(req) {
@@ -226,7 +241,12 @@ exports.analyzeQuickAdd = async (req, res) => {
 
 exports.createProduct = asyncHandler(async (req, res) => {
   const basePayload = await applyProductStructure(withStoreId({ ...req.body, images: sanitizeProductImages(req.body.images) }, req));
-  const categoryName = await getCategoryName(basePayload.category);
+  const categoryName = await getCategoryName(basePayload.category, req);
+  if (basePayload.category && !categoryName) return res.status(400).json({ message: 'Choose a category from this store' });
+  const variantError = validateVariantPayload(basePayload.variants);
+  if (variantError) return res.status(400).json({ message: variantError });
+  const identityError = await validateUniqueProductIdentity(req, basePayload);
+  if (identityError) return res.status(409).json({ message: identityError });
   const payload = applyVariantPayload(normalizeProductSizing(basePayload, categoryName));
   const error = validateProduct(payload);
   if (error) return res.status(400).json({ message: error });
@@ -242,11 +262,20 @@ exports.updateProduct = asyncHandler(async (req, res) => {
   if (!existingProduct) return res.status(404).json({ message: 'Product not found' });
   assertStoreOwned(existingProduct, req);
   const basePayload = await applyProductStructure(withStoreId({ ...req.body, images: sanitizeProductImages(req.body.images) }, req), existingProduct);
-  const categoryName = await getCategoryName(basePayload.category || existingProduct.category);
+  if (basePayload.price !== undefined && basePayload.originalPrice === undefined && Number(basePayload.price) > Number(existingProduct.originalPrice || 0)) {
+    basePayload.originalPrice = basePayload.price;
+  }
+  const categoryName = await getCategoryName(basePayload.category || existingProduct.category, req);
+  if ((basePayload.category || existingProduct.category) && !categoryName) return res.status(400).json({ message: 'Choose a category from this store' });
+  const variantError = validateVariantPayload(basePayload.variants);
+  if (variantError) return res.status(400).json({ message: variantError });
+  const identityError = await validateUniqueProductIdentity(req, basePayload, existingProduct._id);
+  if (identityError) return res.status(409).json({ message: identityError });
   const payload = applyVariantPayload(normalizeProductSizing(basePayload, categoryName));
-  const error = validateProduct(payload, false);
+  const validationPayload = { ...existingProduct.toObject(), ...payload };
+  const error = validateProduct(validationPayload, false);
   if (error) return res.status(400).json({ message: error });
-  const sizingError = validateProductSizing(payload, categoryName);
+  const sizingError = validateProductSizing(validationPayload, categoryName);
   if (sizingError) return res.status(400).json({ message: sizingError });
   const nextImages = Array.isArray(payload.images) && payload.images.length ? payload.images : existingProduct.images || [];
   const product = await Product.findByIdAndUpdate(
@@ -530,16 +559,24 @@ function validateProduct(data, creating = true) {
   if (!data.name || data.name.trim().length < 3) return 'Product name must be at least 3 characters';
   if (!data.sku) return 'SKU is required';
   if (creating && !data.category) return 'Category is required';
-  if (Number(data.originalPrice) <= 0) return 'Original price is required';
-  if (Number(data.price) <= 0) return 'Selling price is required';
+  if (!Number.isFinite(Number(data.originalPrice)) || Number(data.originalPrice) <= 0) return 'Original price is required';
+  if (!Number.isFinite(Number(data.price)) || Number(data.price) <= 0) return 'Selling price is required';
   if (Number(data.price) > Number(data.originalPrice)) return 'Selling price cannot exceed original price';
-  if (Number(data.stock) < 0) return 'Stock cannot be negative';
+  if (!Number.isSafeInteger(Number(data.stock)) || Number(data.stock) < 0) return 'Stock must be a whole number of zero or more';
+  if (data.lowStockAlert !== undefined && (!Number.isSafeInteger(Number(data.lowStockAlert)) || Number(data.lowStockAlert) < 0)) return 'Low-stock alert must be a whole number of zero or more';
   if (data.costPrice !== undefined && (!Number.isFinite(Number(data.costPrice)) || Number(data.costPrice) < 0)) return 'Cost price must be zero or more';
   if (data.gstRate !== undefined && (!Number.isFinite(Number(data.gstRate)) || Number(data.gstRate) < 0 || Number(data.gstRate) > 100)) return 'GST rate must be between 0 and 100';
   if (data.reorderQuantity !== undefined && (!Number.isSafeInteger(Number(data.reorderQuantity)) || Number(data.reorderQuantity) < 0)) return 'Reorder quantity must be a whole number of zero or more';
   if (data.shippingWeightKg !== undefined && (!Number.isFinite(Number(data.shippingWeightKg)) || Number(data.shippingWeightKg) < 0 || Number(data.shippingWeightKg) > 1000)) return 'Packed unit weight must be between 0 and 1000 kg';
   if (data.packageDimensions && ['lengthCm', 'widthCm', 'heightCm'].some((field) => !Number.isFinite(Number(data.packageDimensions[field] || 0)) || Number(data.packageDimensions[field] || 0) < 0 || Number(data.packageDimensions[field] || 0) > 1000)) return 'Package dimensions must be between 0 and 1000 cm';
+  for (const key of ['restockAt', 'publishAt', 'saleStartAt', 'saleEndAt']) if (data[key] && Number.isNaN(new Date(data[key]).getTime())) return 'Choose valid product schedule dates';
   if (data.saleStartAt && data.saleEndAt && new Date(data.saleStartAt) >= new Date(data.saleEndAt)) return 'Sale end must be after sale start';
+  const hasSaleSchedule = Number(data.salePrice) > 0;
+  if (hasSaleSchedule) {
+    if (!Number.isFinite(Number(data.salePrice)) || Number(data.salePrice) <= 0) return 'Scheduled sale price is required';
+    if (Number(data.salePrice) >= Number(data.price)) return 'Scheduled sale price must be lower than the regular selling price';
+    if (!data.saleStartAt || !data.saleEndAt) return 'Choose both sale start and sale end';
+  }
   if (creating && (!Array.isArray(data.images) || !data.images.length)) return 'At least one product image is required';
   if (Array.isArray(data.images) && data.images.some((image) => image.url?.startsWith('data:'))) return 'Images must be uploaded files or valid URLs, not base64 data';
   if (Array.isArray(data.images) && data.images.some((image) => image?.url && !image.url.startsWith('http') && !image.url.startsWith('/uploads/'))) {
@@ -549,6 +586,39 @@ function validateProduct(data, creating = true) {
     return 'Image URLs must be publicly accessible. Please re-upload images before saving.';
   }
   return '';
+}
+
+async function validateUniqueProductIdentity(req, payload = {}, excludeId) {
+  const conflicts = await findProductConflicts(req, {
+    sku: String(payload.sku || '').trim(),
+    barcode: String(payload.barcode || '').trim(),
+    excludeId,
+  });
+  const skuConflict = conflicts.find((item) => item.reason === 'SKU');
+  if (skuConflict) return `SKU is already used by ${skuConflict.name}`;
+  const barcodeConflict = conflicts.find((item) => item.reason === 'Barcode');
+  if (barcodeConflict) return `Barcode is already used by ${barcodeConflict.name}`;
+  return '';
+}
+
+async function findProductConflicts(req, { name = '', sku = '', barcode = '', excludeId = null } = {}) {
+  const base = { isArchived: { $ne: true }, ...(excludeId ? { _id: { $ne: excludeId } } : {}) };
+  const checks = [];
+  if (sku) checks.push(['SKU', Product.findOne(catalogQuery(req, { ...base, sku: { $regex: `^${escapeRegex(sku)}$`, $options: 'i' } })).select('_id name sku barcode').lean()]);
+  if (barcode) checks.push(['Barcode', Product.findOne(catalogQuery(req, { ...base, barcode })).select('_id name sku barcode').lean()]);
+  if (name.length >= 3) checks.push(['Name', Product.findOne(catalogQuery(req, { ...base, name: { $regex: `^${escapeRegex(name)}$`, $options: 'i' } })).select('_id name sku barcode').lean()]);
+  const resolved = await Promise.all(checks.map(async ([reason, query]) => [reason, await query]));
+  const rows = new Map();
+  for (const [reason, product] of resolved) {
+    if (!product) continue;
+    const key = String(product._id);
+    const current = rows.get(key) || { id: key, name: product.name, sku: product.sku || '', barcode: product.barcode || '', reasons: [], blocking: false };
+    current.reasons.push(reason);
+    current.reason = current.reason || reason;
+    if (reason !== 'Name') current.blocking = true;
+    rows.set(key, current);
+  }
+  return [...rows.values()];
 }
 
 function isInaccessibleImageUrl(url = '') {

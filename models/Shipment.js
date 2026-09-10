@@ -36,13 +36,23 @@ const shipmentSchema = new mongoose.Schema({
   providerStatus: String,
   providerStatusAt: Date,
   expectedDeliveryAt: Date,
+  exceptionActions: { type: [{
+    action: { type: String, enum: ['CONTACTED_CUSTOMER', 'CONFIRMED_ADDRESS', 'REQUESTED_REDELIVERY', 'REQUESTED_RTO', 'OTHER'] },
+    note: { type: String, maxlength: 500 },
+    reference: { type: String, maxlength: 120 },
+    actor: { id: String, name: String },
+    date: { type: Date, default: Date.now },
+  }], select: false },
   labelPdf: { type: Buffer, select: false },
   labelAvailable: { type: Boolean, default: false },
   providerCharge: Number,
 }, { timestamps: true });
 
 shipmentSchema.plugin(storeIdPlugin);
-shipmentSchema.index({ storeId: 1, awb: 1 }, { sparse: true });
+shipmentSchema.index(
+  { storeId: 1, provider: 1, awb: 1 },
+  { unique: true, partialFilterExpression: { awb: { $type: 'string', $gt: '' } } },
+);
 shipmentSchema.index({ storeId: 1, createdAt: -1 });
 
 module.exports = mongoose.model('Shipment', shipmentSchema);

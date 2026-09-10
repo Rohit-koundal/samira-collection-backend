@@ -52,6 +52,16 @@ const storeSchema = new mongoose.Schema({
   },
   industryLocked: { type: Boolean, default: true },
   industryRevision: { type: Number, default: 0, min: 0 },
+  customerRules: {
+    vipSpend: { type: Number, min: 0, default: 10000 },
+    repeatOrders: { type: Number, min: 2, max: 100, default: 2 },
+    inactiveDays: { type: Number, min: 30, max: 730, default: 90 },
+    frequentReturnCount: { type: Number, min: 1, max: 100, default: 2 },
+    highRtoMinimumOrders: { type: Number, min: 1, max: 100, default: 2 },
+    highRtoRate: { type: Number, min: 0.05, max: 1, default: 0.4 },
+    highValueCart: { type: Number, min: 0, default: 5000 },
+    newCustomerDays: { type: Number, min: 1, max: 180, default: 30 },
+  },
   plan: { type: String, enum: PLAN_IDS, default: 'BASIC', index: true },
   license: {
     status: { type: String, enum: LICENSE_STATUSES, default: 'TRIAL' },

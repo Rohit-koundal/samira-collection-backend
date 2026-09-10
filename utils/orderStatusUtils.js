@@ -26,6 +26,7 @@ async function syncPaidOnlineOrderStatus(order) {
   }
 
   order.statusTimeline = timeline;
+  order.revision = Number(order.revision || 0) + 1;
   await order.save();
   return order;
 }

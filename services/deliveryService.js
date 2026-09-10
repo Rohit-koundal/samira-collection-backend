@@ -9,9 +9,10 @@ const { packageForItems, deliveryPrice, pickupAddress, pickupSlot } = require('.
 const { ApiError } = require('../utils/apiError');
 const { notifyLater } = require('./notificationService');
 
-const privateFields = '+pickupAddress +destination';
+const privateFields = '+pickupAddress +destination +exceptionActions';
 const conflict = message => new ApiError('DUPLICATE_REQUEST', message);
 const terminal = ['DELIVERED', 'CANCELLED', 'RETURNED'];
+const EXCEPTION_ACTIONS = ['CONTACTED_CUSTOMER', 'CONFIRMED_ADDRESS', 'REQUESTED_REDELIVERY', 'REQUESTED_RTO', 'OTHER'];
 async function assertCarrierStore(storeId, settings) {
   if (!storeId) return;
   const accountStore = settings.storeId || (await require('../models/Store').findOne({ isDefault: true }).select('_id').lean())?._id;
@@ -157,6 +158,29 @@ async function cancelBooking(order, returnRequest) {
   await booking.save();
   return publicShipment(booking);
 }
+async function recordExceptionAction(order, body, returnRequest, actor) {
+  return withOrderLock(order._id, async () => {
+    const booking = await findBooking(order, returnRequest);
+    if (!booking || !['EXCEPTION', 'FAILED'].includes(booking.status)) throw new ApiError('SHIPPING_VALIDATION', 'This shipment does not currently have an open delivery exception. Refresh tracking first.');
+    const action = String(body.action || '').trim().toUpperCase();
+    const note = String(body.note || '').trim();
+    const reference = String(body.reference || '').trim();
+    if (!EXCEPTION_ACTIONS.includes(action)) throw new ApiError('VALIDATION_ERROR', 'Choose a valid delivery exception follow-up.');
+    if (note.length < 3 || note.length > 500) throw new ApiError('VALIDATION_ERROR', 'Add a delivery follow-up note between 3 and 500 characters.');
+    if (reference.length > 120) throw new ApiError('VALIDATION_ERROR', 'Courier reference must be 120 characters or fewer.');
+    const entry = {
+      action,
+      note,
+      reference,
+      actor: { id: String(actor?._id || ''), name: String(actor?.name || actor?.phone || 'Staff').slice(0, 100) },
+      date: new Date(),
+    };
+    booking.exceptionActions.push(entry);
+    booking.events.push({ status: booking.status, note: `Delivery issue follow-up recorded: ${action.replaceAll('_', ' ').toLowerCase()}.`, date: entry.date });
+    await booking.save();
+    return publicShipment(booking);
+  });
+}
 async function reconcile(order, body, returnRequest) {
   return withOrderLock(order._id, async () => {
     const booking = await findBooking(order, returnRequest);
@@ -215,7 +239,7 @@ async function syncBooking(booking, Model = Shipment) {
     await leased.save();
     if (!leased.returnRequest && leased.environment === 'production') {
       const mapped = { PICKED_UP: 'Shipped', SHIPPED: 'Shipped', IN_TRANSIT: 'Shipped', OUT_FOR_DELIVERY: 'Out for Delivery', DELIVERED: 'Delivered' }[leased.status];
-      const prior = mapped && await Order.findOneAndUpdate({ _id: leased.order, orderStatus: { $in: mapped === 'Shipped' ? ['Pending', 'Confirmed', 'Packed'] : mapped === 'Out for Delivery' ? ['Pending', 'Confirmed', 'Packed', 'Shipped'] : ['Pending', 'Confirmed', 'Packed', 'Shipped', 'Out for Delivery'] } }, { $set: { orderStatus: mapped, ...(mapped === 'Delivered' ? { deliveredAt: tracked.providerStatusAt || now } : {}) }, $push: { statusTimeline: { status: mapped, note: `Confirmed by ${leased.courierName || providerLabel(leased.provider)} tracking`, date: tracked.providerStatusAt || now } } }, { new: false });
+      const prior = mapped && await Order.findOneAndUpdate({ _id: leased.order, orderStatus: { $in: mapped === 'Shipped' ? ['Pending', 'Confirmed', 'Packed'] : mapped === 'Out for Delivery' ? ['Pending', 'Confirmed', 'Packed', 'Shipped'] : ['Pending', 'Confirmed', 'Packed', 'Shipped', 'Out for Delivery'] } }, { $set: { orderStatus: mapped, ...(mapped === 'Delivered' ? { deliveredAt: tracked.providerStatusAt || now } : {}) }, $inc: { revision: 1 }, $push: { statusTimeline: { status: mapped, note: `Confirmed by ${leased.courierName || providerLabel(leased.provider)} tracking`, date: tracked.providerStatusAt || now } } }, { new: false });
       if (prior) notifyLater({ userId: prior.user, storeId: prior.storeId, event: mapped === 'Delivered' ? 'ORDER_DELIVERED' : mapped === 'Out for Delivery' ? 'ORDER_OUT_FOR_DELIVERY' : 'ORDER_SHIPPED', title: `Order ${mapped.toLowerCase()}`, message: `${leased.courierName || providerLabel(leased.provider)}: ${tracked.providerStatus}`, metadata: { orderId: String(prior._id), shipmentId: String(leased._id) } });
     }
     // COD payment, refunds, reverse inspection and inventory are deliberately
@@ -242,4 +266,4 @@ function startDeliveryWorker() {
   };
   worker = setInterval(tick, 60000); worker.unref();
 }
-module.exports = { checkoutShipping, createBooking, schedulePickup, cancelBooking, reconcile, syncBooking, findBooking, publicShipment, withOrderLock, startDeliveryWorker, assertBookable };
+module.exports = { checkoutShipping, createBooking, schedulePickup, cancelBooking, recordExceptionAction, reconcile, syncBooking, findBooking, publicShipment, withOrderLock, startDeliveryWorker, assertBookable };

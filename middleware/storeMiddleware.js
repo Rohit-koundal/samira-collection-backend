@@ -4,6 +4,7 @@ const { roleAllows } = require('../models/StoreMember');
 const { ApiError } = require('../utils/apiError');
 const { isPlatformAdmin, resolvePublicStore, resolveStoreFromHost } = require('../services/storeService');
 const { hasStoreFeature, planSummary, storeLimit } = require('../config/storePlans');
+const { isMasterOwner } = require('../config/masterOwner');
 
 function requestedStoreId(req) {
   return String(req.headers['x-store-id'] || req.query.storeId || '').trim();
@@ -64,6 +65,19 @@ async function requireStoreMember(req, res, next) {
     next();
   } catch (error) {
     next(error);
+  }
+}
+
+async function requireAdminCustomerStoreAccess(req, _res, next) {
+  try {
+    if (isMasterOwner(req.user) || req.isDefaultStore) return next();
+    const membership = await StoreMember.findOne({ store: req.store?._id, user: req.user?._id, status: 'ACTIVE' });
+    if (!membership) throw new ApiError('FORBIDDEN', 'You do not have access to this store’s customers');
+    req.storeMember = membership;
+    req.tenantFilter = { storeId: req.store._id };
+    return next();
+  } catch (error) {
+    return next(error);
   }
 }
 
@@ -149,6 +163,7 @@ module.exports = {
   assertStoreCanAcceptOrders,
   optionalResolveStore,
   platformAdminUnscoped,
+  requireAdminCustomerStoreAccess,
   requireStoreMember,
   requireStoreFeature,
   requireActiveStoreLicenseForWrites,

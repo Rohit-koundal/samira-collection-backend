@@ -174,6 +174,7 @@ async function ensureTenantIndexes() {
   const models = [
     { model: require('../models/Category'), legacy: ['slug_1'] },
     { model: require('../models/Product'), legacy: ['slug_1', 'sku_1'] },
+    { model: require('../models/VariantGroup'), legacy: ['slug_1'] },
     { model: require('../models/Cart'), legacy: ['user_1', 'sessionId_1'] },
     { model: require('../models/Subscriber'), legacy: ['email_1'] },
   ];

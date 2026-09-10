@@ -134,6 +134,7 @@ exports.createReturn = asyncHandler(async (req, res) => {
     date: new Date(),
     note: `${type} requested for ${orderedItem.name || 'item'}`,
   });
+  order.revision = Number(order.revision || 0) + 1;
   await order.save();
 
   recordEventLater({
@@ -179,6 +180,7 @@ exports.adminReturns = asyncHandler(async (req, res) => {
     Object.assign(extra, periodFilter(dashboardRange(req.query)));
   }
   if (req.query.id) extra._id = requireObjectId(req.query.id, 'return id');
+  if (req.query.orderId) extra.order = requireObjectId(req.query.orderId, 'order id');
   if (req.query.status) extra.status = requireEnum(req.query.status, RETURN_STATUSES, 'status');
   const search = optionalString(req.query.search, 'search', { max: 100 });
   if (search) {
@@ -271,6 +273,7 @@ exports.updateReturnStatus = asyncHandler(async (req, res) => {
     const requests = await withSession(ReturnExchange.find({ order: request.order }), session);
     order.orderStatus = returnOrderStatus(order, requests);
     order.statusTimeline.push({ status: order.orderStatus, date: new Date(), note: `${request.type === 'exchange' ? 'Exchange' : 'Return'} request marked ${status}` });
+    order.revision = Number(order.revision || 0) + 1;
     await order.save(session ? { session } : {});
   }
   return { request, changed: true };

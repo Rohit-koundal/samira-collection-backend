@@ -25,17 +25,96 @@ test('category create/read/update/hide/delete survives duplicate names and malfo
   const { token } = await createAdmin();
   const category = await call('POST', '/api/admin/categories', { name: 'Workflow Sarees', slug: 'workflow-sarees', image: '/uploads/category.jpg' }, token, 201);
   assert.equal((await get(`/api/admin/categories/${category._id}`, token)).name, 'Workflow Sarees');
-  await call('POST', '/api/admin/categories', { name: 'Workflow Sarees', slug: category.slug }, token, 400);
+  await call('POST', '/api/admin/categories', { name: 'Workflow Sarees', slug: category.slug }, token, 409);
   await call('GET', '/api/admin/categories/bad-id', undefined, token, 400);
   await call('PUT', `/api/admin/categories/${category._id}`, { name: '   ' }, token, 400);
   await call('PUT', `/api/admin/categories/${category._id}`, { name: 'Hidden Sarees', isActive: false }, token);
   assert.equal((await get('/api/admin/categories', token)).length, 1);
   assert.equal((await get('/api/categories?admin=true')).length, 0);
-  await call('PUT', `/api/admin/categories/${category._id}`, { isActive: true }, token);
+  await call('PATCH', `/api/admin/categories/${category._id}/status`, { isActive: true }, token);
   assert.equal((await get('/api/categories')).length, 1);
-  await call('DELETE', `/api/admin/categories/${category._id}`, undefined, token);
+  await call('PATCH', `/api/admin/categories/${category._id}/archive`, {}, token);
+  assert.equal((await get('/api/categories')).length, 0);
+  await call('DELETE', `/api/admin/categories/${category._id}?confirm=wrong`, undefined, token, 400);
+  await call('DELETE', `/api/admin/categories/${category._id}?confirm=Hidden%20Sarees`, undefined, token);
   assert.equal((await get('/api/admin/categories', token)).length, 0);
   await call('GET', `/api/admin/categories/${category._id}`, undefined, token, 404);
+});
+
+test('category dependencies are counted, protected and reassigned without deleting products', async () => {
+  const { token } = await createAdmin();
+  const source = await call('POST', '/api/admin/categories', { name: 'Occasion Wear' }, token, 201);
+  const target = await call('POST', '/api/admin/categories', { name: 'Festive Wear' }, token, 201);
+  const product = await call('POST', '/api/admin/products', {
+    name: 'Rose occasion saree', sku: 'CAT-SAFE-1', category: source._id,
+    price: 900, originalPrice: 1200, stock: 2, images: [{ url: '/uploads/saree.jpg', primary: true }],
+  }, token, 201);
+  const impact = await get(`/api/admin/categories/${source._id}/impact`, token);
+  assert.equal(impact.productCount, 1);
+  assert.equal(impact.canDelete, false);
+  await call('PATCH', `/api/admin/categories/${source._id}/archive`, {}, token);
+  await call('DELETE', `/api/admin/categories/${source._id}?confirm=Occasion%20Wear`, undefined, token, 409);
+  const moved = await call('POST', `/api/admin/categories/${source._id}/reassign`, { targetCategoryId: target._id }, token);
+  assert.equal(moved.moved.products, 1);
+  assert.equal(String((await Product.findById(product._id).lean()).category), String(target._id));
+  await call('DELETE', `/api/admin/categories/${source._id}?confirm=Occasion%20Wear`, undefined, token);
+  assert.ok(await Product.exists({ _id: product._id, category: target._id }));
+});
+
+test('category hierarchy prevents cycles and keeps child visibility consistent with its parent', async () => {
+  const { token } = await createAdmin();
+  const parent = await call('POST', '/api/admin/categories', { name: 'Clothing', image: '/uploads/clothing.jpg' }, token, 201);
+  const child = await call('POST', '/api/admin/categories', { name: 'Sarees', parent: parent._id, displayOrder: 7 }, token, 201);
+  assert.equal(child.level, 1);
+  assert.equal(String(child.parent), String(parent._id));
+  await call('PUT', `/api/admin/categories/${parent._id}`, { parent: child._id }, token, 400);
+  await call('PATCH', `/api/admin/categories/${parent._id}/status`, { isActive: false }, token);
+  assert.equal((await get(`/api/admin/categories/${child._id}`, token)).isActive, false);
+  await call('PATCH', `/api/admin/categories/${child._id}/status`, { isActive: true }, token, 400);
+  await call('PUT', `/api/admin/categories/${parent._id}`, { image: '', slug: 'Clothing & Fashion' }, token);
+  let updated = await get(`/api/admin/categories/${parent._id}`, token);
+  assert.equal(updated.image, '/uploads/clothing.jpg');
+  assert.equal(updated.slug, 'clothing-fashion');
+  assert.ok(updated.previousSlugs.includes('clothing'));
+  await call('PUT', `/api/admin/categories/${parent._id}`, { image: '', removeImage: true }, token);
+  updated = await get(`/api/admin/categories/${parent._id}`, token);
+  assert.equal(updated.image, '');
+});
+
+test('category partial edits preserve content and media until removal is explicitly requested', async () => {
+  const { token } = await createAdmin();
+  const category = await call('POST', '/api/admin/categories', {
+    name: 'Premium Sarees',
+    description: 'Original category description',
+    image: '/uploads/category-main.jpg',
+    socialImage: '/uploads/category-social.jpg',
+    metaTitle: 'Original SEO title',
+    metaDescription: 'Original SEO description',
+    displayOrder: 9,
+  }, token, 201);
+
+  await call('PUT', `/api/admin/categories/${category._id}`, { name: 'Premium Silk Sarees' }, token);
+  let updated = await get(`/api/admin/categories/${category._id}`, token);
+  assert.equal(updated.description, 'Original category description');
+  assert.equal(updated.image, '/uploads/category-main.jpg');
+  assert.equal(updated.socialImage, '/uploads/category-social.jpg');
+  assert.equal(updated.metaTitle, 'Original SEO title');
+  assert.equal(updated.metaDescription, 'Original SEO description');
+  assert.equal(updated.displayOrder, 9);
+
+  await call('PUT', `/api/admin/categories/${category._id}`, { image: '', socialImage: '' }, token);
+  updated = await get(`/api/admin/categories/${category._id}`, token);
+  assert.equal(updated.image, '/uploads/category-main.jpg');
+  assert.equal(updated.socialImage, '/uploads/category-social.jpg');
+
+  await call('PUT', `/api/admin/categories/${category._id}`, { image: '', removeImage: true }, token);
+  updated = await get(`/api/admin/categories/${category._id}`, token);
+  assert.equal(updated.image, '');
+  assert.equal(updated.socialImage, '/uploads/category-social.jpg');
+
+  await call('PUT', `/api/admin/categories/${category._id}`, { socialImage: '', removeSocialImage: true }, token);
+  updated = await get(`/api/admin/categories/${category._id}`, token);
+  assert.equal(updated.socialImage, '');
 });
 
 test('banner creation, visibility-only editing, reactivation and deletion retain campaign content', async () => {
@@ -58,24 +137,86 @@ test('variant-group CRUD preserves membership on metadata edits and safely trans
   const first = await createProduct(), second = await createProduct(), hidden = await createProduct({ isActive: false });
   const groupA = (await call('POST', '/api/admin/variant-groups', { name: 'Color Family', productIds: [String(first._id), String(second._id), String(hidden._id)], colors: ['Rose','Wine'], sizes: ['M','L'] }, token, 201)).data;
   const renamed = (await call('PUT', `/api/admin/variant-groups/${groupA._id}`, { name: 'Premium Color Family' }, token)).data;
-  assert.equal(renamed.products.length, 3); assert.deepEqual(renamed.colors, ['Rose','Wine']);
+  assert.equal(renamed.products.length, 3); assert.deepEqual(renamed.colors, ['Red','Rose','Wine']);
   assert.equal((await get(`/api/variant-groups/${groupA._id}`)).data.products.length, 2);
-  const groupB = (await call('POST', '/api/admin/variant-groups', { name: 'Second Family', productIds: [String(second._id)] }, token, 201)).data;
+  await call('POST', '/api/admin/variant-groups', { name: 'Second Family', productIds: [String(second._id)], isActive: false }, token, 409);
+  const groupB = (await call('POST', '/api/admin/variant-groups', { name: 'Second Family', productIds: [String(second._id)], isActive: false, confirmTransfers: true }, token, 201)).data;
   assert.equal((await VariantGroup.findById(groupA._id)).products.some(id => String(id) === String(second._id)), false);
   await call('POST', `/api/admin/variant-groups/${groupA._id}/remove-products`, { productIds: [String(second._id)] }, token);
   assert.equal(String((await Product.findById(second._id)).variantGroupId), String(groupB._id));
-  await call('POST', `/api/admin/variant-groups/${groupB._id}/add-products`, { productIds: [String(first._id)] }, token);
+  await call('POST', `/api/admin/variant-groups/${groupB._id}/add-products`, { productIds: [String(first._id)], confirmTransfers: true }, token);
   await call('POST', `/api/admin/variant-groups/${groupB._id}/remove-products`, { productIds: [String(first._id)] }, token);
   assert.equal((await Product.findById(first._id)).variantGroupId, undefined);
   await call('PUT', `/api/admin/variant-groups/${groupB._id}`, { isActive: false }, token);
   await call('GET', `/api/variant-groups/${groupB._id}`, undefined, undefined, 404);
   assert.equal((await get('/api/admin/variant-groups', token)).data.length, 2);
-  assert.equal((await get('/api/variant-groups')).data.length, 1);
+  assert.equal((await get('/api/variant-groups')).data.length, 0);
   await call('POST', '/api/admin/variant-groups', { name: 'Invalid', productIds: ['0123456789abcdef99999999'] }, token, 400);
   assert.equal(await VariantGroup.countDocuments({ name: 'Invalid' }), 0);
-  await call('DELETE', `/api/admin/variant-groups/${groupA._id}`, undefined, token);
-  await call('DELETE', `/api/admin/variant-groups/${groupB._id}`, undefined, token);
+  await call('PATCH', `/api/admin/variant-groups/${groupA._id}/archive`, {}, token);
+  await call('PATCH', `/api/admin/variant-groups/${groupB._id}/archive`, {}, token);
+  await call('DELETE', `/api/admin/variant-groups/${groupA._id}?confirm=${encodeURIComponent(renamed.name)}`, undefined, token);
+  await call('DELETE', `/api/admin/variant-groups/${groupB._id}?confirm=${encodeURIComponent(groupB.name)}`, undefined, token);
   assert.equal((await Product.findById(second._id)).variantGroupId, undefined);
+});
+
+test('variant families isolate stores, hide internal product data and reject stale edits', async () => {
+  const sellerA = await createProvisionedSeller('Variant Store Alpha');
+  const sellerB = await createProvisionedSeller('Variant Store Beta');
+  const storeAId = sellerA.store.id || sellerA.store._id;
+  const storeBId = sellerB.store.id || sellerB.store._id;
+  await Store.updateMany({ _id: { $in: [storeAId, storeBId] } }, { status: 'PUBLISHED', publishedAt: new Date() });
+  const first = await createProduct({ storeId: storeAId, name: 'Alpha Rose Phone', slug: 'alpha-rose-phone', sku: 'ALPHA-ROSE', colors: ['Rose'], costPrice: 400, supplierName: 'Private Supplier' });
+  const second = await createProduct({ storeId: storeAId, name: 'Alpha Black Phone', slug: 'alpha-black-phone', sku: 'ALPHA-BLACK', colors: ['Black'], publishAt: new Date(Date.now() + 86400000) });
+  const outsider = await createProduct({ storeId: storeBId, name: 'Beta Phone', slug: 'beta-phone', sku: 'BETA-PHONE', colors: ['Blue'] });
+  const headersA = { 'x-store-id': String(storeAId) };
+  const headersB = { 'x-store-id': String(storeBId) };
+  await call('POST', '/api/seller/variant-groups', {
+    name: 'Invalid one-choice family', baseProduct: String(first._id), productIds: [String(first._id), String(second._id)],
+    optionDefinitions: [{ key: 'color', label: 'Colour', displayType: 'swatch' }],
+    members: [
+      { product: String(first._id), optionValues: { color: 'Rose' }, isActive: true },
+      { product: String(second._id), optionValues: { color: 'Black' }, isActive: false },
+    ], isActive: true,
+  }, sellerA.token, 400, headersA);
+  const created = (await call('POST', '/api/seller/variant-groups', {
+    name: 'Alpha Phone Colours', baseProduct: String(first._id), productIds: [String(first._id), String(second._id)],
+    optionDefinitions: [{ key: 'color', label: 'Colour', displayType: 'swatch' }],
+    members: [
+      { product: String(first._id), optionValues: { color: 'Rose' }, swatch: '#d77b91' },
+      { product: String(second._id), optionValues: { color: 'Black' }, swatch: '#111111' },
+    ], isActive: true,
+  }, sellerA.token, 201, headersA)).data;
+  assert.equal(String((await VariantGroup.findById(created._id)).storeId), String(storeAId));
+  assert.equal((await call('GET', '/api/seller/variant-groups?page=1', undefined, sellerB.token, 200, headersB)).data.length, 0);
+  await call('GET', `/api/seller/variant-groups/${created._id}`, undefined, sellerB.token, 404, headersB);
+  await call('PUT', `/api/seller/variant-groups/${created._id}`, { ...created, productIds: [String(first._id), String(outsider._id)], baseRevision: created.revision }, sellerA.token, 400, headersA);
+
+  const publicFamily = (await get(`/api/variant-groups/${created._id}?store=${sellerA.store.slug}`)).data;
+  assert.equal(publicFamily.products.length, 1);
+  assert.equal(publicFamily.products[0].name, first.name);
+  assert.equal(JSON.stringify(publicFamily).includes('Private Supplier'), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(publicFamily.products[0], 'costPrice'), false);
+  await call('GET', `/api/variant-groups/${created._id}?store=${sellerB.store.slug}`, undefined, undefined, 404);
+
+  const renamed = (await call('PUT', `/api/seller/variant-groups/${created._id}`, {
+    name: 'Alpha Premium Colours', baseProduct: String(first._id), productIds: [String(first._id), String(second._id)],
+    optionDefinitions: created.optionDefinitions, members: created.members.map((member) => ({ product: member.productId, optionValues: member.optionValues, swatch: member.swatch })),
+    isActive: true, baseRevision: created.revision,
+  }, sellerA.token, 200, headersA)).data;
+  assert.equal((await Product.findById(first._id)).variantName, 'Rose');
+  await call('PUT', `/api/seller/variant-groups/${created._id}`, { name: 'Stale overwrite', baseRevision: created.revision }, sellerA.token, 409, headersA);
+  await call('DELETE', `/api/seller/variant-groups/${created._id}?confirm=${encodeURIComponent(renamed.name)}`, undefined, sellerA.token, 400, headersA);
+  await call('PATCH', `/api/seller/variant-groups/${created._id}/archive`, {}, sellerA.token, 200, headersA);
+  await call('GET', `/api/variant-groups/${created._id}?store=${sellerA.store.slug}`, undefined, undefined, 404);
+  await Product.updateOne({ _id: first._id }, { isArchived: true });
+  const restored = (await call('PATCH', `/api/seller/variant-groups/${created._id}/restore`, {}, sellerA.token, 200, headersA)).data;
+  assert.equal(String(restored.baseProduct._id), String(second._id));
+  assert.equal(restored.isActive, false);
+  await call('PATCH', `/api/seller/variant-groups/${created._id}/archive`, {}, sellerA.token, 200, headersA);
+  await call('DELETE', `/api/seller/variant-groups/${created._id}?confirm=wrong`, undefined, sellerA.token, 400, headersA);
+  await call('DELETE', `/api/seller/variant-groups/${created._id}?confirm=${encodeURIComponent(renamed.name)}`, undefined, sellerA.token, 200, headersA);
+  assert.ok(await Product.exists({ _id: first._id }));
 });
 
 test('customer journey logs in, edits addresses, purchases, follows fulfilment, reviews and returns the item', async () => {
@@ -108,7 +249,9 @@ test('customer journey logs in, edits addresses, purchases, follows fulfilment, 
   assert.equal(order.finalAmount, quote.totals.finalAmount);
   await call('POST', '/api/cart/remove-items', { itemIds: [bag.items[0]._id] }, token);
   await call('DELETE', `/api/wishlist/${product._id}`, undefined, token);
-  for (const orderStatus of ['Confirmed','Packed','Shipped','Out for Delivery','Delivered']) await call('PUT', `/api/admin/orders/${order._id}/status`, { orderStatus }, admin.token);
+  for (const orderStatus of ['Confirmed', 'Packed']) await call('PUT', `/api/admin/orders/${order._id}/status`, { orderStatus }, admin.token);
+  await call('PUT', `/api/admin/orders/${order._id}/shipment`, { courierName: 'Fixture Courier', trackingNumber: 'CUSTOMER-JOURNEY-001', trackingUrl: 'https://example.test/tracking/CUSTOMER-JOURNEY-001' }, admin.token);
+  for (const orderStatus of ['Shipped', 'Out for Delivery', 'Delivered']) await call('PUT', `/api/admin/orders/${order._id}/status`, { orderStatus }, admin.token);
   const detail = await get(`/api/orders/${order._id}`, token); assert.equal(detail.orderStatus, 'Delivered');
   assert.equal((await get('/api/orders/my-orders', token)).length, 1);
   assert.equal((await get(`/api/orders/${order._id}/receipt`, token)).finalAmount, order.finalAmount);
@@ -223,7 +366,8 @@ test('seller CRM, campaign analytics, manual shipment and reports agree with its
   assert.equal((await get('/api/seller/inventory/history', seller.token, headers)).items[0].type, 'SALE');
   assert.equal((await get('/api/seller/orders', seller.token, headers)).length, 1);
   assert.equal((await get(`/api/seller/orders/${order._id}`, seller.token, headers))._id, order._id);
-  const shipment = await call('PUT', `/api/seller/orders/${order._id}/shipment`, { courierName: 'Fixture Courier', trackingNumber: 'FIXTURE-001', trackingUrl: 'https://example.test/tracking/FIXTURE-001', status: 'SHIPPED' }, seller.token, 200, headers);
+  for (const orderStatus of ['Confirmed', 'Packed']) await call('PUT', `/api/seller/orders/${order._id}/status`, { orderStatus }, seller.token, 200, headers);
+  const shipment = await call('PUT', `/api/seller/orders/${order._id}/shipment`, { courierName: 'Fixture Courier', trackingNumber: 'FIXTURE-001', trackingUrl: 'https://example.test/tracking/FIXTURE-001' }, seller.token, 200, headers);
   assert.equal(shipment.trackingNumber, 'FIXTURE-001');
   const updated = await call('PUT', `/api/seller/crm/${customer.user._id}`, { tags: ['VIP'], notes: 'Fixture customer sizing preference', acquisition: 'Instagram', marketingConsent: true }, seller.token, 200, headers);
   assert.deepEqual(updated.tags, ['VIP']);
@@ -244,7 +388,7 @@ test('seller CRM, campaign analytics, manual shipment and reports agree with its
   assert.ok(await get('/api/seller/dashboard/stats', seller.token, headers));
   const other = await createProvisionedSeller('Unrelated Workflow');
   await call('GET', `/api/seller/orders/${order._id}`, undefined, other.token, 404, { 'x-store-id': other.store.id });
-  await call('PUT', `/api/seller/orders/${order._id}/status`, { orderStatus: 'Delivered' }, seller.token, 200, headers);
+  for (const orderStatus of ['Shipped', 'Out for Delivery', 'Delivered']) await call('PUT', `/api/seller/orders/${order._id}/status`, { orderStatus }, seller.token, 200, headers);
   const returnRequest = await call('POST','/api/returns',{order:order._id,product:String(product._id),quantity:1,type:'return',reason:'Fixture return'},customer.token,201,storefrontHeaders);
   assert.equal((await get('/api/seller/returns',seller.token,headers)).length,1);
   await call('PUT',`/api/seller/returns/${returnRequest._id}/status`,{status:'Received'},other.token,404,{'x-store-id':other.store.id});
@@ -398,7 +542,8 @@ test('admin catalog editing, inventory actions, coupon lifecycle and dashboard a
   assert.equal(automaticQuote.totals.coupon.code, 'AUTO-BUY-ONE');
   assert.equal(automaticQuote.totals.couponDiscount, 1000);
   await call('DELETE', `/api/admin/coupons/${automatic._id}`, undefined, admin.token);
-  await call('PUT', `/api/admin/orders/${order._id}/payment-status`, { paymentStatus: 'Paid' }, admin.token);
+  await Order.updateOne({ _id: order._id }, { $set: { orderStatus: 'Delivered', deliveredAt: new Date() } });
+  await call('PUT', `/api/admin/orders/${order._id}/payment-status`, { paymentStatus: 'Paid', note: 'COD received for workflow test' }, admin.token);
   const stats = await get('/api/admin/dashboard/stats', admin.token); assert.equal(stats.orders, 1); assert.equal(stats.revenue, order.finalAmount);
   assert.ok(await get('/api/admin/dashboard/overview', admin.token));
   assert.equal((await get('/api/admin/dashboard/recent-orders', admin.token)).length, 1);

@@ -1,6 +1,7 @@
 const mongoose = require('mongoose');
 const { ApiError } = require('../utils/apiError');
 const { getPrimaryImageUrl } = require('../utils/imageUtils');
+const { effectiveUnitPrice } = require('./productPricingService');
 
 function activeVariants(product = {}) {
   return (Array.isArray(product.variants) ? product.variants : []).filter((variant) => variant && variant.isActive !== false);
@@ -57,8 +58,7 @@ function requireVariant(product, selection = {}) {
 }
 
 function variantUnitPrice(product, variant) {
-  const price = Number(variant?.price || 0);
-  return price > 0 ? price : Number(product.price || 0);
+  return effectiveUnitPrice(product, variant);
 }
 
 function variantUnitMrp(product, variant) {
@@ -116,12 +116,52 @@ function normalizeVariantsPayload(variants, product = {}) {
     .filter((variant) => variant.size || variant.color || Object.keys(variant.optionValues || {}).length);
 }
 
+function validateVariantPayload(variants) {
+  if (variants === undefined) return '';
+  if (!Array.isArray(variants)) return 'Product variants must be a list';
+  if (variants.length > 200) return 'A product can have up to 200 variants';
+  const combinations = new Set();
+  const skus = new Set();
+  for (const variant of variants) {
+    if (!variant || typeof variant !== 'object' || Array.isArray(variant)) return 'Every product variant must be valid';
+    const stock = Number(variant.stock || 0);
+    if (!Number.isSafeInteger(stock) || stock < 0) return 'Every variant stock value must be a whole number of zero or more';
+    const price = optionalPositiveNumber(variant.price);
+    const originalPrice = optionalPositiveNumber(variant.originalPrice);
+    if (price === false) return 'Variant selling prices must be greater than zero when entered';
+    if (originalPrice === false) return 'Variant MRP values must be greater than zero when entered';
+    if (price !== null && originalPrice !== null && price > originalPrice) return 'A variant selling price cannot exceed its MRP';
+    const optionValues = variant.optionValues instanceof Map ? Object.fromEntries(variant.optionValues) : { ...(variant.optionValues || {}) };
+    if (variant.size && !optionValues.size) optionValues.size = variant.size;
+    if (variant.color && !optionValues.color && !optionValues.colour) optionValues.color = variant.color;
+    const combination = Object.entries(optionValues)
+      .map(([key, value]) => [String(key).trim().toLowerCase(), String(value || '').trim().toLowerCase()])
+      .filter(([, value]) => value)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, value]) => `${key}:${value}`).join('|');
+    if (!combination) return 'Every variant needs at least one option value';
+    if (combinations.has(combination)) return 'Variant option combinations must be unique';
+    combinations.add(combination);
+    const sku = String(variant.sku || '').trim().toLowerCase();
+    if (sku && skus.has(sku)) return 'Variant SKUs must be unique within the product';
+    if (sku) skus.add(sku);
+  }
+  return '';
+}
+
+function optionalPositiveNumber(value) {
+  if (value === undefined || value === null || value === '') return null;
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? number : false;
+}
+
 module.exports = {
   activeVariants,
   availableStock,
   findVariant,
   hasManagedVariants,
   normalizeVariantsPayload,
+  validateVariantPayload,
   requireVariant,
   totalVariantStock,
   variantId,

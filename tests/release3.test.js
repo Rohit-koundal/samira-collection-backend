@@ -7,6 +7,7 @@ const Product = require('../models/Product');
 const Order = require('../models/Order');
 const AuditLog = require('../models/AuditLog');
 const Store = require('../models/Store');
+const Category = require('../models/Category');
 const InventoryTransaction = require('../models/InventoryTransaction');
 const { createProvisionedSeller } = require('./accessFixtures');
 
@@ -75,6 +76,39 @@ test('seller A cannot read seller B products', async () => {
   const listB = await request('/api/seller/products', { token: sellerB.token, headers: { 'x-store-id': sellerB.store.id } });
   assert.equal(listB.data.length, 1);
   assert.equal(listB.data[0].name, 'Beta Saree');
+});
+
+test('seller catalog management includes its inactive products, excludes archives by default and exposes archives on request', async () => {
+  const seller = await createSellerStore('Managed Catalog');
+  const base = { price: 999, originalPrice: 1299, stock: 2, storeId: seller.store.id };
+  await Product.create({ ...base, name: 'Visible item', slug: 'visible-item', sku: 'SELL-VISIBLE', isActive: true });
+  await Product.create({ ...base, name: 'Hidden item', slug: 'hidden-item', sku: 'SELL-HIDDEN', isActive: false });
+  await Product.create({ ...base, name: 'Archived item', slug: 'archived-item', sku: 'SELL-ARCHIVED', isActive: false, isArchived: true });
+  const auth = { token: seller.token, headers: { 'x-store-id': seller.store.id } };
+
+  const current = await request('/api/seller/products', auth);
+  assert.deepEqual(current.data.map((product) => product.name).sort(), ['Hidden item', 'Visible item']);
+  const archived = await request('/api/seller/products?archive=only', auth);
+  assert.deepEqual(archived.data.map((product) => product.name), ['Archived item']);
+});
+
+test('seller products and drafts cannot reference a category owned by another store', async () => {
+  const sellerA = await createSellerStore('Category Owner A');
+  const sellerB = await createSellerStore('Category Owner B');
+  const foreignCategory = await Category.create({ name: 'Private category', slug: 'private-category', storeId: sellerB.store.id });
+  const headers = { 'x-store-id': sellerA.store.id };
+  const product = await request('/api/seller/products', {
+    method: 'POST', token: sellerA.token, headers, body: {
+      name: 'Cross store item', sku: 'CROSS-1', category: String(foreignCategory._id),
+      price: 900, originalPrice: 1200, stock: 2, images: [{ url: '/uploads/test.jpg', primary: true }],
+    },
+  });
+  assert.equal(product.status, 400);
+  const draft = await request('/api/seller/product-drafts', {
+    method: 'POST', token: sellerA.token, headers, body: { name: 'Cross store draft', category: String(foreignCategory._id) },
+  });
+  assert.equal(draft.status, 400);
+  assert.equal(await Product.countDocuments({ storeId: sellerA.store.id }), 0);
 });
 
 test('default storefront still lists legacy products without storeId', async () => {

@@ -9,7 +9,7 @@ test('local Indian numbers beginning with 91 retain all ten digits for login and
   for (const value of ['9123456789', '+91 91234 56789', '919123456789']) {
     assert.equal(normalizePhone(value), '9123456789');
     assert.equal(requireIndianMobile(value), '9123456789');
-    const address = { fullName: 'Customer', mobile: value, pincode: '302001' };
+    const address = { fullName: 'Customer', mobile: value, pincode: '302001', houseNo: '12', area: 'Market Road', city: 'Jaipur', state: 'Rajasthan' };
     assert.doesNotThrow(() => assertShippingAddress(address));
     assert.equal(snapshotAddress(address).mobile, '9123456789');
   }

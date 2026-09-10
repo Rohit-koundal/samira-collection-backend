@@ -11,7 +11,7 @@ const Product = require('../models/Product');
 const ReturnExchange = require('../models/ReturnExchange');
 const Settings = require('../models/Settings');
 const User = require('../models/User');
-const { buildCustomerRows } = require('./crmService');
+const { buildCustomerRows, listCustomerRows } = require('./crmService');
 const { andFilter, defaultStoreFilter } = require('./storeService');
 const { ApiError } = require('../utils/apiError');
 const { requireObjectId } = require('../utils/validators');
@@ -243,7 +243,8 @@ async function createCustomerOffer(store, payload = {}) {
     if (!coupon) throw new ApiError('INVALID_COUPON', 'Choose an active coupon from this store');
   }
 
-  const allowed = new Set((await buildCustomerRows(store._id)).map((row) => row.userId));
+  const customerResult = await listCustomerRows({ storeId: store._id, tenantFilter: scopeFor(store), rules: store.customerRules }, { limit: 5000, exportAll: true });
+  const allowed = new Set(customerResult.items.map((row) => row.userId));
   if (customerIds.some((id) => !allowed.has(id))) throw new ApiError('FORBIDDEN', 'Every selected customer must belong to the active store');
   const customers = await User.find({ _id: { $in: customerIds }, isBlocked: { $ne: true } }).select('name phone').lean();
   const byId = new Map(customers.map((customer) => [String(customer._id), customer]));
@@ -252,25 +253,34 @@ async function createCustomerOffer(store, payload = {}) {
 
   if (channel === 'WHATSAPP_LINK') {
     const profiles = await CustomerCrm.find({ storeId: store._id, user: { $in: customerIds } })
-      .select('user marketingConsent lastWhatsAppOfferPreparedAt').lean();
+      .select('user marketingConsent channelConsents restrictions lastWhatsAppOfferPreparedAt').lean();
     const profileByUser = new Map(profiles.map((profile) => [String(profile.user), profile]));
     const cutoff = new Date(Date.now() - 7 * DAY);
     const items = await Promise.all(customerIds.map(async (id) => {
       const customer = byId.get(id);
       const phone = String(customer?.phone || '').replace(/\D/g, '').replace(/^91(?=\d{10}$)/, '');
       const profile = profileByUser.get(id);
-      if (!profile?.marketingConsent) return { customerId: id, name: customer?.name || 'Customer', available: false, reason: 'Marketing consent is not recorded' };
+      const restrictionActive = !profile?.restrictions?.expiresAt || new Date(profile.restrictions.expiresAt) > new Date();
+      if (restrictionActive && profile?.restrictions?.marketingSuppressed) return { customerId: id, name: customer?.name || 'Customer', available: false, reason: 'Marketing is suppressed for this customer' };
+      const whatsappConsent = profile?.channelConsents?.whatsapp?.granted === true || profile?.marketingConsent === true;
+      if (!whatsappConsent) return { customerId: id, name: customer?.name || 'Customer', available: false, reason: 'WhatsApp marketing consent is not recorded' };
       if (!customer || !/^[6-9]\d{9}$/.test(phone)) return { customerId: id, name: customer?.name || 'Customer', available: false, reason: 'Valid WhatsApp number unavailable' };
       if (profile.lastWhatsAppOfferPreparedAt && new Date(profile.lastWhatsAppOfferPreparedAt) >= cutoff) {
         return { customerId: id, name: customer.name || 'Customer', available: false, reason: 'A WhatsApp offer was prepared in the last 7 days' };
       }
       const reserved = await CustomerCrm.findOneAndUpdate({
         _id: profile._id,
-        marketingConsent: true,
-        $or: [
-          { lastWhatsAppOfferPreparedAt: { $exists: false } },
-          { lastWhatsAppOfferPreparedAt: null },
-          { lastWhatsAppOfferPreparedAt: { $lt: cutoff } },
+        $and: [
+          { $or: [{ 'channelConsents.whatsapp.granted': true }, { marketingConsent: true }] },
+          { $or: [
+            { lastWhatsAppOfferPreparedAt: { $exists: false } },
+            { lastWhatsAppOfferPreparedAt: null },
+            { lastWhatsAppOfferPreparedAt: { $lt: cutoff } },
+          ] },
+          { $or: [
+            { 'restrictions.marketingSuppressed': { $ne: true } },
+            { 'restrictions.expiresAt': { $lte: new Date() } },
+          ] },
         ],
       }, { $set: { lastWhatsAppOfferPreparedAt: new Date() } }, { new: true }).lean();
       if (!reserved) return { customerId: id, name: customer.name || 'Customer', available: false, reason: 'A recent WhatsApp offer is already pending review' };
@@ -286,13 +296,18 @@ async function createCustomerOffer(store, payload = {}) {
     };
   }
 
+  const suppressedProfiles = await CustomerCrm.find({
+    storeId: store._id, user: { $in: customerIds }, 'restrictions.marketingSuppressed': true,
+    $or: [{ 'restrictions.expiresAt': { $exists: false } }, { 'restrictions.expiresAt': null }, { 'restrictions.expiresAt': { $gt: new Date() } }],
+  }).select('user').lean();
+  const suppressed = new Set(suppressedProfiles.map((profile) => String(profile.user)));
   const recentCutoff = new Date(Date.now() - 7 * DAY);
   const recent = await Notification.find({
     storeId: store._id, user: { $in: customerIds }, event: 'CRM_OFFER',
     'metadata.couponCode': coupon?.code || '', createdAt: { $gte: recentCutoff },
   }).select('user').lean();
   const alreadySent = new Set(recent.map((item) => String(item.user)));
-  const recipients = customerIds.filter((id) => byId.has(id) && !alreadySent.has(id));
+  const recipients = customerIds.filter((id) => byId.has(id) && !alreadySent.has(id) && !suppressed.has(id));
   if (recipients.length) {
     await Notification.insertMany(recipients.map((userId) => ({
       storeId: store._id, user: userId, event: 'CRM_OFFER', title, message,

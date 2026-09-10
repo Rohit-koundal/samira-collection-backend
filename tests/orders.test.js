@@ -7,6 +7,8 @@ const Product = require('../models/Product');
 const Order = require('../models/Order');
 const Coupon = require('../models/Coupon');
 const InventoryTransaction = require('../models/InventoryTransaction');
+const ReturnExchange = require('../models/ReturnExchange');
+const Shipment = require('../models/Shipment');
 
 test.before(startTestEnvironment);
 test.after(stopTestEnvironment);
@@ -161,12 +163,118 @@ test('a delivered order cannot be cancelled', async () => {
   const product = await createProduct({ stock: 5 });
   const created = await request('/api/orders/cod', { method: 'POST', token, body: codOrderBody(product) });
 
-  await request(`/api/admin/orders/${created.data._id}/status`, { method: 'PUT', token: admin.token, body: { orderStatus: 'Delivered' } });
+  await Order.updateOne({ _id: created.data._id }, { $set: { orderStatus: 'Delivered', deliveredAt: new Date() } });
 
   const { status, data } = await request(`/api/orders/${created.data._id}/cancel`, { method: 'POST', token, body: {} });
   assert.equal(status, 409);
   assert.equal(data.code, 'ORDER_NOT_CANCELLABLE');
   assert.equal((await Product.findById(product._id)).stock, 4, 'stock must stay deducted for a delivered order');
+});
+
+test('fulfilment follows the safe sequence and rejects a stale revision', async () => {
+  const { token } = await createCustomer();
+  const admin = await createAdmin();
+  const product = await createProduct({ stock: 5 });
+  const created = await request('/api/orders/cod', { method: 'POST', token, body: codOrderBody(product) });
+  const detail = await request(`/api/admin/orders/${created.data._id}`, { token: admin.token });
+  assert.ok(detail.data.allowedActions.includes('CONFIRM_ORDER'));
+  const summary = await request('/api/admin/orders/workspace-summary', { token: admin.token });
+  assert.equal(summary.status, 200); assert.equal(summary.data.pending, 1);
+
+  const skipped = await request(`/api/admin/orders/${created.data._id}/status`, { method: 'PUT', token: admin.token, body: { orderStatus: 'Delivered', revision: 0 } });
+  assert.equal(skipped.status, 409); assert.equal(skipped.data.code, 'ORDER_TRANSITION_INVALID');
+
+  const confirmed = await request(`/api/admin/orders/${created.data._id}/status`, { method: 'PUT', token: admin.token, body: { orderStatus: 'Confirmed', revision: 0 } });
+  assert.equal(confirmed.status, 200); assert.equal(confirmed.data.revision, 1);
+  const packingSummary = await request('/api/admin/orders/workspace-summary', { token: admin.token });
+  assert.equal(packingSummary.data.todayPacking, 1);
+  const stale = await request(`/api/admin/orders/${created.data._id}/status`, { method: 'PUT', token: admin.token, body: { orderStatus: 'Packed', revision: 0 } });
+  assert.equal(stale.status, 409); assert.equal(stale.data.code, 'ORDER_CHANGED');
+});
+
+test('private notes and pre-booking address corrections are revision-safe', async () => {
+  const customer = await createCustomer();
+  const admin = await createAdmin();
+  const product = await createProduct({ stock: 5 });
+  const created = await request('/api/orders/cod', { method: 'POST', token: customer.token, body: codOrderBody(product) });
+
+  const noted = await request(`/api/admin/orders/${created.data._id}/staff-notes`, {
+    method: 'PATCH', token: admin.token, body: { text: 'Customer confirmed the landmark.', revision: 0 },
+  });
+  assert.equal(noted.status, 200); assert.equal(noted.data.revision, 1);
+  assert.equal(noted.data.staffNotes[0].text, 'Customer confirmed the landmark.');
+
+  const customerView = await request(`/api/orders/${created.data._id}`, { token: customer.token });
+  assert.equal(customerView.data.staffNotes, undefined, 'private staff notes must never reach the customer');
+
+  const correctedAddress = validAddress({ houseNo: '22B', landmark: 'Opposite City Mall' });
+  const corrected = await request(`/api/admin/orders/${created.data._id}/shipping-address`, {
+    method: 'PUT', token: admin.token, body: { shippingAddress: correctedAddress, reason: 'Customer corrected the house number', revision: 1 },
+  });
+  assert.equal(corrected.status, 200); assert.equal(corrected.data.revision, 2);
+  assert.equal(corrected.data.shippingAddress.houseNo, '22B');
+
+  const stale = await request(`/api/admin/orders/${created.data._id}/staff-notes`, {
+    method: 'PATCH', token: admin.token, body: { text: 'Stale note', revision: 1 },
+  });
+  assert.equal(stale.status, 409); assert.equal(stale.data.code, 'ORDER_CHANGED');
+});
+
+test('completed COD returns can record cumulative refund payments with a remaining balance', async () => {
+  const customer = await createCustomer();
+  const admin = await createAdmin();
+  const product = await createProduct({ stock: 5, price: 1200 });
+  const created = await request('/api/orders/cod', { method: 'POST', token: customer.token, body: codOrderBody(product) });
+  await Order.updateOne({ _id: created.data._id }, { $set: { orderStatus: 'Delivered', deliveredAt: new Date() } });
+  const paid = await request(`/api/admin/orders/${created.data._id}/payment-status`, {
+    method: 'PUT', token: admin.token, body: { paymentStatus: 'Paid', note: 'COD received at delivery', revision: 0 },
+  });
+  assert.equal(paid.status, 200); assert.equal(paid.data.paymentStatus, 'Paid');
+  const premature = await request(`/api/admin/orders/${created.data._id}/payment-status`, {
+    method: 'PUT', token: admin.token, body: { paymentStatus: 'Refunded', amount: 300, note: 'Refund attempted before return completion', revision: 1 },
+  });
+  assert.equal(premature.status, 409); assert.equal(premature.data.code, 'PAYMENT_TRANSITION_INVALID');
+  const stored = await Order.findById(created.data._id);
+  await ReturnExchange.create({ order: stored._id, product: product._id, user: customer.user._id, orderItemId: String(stored.orderItems[0]._id), quantity: 1, type: 'return', reason: 'Returned item', status: 'Refunded', resolutionStatus: 'Refunded', storeId: stored.storeId });
+
+  const detail = await request(`/api/admin/orders/${stored._id}`, { token: admin.token });
+  assert.ok(detail.data.allowedActions.includes('RECORD_COD_REFUND'));
+  const partial = await request(`/api/admin/orders/${stored._id}/payment-status`, {
+    method: 'PUT', token: admin.token, body: { paymentStatus: 'Refunded', amount: 300, reference: 'cash-refund-1', note: 'First refund instalment paid', revision: 1 },
+  });
+  assert.equal(partial.status, 200); assert.equal(partial.data.paymentStatus, 'Paid');
+  assert.equal(partial.data.paymentState, 'PARTIALLY_REFUNDED'); assert.equal(partial.data.refundedAmount, 300);
+  assert.equal(partial.data.refunds[0].provider, 'manual');
+
+  const balance = Number(partial.data.finalAmount) - 300;
+  const completed = await request(`/api/admin/orders/${stored._id}/payment-status`, {
+    method: 'PUT', token: admin.token, body: { paymentStatus: 'Refunded', amount: balance, reference: 'cash-refund-2', note: 'Remaining refund paid', revision: 2 },
+  });
+  assert.equal(completed.status, 200); assert.equal(completed.data.paymentStatus, 'Refunded');
+  assert.equal(completed.data.paymentState, 'REFUNDED'); assert.equal(completed.data.refundedAmount, partial.data.finalAmount);
+  assert.equal(completed.data.refunds.length, 2);
+});
+
+test('delivery exception follow-ups are audited for staff and hidden from customers', async () => {
+  const customer = await createCustomer();
+  const admin = await createAdmin();
+  const product = await createProduct({ stock: 5 });
+  const created = await request('/api/orders/cod', { method: 'POST', token: customer.token, body: codOrderBody(product) });
+  const shipment = await Shipment.create({ order: created.data._id, provider: 'manual', courierName: 'Local courier', status: 'EXCEPTION', bookingState: 'BOOKED', awb: 'ISSUE-AWB-1', trackingNumber: 'ISSUE-AWB-1', storeId: created.data.storeId });
+  await Order.updateOne({ _id: created.data._id }, { $set: { shipment: shipment._id, orderStatus: 'Shipped' } });
+
+  const detail = await request(`/api/admin/orders/${created.data._id}`, { token: admin.token });
+  assert.ok(detail.data.allowedActions.includes('RESOLVE_DELIVERY_EXCEPTION'));
+  const result = await request(`/api/admin/orders/${created.data._id}/delivery/exception`, {
+    method: 'POST', token: admin.token, body: { action: 'REQUESTED_REDELIVERY', reference: 'NDR-22', note: 'Customer confirmed the complete address and next-day availability.' },
+  });
+  assert.equal(result.status, 200);
+  assert.equal(result.data.shipment.exceptionActions[0].action, 'REQUESTED_REDELIVERY');
+  assert.equal(result.data.shipment.exceptionActions[0].reference, 'NDR-22');
+
+  const customerDelivery = await request(`/api/orders/${created.data._id}/delivery`, { token: customer.token });
+  assert.equal(customerDelivery.status, 200);
+  assert.equal(customerDelivery.data.shipment.exceptionActions, undefined);
 });
 
 test('a customer cannot cancel or read another customer order', async () => {

@@ -20,6 +20,7 @@ const PERMISSIONS_BY_ROLE = {
     'marketing.read', 'marketing.write',
     'inventory.read', 'inventory.write',
     'crm.read', 'crm.write',
+    'crm.pii.read', 'crm.export',
     'inbox.read', 'inbox.write',
     'settings.read', 'settings.write',
     'audit.read',
@@ -27,7 +28,7 @@ const PERMISSIONS_BY_ROLE = {
   ],
   CATALOG_MANAGER: ['catalog.read', 'catalog.write', 'inventory.read'],
   ORDER_MANAGER: ['orders.read', 'orders.write', 'returns.read', 'returns.write', 'inventory.read', 'inventory.write'],
-  SUPPORT: ['support.read', 'support.write', 'inbox.read', 'inbox.write', 'returns.read', 'returns.write', 'orders.read', 'crm.read'],
+  SUPPORT: ['support.read', 'support.write', 'inbox.read', 'inbox.write', 'returns.read', 'returns.write', 'orders.read', 'crm.read', 'crm.pii.read'],
   MARKETING: ['marketing.read', 'marketing.write', 'catalog.read', 'crm.read'],
   WAREHOUSE: ['inventory.read', 'inventory.write', 'orders.read'],
 };

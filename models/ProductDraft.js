@@ -60,6 +60,7 @@ const productDraftSchema = new mongoose.Schema({
   supplierSku: String,
   restockAt: Date,
   publishAt: Date,
+  salePrice: Number,
   saleStartAt: Date,
   saleEndAt: Date,
   sizes: [String],
@@ -91,10 +92,16 @@ const productDraftSchema = new mongoose.Schema({
   showInTrending: Boolean,
   showInFestive: Boolean,
   variants: { type: [mongoose.Schema.Types.Mixed], default: [] },
-  status: { type: String, enum: ['draft', 'published'], default: 'draft' },
+  status: { type: String, enum: ['draft', 'published', 'archived'], default: 'draft', index: true },
+  revision: { type: Number, default: 0, min: 0 },
+  archivedAt: { type: Date, default: null },
+  lastSavedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: undefined },
+  lastPublishAttemptAt: { type: Date, default: null },
+  lastPublishError: { type: String, maxlength: 500, default: '' },
   createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   publishedProductId: { type: mongoose.Schema.Types.ObjectId, ref: 'Product' },
   sourceType: { type: String, enum: ['manual', 'reel-import', 'social-import'], default: undefined },
+  autosaveKey: { type: String, trim: true, maxlength: 80, default: undefined },
   sourceSocialImportId: { type: mongoose.Schema.Types.ObjectId, ref: 'SocialProductImport', unique: true, sparse: true, default: undefined },
   sourceUrl: String,
   sourcePlatform: String,
@@ -111,5 +118,9 @@ const productDraftSchema = new mongoose.Schema({
 }, { timestamps: true });
 
 productDraftSchema.plugin(storeIdPlugin);
+productDraftSchema.index({ storeId: 1, createdBy: 1, autosaveKey: 1 }, { unique: true, partialFilterExpression: { autosaveKey: { $type: 'string' } } });
+productDraftSchema.index({ storeId: 1, status: 1, updatedAt: -1 });
+productDraftSchema.index({ storeId: 1, sourceType: 1, updatedAt: -1 });
+productDraftSchema.index({ storeId: 1, category: 1, updatedAt: -1 });
 
 module.exports = mongoose.model('ProductDraft', productDraftSchema);
