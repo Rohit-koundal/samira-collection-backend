@@ -8,6 +8,7 @@ const platform = require('../services/clientPlatformService');
 const { verifyEnvelope } = require('../services/licenseSignatureService');
 const InstallationPayment = require('../models/InstallationPayment');
 const ClientInstallation = require('../models/ClientInstallation');
+const ClientInstallationOperation = require('../models/ClientInstallationOperation');
 
 process.env.RAZORPAY_KEY_ID = 'rzp_test_client_platform';
 process.env.RAZORPAY_KEY_SECRET = 'client_platform_test_secret';
@@ -72,16 +73,54 @@ test('master changes and subscription payments affect only the selected installa
   assert.equal(verifyEnvelope(other, second.credentials.signingPublicKey).status, 'TRIAL');
 });
 
-test('master key rotation invalidates only the previous installation key', async () => {
+test('staged key rotation keeps the previous key until the replacement checks in', async () => {
   const first = await provision('Rotated Client', 'rotated-client');
-  const response = await request(`/api/master/installations/${first.installation._id}/rotate-key`, { method: 'POST', token: first.master.token, body: {} });
-  assert.equal(response.status, 200);
-  assert.notEqual(response.data.credentials.CLIENT_LICENSE_KEY, first.credentials.licenseKey);
-  const oldKey = await request('/api/platform/validate', { method: 'POST', headers: { 'x-installation-id': first.credentials.installationId, 'x-license-key': first.credentials.licenseKey }, body: { appVersion: '1.0.0' } });
-  assert.equal(oldKey.status, 401);
-  const newKey = await request('/api/platform/validate', { method: 'POST', headers: { 'x-installation-id': first.credentials.installationId, 'x-license-key': response.data.credentials.CLIENT_LICENSE_KEY }, body: { appVersion: '1.0.0' } });
-  assert.equal(newKey.status, 200);
-  assert.doesNotMatch(JSON.stringify(newKey.data), new RegExp(response.data.credentials.CLIENT_LICENSE_KEY));
+  const previousEncryptionKey = process.env.PLATFORM_CREDENTIAL_ENCRYPTION_KEY;
+  process.env.PLATFORM_CREDENTIAL_ENCRYPTION_KEY = 'test-only-client-platform-encryption-key';
+  try {
+    const response = await request(`/api/master/installations/${first.installation._id}/rotate-key`, { method: 'POST', token: first.master.token, body: { baseRevision: 0, reason: 'Scheduled credential maintenance', idempotencyKey: 'key:test:rotation:001' } });
+    assert.equal(response.status, 200);
+    assert.notEqual(response.data.credentials.CLIENT_LICENSE_KEY, first.credentials.licenseKey);
+    const oldBeforeCheckIn = await request('/api/platform/validate', { method: 'POST', headers: { 'x-installation-id': first.credentials.installationId, 'x-license-key': first.credentials.licenseKey }, body: { appVersion: '1.0.0' } });
+    assert.equal(oldBeforeCheckIn.status, 200);
+    const newKey = await request('/api/platform/validate', { method: 'POST', headers: { 'x-installation-id': first.credentials.installationId, 'x-license-key': response.data.credentials.CLIENT_LICENSE_KEY }, body: { appVersion: '1.0.0' } });
+    assert.equal(newKey.status, 200);
+    const oldAfterCheckIn = await request('/api/platform/validate', { method: 'POST', headers: { 'x-installation-id': first.credentials.installationId, 'x-license-key': first.credentials.licenseKey }, body: { appVersion: '1.0.0' } });
+    assert.equal(oldAfterCheckIn.status, 401);
+    assert.doesNotMatch(JSON.stringify(newKey.data), new RegExp(response.data.credentials.CLIENT_LICENSE_KEY));
+  } finally {
+    if (previousEncryptionKey === undefined) delete process.env.PLATFORM_CREDENTIAL_ENCRYPTION_KEY;
+    else process.env.PLATFORM_CREDENTIAL_ENCRYPTION_KEY = previousEncryptionKey;
+  }
+});
+
+test('staged key rotation cannot silently replace another live pending key', async () => {
+  const client = await provision('Protected Rotation Client', 'protected-rotation-client');
+  const previousEncryptionKey = process.env.PLATFORM_CREDENTIAL_ENCRYPTION_KEY;
+  process.env.PLATFORM_CREDENTIAL_ENCRYPTION_KEY = 'test-only-client-platform-encryption-key';
+  try {
+    const first = await request(`/api/master/installations/${client.installation._id}/rotate-key`, {
+      method: 'POST', token: client.master.token,
+      body: { baseRevision: 0, reason: 'Scheduled credential rotation', idempotencyKey: 'key:test:protected:001' },
+    });
+    assert.equal(first.status, 200);
+    const replacement = await request(`/api/master/installations/${client.installation._id}/rotate-key`, {
+      method: 'POST', token: client.master.token,
+      body: { baseRevision: 1, reason: 'Accidental second credential rotation', idempotencyKey: 'key:test:protected:002' },
+    });
+    assert.equal(replacement.status, 409);
+    assert.equal(replacement.data.code, 'DUPLICATE_REQUEST');
+    const recovered = await request(`/api/master/installations/${client.installation._id}/rotate-key`, {
+      method: 'POST', token: client.master.token,
+      body: { baseRevision: 1, reason: 'Scheduled credential rotation', idempotencyKey: 'key:test:protected:001' },
+    });
+    assert.equal(recovered.status, 200);
+    assert.equal(recovered.data.duplicate, true);
+    assert.equal(recovered.data.credentials.CLIENT_LICENSE_KEY, first.data.credentials.CLIENT_LICENSE_KEY);
+  } finally {
+    if (previousEncryptionKey === undefined) delete process.env.PLATFORM_CREDENTIAL_ENCRYPTION_KEY;
+    else process.env.PLATFORM_CREDENTIAL_ENCRYPTION_KEY = previousEncryptionKey;
+  }
 });
 
 test('generated backend enforces the signed product limit even when a browser bypasses UI checks', async () => {
@@ -158,6 +197,107 @@ test('client control searches installations and returns isolated profile, featur
   assert.equal(operations.data.installation.usage.ordersPerMonth, 9);
   assert.equal(operations.data.paymentTotal, 0);
   assert.ok(operations.data.activity.some((entry) => entry.action === 'CLIENT_INSTALLATION_UPDATE'));
+});
+
+test('client attention reports live risks without treating inactive clients as offline', async () => {
+  const risk = await provision('Risk Client', 'risk-client');
+  const inactive = await provision('Inactive Client', 'inactive-client');
+  await ClientInstallation.updateOne({ _id: risk.installation._id }, {
+    $set: {
+      status: 'ACTIVE', billingCycle: 'LIFETIME', endsAt: null, lastSeenAt: null,
+      'billingReview.required': true, 'billingReview.reason': 'Verify a refunded payment',
+      'limitOverrides.products': 10, 'usage.products': 9,
+    },
+  });
+  await ClientInstallation.updateOne({ _id: inactive.installation._id }, { $set: { status: 'REVOKED', lastSeenAt: null } });
+
+  const workspace = await platform.clientControlWorkspace({ attention: 'risks' });
+  assert.equal(workspace.pagination.total, 1);
+  assert.equal(workspace.installations[0].companyName, 'Risk Client');
+  assert.ok(workspace.installations[0].attention.some((item) => item.code === 'OFFLINE'));
+  assert.ok(workspace.installations[0].attention.some((item) => item.code === 'BILLING_REVIEW'));
+  assert.ok(workspace.installations[0].attention.some((item) => item.code === 'LIMIT_PRODUCTS'));
+  assert.equal(workspace.summary.needsAttention, 1);
+
+  const all = await platform.clientControlWorkspace({});
+  const revoked = all.installations.find((item) => item.companyName === 'Inactive Client');
+  assert.ok(revoked);
+  assert.ok(!revoked.attention.some((item) => item.code === 'OFFLINE'));
+});
+
+test('section saves are revision checked and never apply unrelated unsaved fields', async () => {
+  const client = await provision('Safe Save Client', 'safe-save-client');
+  const profile = await request(`/api/master/installations/${client.installation._id}/profile`, {
+    method: 'PATCH', token: client.master.token,
+    body: { baseRevision: 0, contact: { ownerName: 'Safe Owner', phone: '9811111111', email: 'safe@example.com' }, tags: 'priority, north', notes: 'Profile only' },
+  });
+  assert.equal(profile.status, 200);
+  assert.equal(profile.data.installation.revision, 1);
+  assert.equal(profile.data.installation.plan, 'PROFESSIONAL');
+  assert.equal(profile.data.installation.contact.email, 'safe@example.com');
+
+  const stale = await request(`/api/master/installations/${client.installation._id}/entitlements`, {
+    method: 'PATCH', token: client.master.token,
+    body: { baseRevision: 0, reason: 'Stale feature update', featureOverrides: ['businessAssistant'], disabledFeatures: [], limitOverrides: {} },
+  });
+  assert.equal(stale.status, 409);
+  assert.equal(stale.data.code, 'DUPLICATE_REQUEST');
+  const stored = await ClientInstallation.findById(client.installation._id);
+  assert.deepEqual(stored.featureOverrides, []);
+});
+
+test('manual access grants are reasoned and idempotent', async () => {
+  const client = await provision('Grant Client', 'grant-client');
+  const body = { baseRevision: 0, plan: 'PROFESSIONAL', billingCycle: 'MONTHLY', source: 'MANUAL_PAYMENT', reference: 'cash-001', reason: 'Payment received outside gateway', idempotencyKey: 'grant:test:client:001' };
+  const first = await request(`/api/master/installations/${client.installation._id}/subscription/grants`, { method: 'POST', token: client.master.token, body });
+  assert.equal(first.status, 200);
+  assert.equal(first.data.duplicate, false);
+  const firstEnd = first.data.installation.endsAt;
+  const repeated = await request(`/api/master/installations/${client.installation._id}/subscription/grants`, { method: 'POST', token: client.master.token, body });
+  assert.equal(repeated.status, 200);
+  assert.equal(repeated.data.duplicate, true);
+  assert.equal(repeated.data.installation.endsAt, firstEnd);
+  assert.equal(await ClientInstallationOperation.countDocuments({ installation: client.installation._id, type: 'ACCESS_GRANT' }), 1);
+});
+
+test('lifecycle actions require a reason and restore only a valid access period', async () => {
+  const client = await provision('Lifecycle Client', 'lifecycle-client');
+  const missingReason = await request(`/api/master/installations/${client.installation._id}/lifecycle`, { method: 'PATCH', token: client.master.token, body: { baseRevision: 0, action: 'SUSPEND' } });
+  assert.equal(missingReason.status, 400);
+  const suspended = await request(`/api/master/installations/${client.installation._id}/lifecycle`, { method: 'PATCH', token: client.master.token, body: { baseRevision: 0, action: 'SUSPEND', reason: 'Manual compliance review' } });
+  assert.equal(suspended.status, 200);
+  assert.equal(suspended.data.installation.status, 'SUSPENDED');
+  const restored = await request(`/api/master/installations/${client.installation._id}/lifecycle`, { method: 'PATCH', token: client.master.token, body: { baseRevision: 1, action: 'RESTORE', reason: 'Review completed successfully' } });
+  assert.equal(restored.status, 200);
+  assert.equal(restored.data.installation.status, 'TRIAL');
+});
+
+test('a full refund of the latest client payment suspends access for billing review', async () => {
+  const client = await provision('Refund Client', 'refund-client');
+  const payment = await InstallationPayment.create({ installation: client.installation._id, installationId: client.credentials.installationId, plan: 'PROFESSIONAL', billingCycle: 'MONTHLY', amount: 1999, baseAmount: 1694, taxAmount: 305, currency: 'INR', status: 'PAID', receipt: 'client_refund_test', razorpayOrderId: 'order_client_refund', razorpayPaymentId: 'pay_client_refund', paidAt: new Date() });
+  await ClientInstallation.updateOne({ _id: client.installation._id }, { $set: { status: 'ACTIVE', billingCycle: 'MONTHLY', endsAt: new Date(Date.now() + 20 * 86400000), lastPayment: { orderId: payment.razorpayOrderId, paymentId: payment.razorpayPaymentId, amount: payment.amount, currency: 'INR', paidAt: new Date() } } });
+  const result = await platform.handleRefundWebhook({ razorpayPaymentId: payment.razorpayPaymentId, refundId: 'refund_client_full', refundedAmount: 1999 });
+  assert.equal(result.outcome, 'REFUNDED');
+  assert.equal(result.installation.status, 'SUSPENDED');
+  assert.equal(result.installation.billingReview.required, true);
+  const repeated = await platform.handleRefundWebhook({ razorpayPaymentId: payment.razorpayPaymentId, refundId: 'refund_client_full', refundedAmount: 1999 });
+  assert.equal(repeated.duplicate, true);
+  assert.equal((await InstallationPayment.findById(payment._id)).refunds.length, 1);
+});
+
+test('release rollout state is revision checked and can be paused and resumed', async () => {
+  const client = await provision('Release Owner', 'release-owner');
+  const created = await request('/api/master/releases', { method: 'POST', token: client.master.token, body: { version: '2.0.0', channel: 'stable', rolloutPercent: 20, notes: 'Canary release', artifact: { repository: 'owner/repository', commitSha: 'abcdef1234567', minimumProtocol: 1 } } });
+  assert.equal(created.status, 201);
+  const paused = await request(`/api/master/releases/${created.data.release._id}`, { method: 'PATCH', token: client.master.token, body: { baseRevision: 0, action: 'PAUSE', reason: 'Observe canary metrics' } });
+  assert.equal(paused.status, 200);
+  assert.equal(paused.data.release.rolloutStatus, 'PAUSED');
+  const stale = await request(`/api/master/releases/${created.data.release._id}`, { method: 'PATCH', token: client.master.token, body: { baseRevision: 0, action: 'RESUME', rolloutPercent: 50, reason: 'Stale request' } });
+  assert.equal(stale.status, 409);
+  const resumed = await request(`/api/master/releases/${created.data.release._id}`, { method: 'PATCH', token: client.master.token, body: { baseRevision: 1, action: 'RESUME', rolloutPercent: 50, reason: 'Canary health is stable' } });
+  assert.equal(resumed.status, 200);
+  assert.equal(resumed.data.release.rolloutPercent, 50);
+  assert.equal(resumed.data.release.rolloutStatus, 'ACTIVE');
 });
 
 test('deployment hooks are encrypted, hidden from responses and trigger only the selected client build', async () => {

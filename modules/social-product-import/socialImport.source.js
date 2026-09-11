@@ -80,7 +80,8 @@ function parsePublicPage(html, source) {
 }
 
 async function graph(path, fields, token, host = 'graph.facebook.com', after) {
-  const version = /^v\d+\.0$/.test(process.env.SOCIAL_IMPORT_GRAPH_VERSION || '') ? process.env.SOCIAL_IMPORT_GRAPH_VERSION : 'v25.0';
+  const configured = process.env.META_GRAPH_VERSION || process.env.SOCIAL_IMPORT_GRAPH_VERSION || '';
+  const version = /^v\d+\.0$/.test(configured) ? configured : 'v23.0';
   const url = new URL(`https://${host}/${version}/${path}`);
   url.searchParams.set('fields', fields); url.searchParams.set('limit', '100');
   if (after) url.searchParams.set('after', after);
@@ -91,8 +92,17 @@ async function graph(path, fields, token, host = 'graph.facebook.com', after) {
 }
 async function resolveConnected(source, storeId) {
   let token = ''; let accountId = '';
+  let workspaceAccount = null;
+  if (storeId) {
+    const { Connection } = require('../social-workspace/models');
+    workspaceAccount = await Connection.findOne({ storeId, provider: source.platform, status: { $in: ['connected', 'degraded'] }, $or: [{ expiresAt: null }, { expiresAt: { $gt: new Date() } }] }).sort({ status: 1, updatedAt: -1 }).select('+token');
+    if (workspaceAccount?.token) {
+      token = require('../../utils/secretBox').decryptSecret(workspaceAccount.token);
+      accountId = workspaceAccount.accountId || workspaceAccount.pageId || 'me';
+    }
+  }
   if (source.platform === 'instagram') {
-    if (storeId) {
+    if (storeId && !token) {
       const Connection = require('../../models/InstagramConnection');
       const connection = await Connection.findOne({ storeId, status: 'CONNECTED' }).select('+encryptedAccessToken');
       if (connection?.encryptedAccessToken && (!connection.tokenExpiresAt || connection.tokenExpiresAt > new Date())) {
@@ -105,7 +115,7 @@ async function resolveConnected(source, storeId) {
     if (!token || !/^(?:me|\d+)$/.test(accountId)) return null;
     let after;
     for (let page = 0; page < 5; page++) {
-      const body = await graph(`${accountId}/media`, 'id,caption,permalink,media_type,media_url,thumbnail_url,children{media_type,media_url,thumbnail_url}', token, 'graph.instagram.com', after);
+      const body = await graph(`${accountId}/media`, 'id,caption,permalink,media_type,media_url,thumbnail_url,children{media_type,media_url,thumbnail_url}', token, workspaceAccount?.apiHost || 'graph.instagram.com', after);
       const item = (body.data || []).find((value) => {
         try { return normalizeSocialUrl(value.permalink).mediaId === source.mediaId; } catch { return false; }
       });
@@ -121,11 +131,11 @@ async function resolveConnected(source, storeId) {
     return null;
   }
   // A server-owned Page token is used only in the global admin workspace.
-  token = !storeId && String(process.env.SOCIAL_IMPORT_FACEBOOK_PAGE_TOKEN || '').trim();
+  token = token || (!storeId && String(process.env.SOCIAL_IMPORT_FACEBOOK_PAGE_TOKEN || '').trim());
   if (!token || !/^[\d_]+$/.test(source.mediaId)) return null;
   const fields = source.kind === 'photo' ? 'id,name,images,link' : source.kind === 'video' ? 'id,title,description,source,picture,permalink_url'
     : 'id,message,permalink_url,attachments{media,type,subattachments{media,type}}';
-  const item = await graph(source.mediaId, fields, token);
+  const item = await graph(source.mediaId, fields, token, workspaceAccount?.apiHost || 'graph.facebook.com');
   const images = []; const videos = [];
   if (item.images?.length) images.push({ url: [...item.images].sort((a, b) => b.width - a.width)[0].source, kind: 'image' });
   if (item.picture) images.push({ url: item.picture, kind: 'image' });

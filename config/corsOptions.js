@@ -54,6 +54,7 @@ function corsOptions(req, callback) {
   ) {
     return callback(null, {
       origin: true,
+      credentials: true,
       methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
       allowedHeaders: ['Content-Type', 'Authorization', 'x-session-id', 'x-store-slug', 'x-store-id', 'x-request-id'],
       maxAge: 86400,

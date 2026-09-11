@@ -5,6 +5,7 @@ const cartSchema = new mongoose.Schema({
   user: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   sessionId: { type: String, trim: true, maxlength: 120 },
   mergedGuestCarts: [{ type: mongoose.Schema.Types.ObjectId }],
+  checkoutConsumptions: [{ type: String, maxlength: 120 }],
   items: [{
     product: { type: mongoose.Schema.Types.ObjectId, ref: 'Product' },
     size: String,

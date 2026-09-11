@@ -15,6 +15,7 @@ const {
   uploadFileToR2,
 } = require('./r2Upload');
 const {
+  deleteFile: deleteCloudinaryFile,
   isCloudinaryConfigured,
   uploadImage,
   uploadVideo,
@@ -192,7 +193,9 @@ async function deleteObject({ provider, storageKey }) {
     await getR2Client().send(new DeleteObjectCommand({ Bucket: process.env.R2_BUCKET_NAME, Key: storageKey }));
     return true;
   }
-  // Cloudinary originals are retained unless deletion credentials and an explicit cleanup job are configured.
+  if (provider === 'cloudinary' && isCloudinaryConfigured()) {
+    return deleteCloudinaryFile(storageKey, 'video');
+  }
   return false;
 }
 

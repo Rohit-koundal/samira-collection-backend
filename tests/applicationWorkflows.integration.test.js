@@ -10,6 +10,9 @@ const Cart = require('../models/Cart');
 const Notification = require('../models/Notification');
 const Order = require('../models/Order');
 const Subscriber = require('../models/Subscriber');
+const Banner = require('../models/Banner');
+const Coupon = require('../models/Coupon');
+const WebsiteTheme = require('../models/WebsiteTheme');
 const { readConfiguration } = require('../services/masterConfigurationService');
 test.before(startTestEnvironment);
 test.after(stopTestEnvironment);
@@ -132,6 +135,70 @@ test('banner creation, visibility-only editing, reactivation and deletion retain
   await call('DELETE', `/api/admin/banners/${banner._id}`, undefined, token, 404);
 });
 
+test('banner schedules, safe links and engagement counters behave like real storefront campaigns', async () => {
+  const { token } = await createAdmin();
+  await call('POST', '/api/admin/banners', {
+    title: 'Unsafe campaign', image: '/uploads/unsafe.jpg', destinationType: 'CUSTOM', link: 'javascript:alert(1)',
+  }, token, 400);
+
+  const scheduled = await call('POST', '/api/admin/banners', {
+    title: 'Tomorrow campaign', image: '/uploads/tomorrow.jpg', mobileImage: '/uploads/tomorrow-mobile.jpg',
+    position: 'Offer Strip', startsAt: new Date(Date.now() + 86400000).toISOString(), isActive: true,
+  }, token, 201);
+  assert.equal(scheduled.status, 'Scheduled');
+  assert.equal((await get('/api/banners')).some((item) => item._id === scheduled._id), false);
+
+  const live = await call('POST', '/api/admin/banners', {
+    title: 'Live campaign', image: '/uploads/live.jpg', position: 'Cart - Bottom', campaignKey: 'cart-live',
+    destinationType: 'COLLECTION', destinationValue: 'Wedding Edit', endsAt: new Date(Date.now() + 86400000).toISOString(), isActive: true,
+  }, token, 201);
+  assert.equal(live.link, '/products?collection=Wedding%20Edit');
+  await call('POST', `/api/banners/${live._id}/events`, { event: 'impression', sessionId: 'campaign-session-1' }, undefined, 202);
+  const duplicate = await call('POST', `/api/banners/${live._id}/events`, { event: 'impression', sessionId: 'campaign-session-1' }, undefined, 202);
+  assert.equal(duplicate.duplicate, true);
+  await call('POST', `/api/banners/${live._id}/events`, { event: 'click', sessionId: 'campaign-session-1' }, undefined, 202);
+  const stored = await Banner.findById(live._id).lean();
+  assert.equal(stored.impressions, 1);
+  assert.equal(stored.clicks, 1);
+});
+
+test('seller banner management is isolated between stores', async () => {
+  const sellerA = await createProvisionedSeller('Banner Store Alpha');
+  const sellerB = await createProvisionedSeller('Banner Store Beta');
+  const headersA = { 'x-store-id': sellerA.store.id };
+  const headersB = { 'x-store-id': sellerB.store.id };
+  const created = await call('POST', '/api/seller/banners', {
+    title: 'Alpha home hero', image: '/uploads/alpha-hero.jpg', storeId: sellerB.store.id,
+  }, sellerA.token, 201, headersA);
+  assert.equal(String(created.storeId), String(sellerA.store.id));
+  assert.equal((await get('/api/seller/banners', sellerA.token, headersA)).length, 1);
+  assert.equal((await get('/api/seller/banners', sellerB.token, headersB)).length, 0);
+  await call('GET', `/api/seller/banners/${created._id}`, undefined, sellerB.token, 404, headersB);
+});
+
+test('seller coupon targeting and option search never cross store boundaries', async () => {
+  const sellerA = await createProvisionedSeller('Coupon Store Alpha');
+  const sellerB = await createProvisionedSeller('Coupon Store Beta');
+  await Store.updateMany({ _id: { $in: [sellerA.store.id, sellerB.store.id] } }, {
+    $set: { plan: 'PREMIUM', 'license.status': 'ACTIVE' },
+  });
+  const headersA = { 'x-store-id': sellerA.store.id };
+  const owned = await createProduct({ storeId: sellerA.store.id, name: 'Alpha Rose Saree', sku: 'ALPHA-ROSE' });
+  const outsider = await createProduct({ storeId: sellerB.store.id, name: 'Beta Rose Saree', sku: 'BETA-ROSE' });
+
+  await call('POST', '/api/seller/coupons', {
+    code: 'ALPHA10', type: 'Percentage', discountValue: 10, applicableProducts: [outsider._id], isActive: true,
+  }, sellerA.token, 400, headersA);
+  const created = await call('POST', '/api/seller/coupons', {
+    code: 'ALPHA10', type: 'Percentage', discountValue: 10, applicableProducts: [owned._id], isActive: true,
+  }, sellerA.token, 201, headersA);
+  assert.equal(String(created.storeId), String(sellerA.store.id));
+
+  const options = await get('/api/seller/coupons/options?type=PRODUCT&search=rose', sellerA.token, headersA);
+  assert.deepEqual(options.items.map((item) => item.id), [String(owned._id)]);
+  assert.equal(options.items.some((item) => item.id === String(outsider._id)), false);
+});
+
 test('variant-group CRUD preserves membership on metadata edits and safely transfers products between groups', async () => {
   const { token } = await createAdmin();
   const first = await createProduct(), second = await createProduct(), hidden = await createProduct({ isActive: false });
@@ -252,6 +319,7 @@ test('customer journey logs in, edits addresses, purchases, follows fulfilment, 
   for (const orderStatus of ['Confirmed', 'Packed']) await call('PUT', `/api/admin/orders/${order._id}/status`, { orderStatus }, admin.token);
   await call('PUT', `/api/admin/orders/${order._id}/shipment`, { courierName: 'Fixture Courier', trackingNumber: 'CUSTOMER-JOURNEY-001', trackingUrl: 'https://example.test/tracking/CUSTOMER-JOURNEY-001' }, admin.token);
   for (const orderStatus of ['Shipped', 'Out for Delivery', 'Delivered']) await call('PUT', `/api/admin/orders/${order._id}/status`, { orderStatus }, admin.token);
+  await call('PUT', `/api/admin/orders/${order._id}/payment-status`, { paymentStatus: 'Paid', note: 'COD collected during delivery' }, admin.token);
   const detail = await get(`/api/orders/${order._id}`, token); assert.equal(detail.orderStatus, 'Delivered');
   assert.equal((await get('/api/orders/my-orders', token)).length, 1);
   assert.equal((await get(`/api/orders/${order._id}/receipt`, token)).finalAmount, order.finalAmount);
@@ -263,12 +331,13 @@ test('customer journey logs in, edits addresses, purchases, follows fulfilment, 
   await call('PATCH', `/api/admin/reviews/${review._id}/visibility`, { isVisible: false }, admin.token);
   assert.equal((await get('/api/reviews/featured')).length, 0);
   await call('PATCH', `/api/admin/reviews/${review._id}/visibility`, { isVisible: true }, admin.token);
-  await call('DELETE', `/api/admin/reviews/${review._id}`, undefined, admin.token);
+  await call('PATCH', `/api/admin/reviews/management/${review._id}/archive`, { reason: 'Customer journey cleanup' }, admin.token);
+  await call('DELETE', `/api/admin/reviews/management/${review._id}?confirm=PERMANENTLY_DELETE`, undefined, admin.token);
   assert.equal((await Product.findById(product._id)).numReviews, 0);
   const returns = await call('POST', '/api/returns', { order: order._id, product: String(product._id), orderItemId: order.orderItems[0]._id, quantity: 1, type: 'return', reason: 'Size issue' }, token, 201);
   assert.equal((await get('/api/admin/returns', admin.token)).length, 1);
   assert.equal((await get(`/api/returns/order/${order._id}`, token)).requests.length, 1);
-  for (const status of ['Approved','Pickup Scheduled','Received','Refunded','Closed']) await call('PUT', `/api/admin/returns/${returns._id}/status`, { status }, admin.token);
+  for (const body of [{status:'Approved'},{status:'Pickup Scheduled'},{status:'Received'},{status:'QC Passed',inventoryDisposition:'RESTOCK',receivedQuantity:1,qcNotes:'Sellable fixture return'},{status:'Refund Initiated',refundAmount:500},{status:'Refunded',refundAmount:500,refundReference:'workflow-refund-001'},{status:'Closed'}]) await call('PUT', `/api/admin/returns/${returns._id}/status`, body, admin.token);
   assert.equal((await Product.findById(product._id)).stock, 6);
   assert.equal((await get('/api/returns/my-requests', token)).length, 1);
   const notifications = await get('/api/notifications', token); assert.ok(notifications.length > 0);
@@ -281,6 +350,8 @@ test('customer journey logs in, edits addresses, purchases, follows fulfilment, 
   await call('DELETE', '/api/cart', undefined, token);
   assert.equal((await get('/api/cart', token)).items.length, 0);
   await call('POST', '/api/auth/logout', {}, token);
+  await call('GET', '/api/auth/me', undefined, token, 401);
+  await call('POST', '/api/auth/refresh', { refreshToken: login.refreshToken }, undefined, 401);
 });
 
 test('support and newsletter actions persist and the seller inbox closes a conversation without external delivery', async () => {
@@ -391,9 +462,11 @@ test('seller CRM, campaign analytics, manual shipment and reports agree with its
   for (const orderStatus of ['Shipped', 'Out for Delivery', 'Delivered']) await call('PUT', `/api/seller/orders/${order._id}/status`, { orderStatus }, seller.token, 200, headers);
   const returnRequest = await call('POST','/api/returns',{order:order._id,product:String(product._id),quantity:1,type:'return',reason:'Fixture return'},customer.token,201,storefrontHeaders);
   assert.equal((await get('/api/seller/returns',seller.token,headers)).length,1);
-  await call('PUT',`/api/seller/returns/${returnRequest._id}/status`,{status:'Received'},other.token,404,{'x-store-id':other.store.id});
+  await call('PUT',`/api/seller/returns/${returnRequest._id}/status`,{status:'Approved'},other.token,404,{'x-store-id':other.store.id});
   assert.equal((await Product.findById(product._id)).stock,7);
+  await call('PUT',`/api/seller/returns/${returnRequest._id}/status`,{status:'Approved'},seller.token,200,headers);
   await call('PUT',`/api/seller/returns/${returnRequest._id}/status`,{status:'Received'},seller.token,200,headers);
+  await call('PUT',`/api/seller/returns/${returnRequest._id}/status`,{status:'QC Passed',inventoryDisposition:'RESTOCK',receivedQuantity:1,qcNotes:'Sellable fixture return'},seller.token,200,headers);
   assert.equal((await Product.findById(product._id)).stock,8);
 });
 
@@ -406,6 +479,7 @@ test('business center isolates abandoned carts, limits reminders, answers from l
     pickupAddress: { fullName: 'Seller', mobile: '9123456789', pincode: '176001', city: 'Kangra', state: 'Himachal Pradesh', houseNo: '1', area: 'Market' },
   });
   const product = await createProduct({ storeId: seller.store.id, stock: 8, name: 'Recovery Workflow Product' });
+  await Coupon.create({ storeId: seller.store.id, code: 'EVERGREEN10', type: 'Percentage', discountValue: 10, isActive: true });
   const customer = await createCustomer({ phone: '9234567890' });
   const olderOrder = await Order.create({
     storeId: seller.store.id, user: customer.user._id,
@@ -440,8 +514,8 @@ test('business center isolates abandoned carts, limits reminders, answers from l
   assert.equal(storefrontConfig.config.branding.logo, '/uploads/store-logo.jpg');
   const design = await get('/api/seller/design', seller.token, headers);
   design.draftConfig.colors.primary = '#123456';
-  await call('PUT', '/api/seller/design', { config: design.draftConfig }, seller.token, 200, headers);
-  await call('POST', '/api/seller/design/publish', {}, seller.token, 200, headers);
+  const savedDesign = await call('PUT', '/api/seller/design', { config: design.draftConfig, expectedRevision: design.revision }, seller.token, 200, headers);
+  await call('POST', '/api/seller/design/publish', { expectedRevision: savedDesign.revision }, seller.token, 200, headers);
   assert.equal((await get(`/api/website-config?store=${seller.store.slug}`)).config.colors.primary, '#123456');
   assert.notEqual((await get('/api/seller/design', other.token, otherHeaders)).draftConfig.colors.primary, '#123456');
 
@@ -449,6 +523,7 @@ test('business center isolates abandoned carts, limits reminders, answers from l
   assert.equal(overview.store.id, seller.store.id);
   assert.equal(overview.platform.id, 'PREMIUM');
   assert.equal(overview.health.metrics.abandonedCarts, 1);
+  assert.equal(overview.health.activeCoupons.some((coupon) => coupon.code === 'EVERGREEN10'), true);
   assert.equal(overview.health.performance.current.orders, 2);
   assert.equal(overview.health.performance.current.paidRevenue, 1200);
   assert.equal(overview.health.period.key, '30d');
@@ -515,6 +590,11 @@ test('admin catalog editing, inventory actions, coupon lifecycle and dashboard a
   const admin = await createAdmin(); const customer = await createCustomer();
   const category = await call('POST', '/api/admin/categories', { name: 'Sarees', slug: 'workflow-sarees' }, admin.token, 201);
   const product = await call('POST', '/api/admin/products', { name: 'Workflow Silk Saree', sku: 'WORKFLOW-CRUD-1', category: category._id, price: 1000, originalPrice: 1600, stock: 5, images: [{ url: '/uploads/test.jpg', primary: true }], colors: ['Rose'], sizingMode: 'auto' }, admin.token, 201);
+  const openingHistory = await get(`/api/admin/inventory/history?product=${product._id}&type=IMPORT`, admin.token);
+  assert.equal(openingHistory.items.length, 1);
+  assert.equal(openingHistory.items[0].stockBefore, 0);
+  assert.equal(openingHistory.items[0].stockAfter, 5);
+  await Product.updateOne({ _id: product._id }, { $unset: { inventoryRevision: 1 } });
   const saved = await call('PUT', `/api/admin/products/${product._id}`, { ...product, name: 'Edited Workflow Silk Saree', description: 'Updated catalog details.' }, admin.token);
   assert.equal(saved.name, 'Edited Workflow Silk Saree');
   assert.equal((await get(`/api/admin/products/${product._id}`, admin.token)).description, 'Updated catalog details.');
@@ -523,7 +603,7 @@ test('admin catalog editing, inventory actions, coupon lifecycle and dashboard a
   assert.equal(inventoryHistory.items[0].type, 'MANUAL_ADJUSTMENT');
   assert.equal(inventoryHistory.items[0].stockAfter, 3);
   assert.equal((await get('/api/admin/inventory/low-stock', admin.token)).length, 1);
-  await call('PATCH', `/api/admin/products/${product._id}/mark-out-of-stock`, {}, admin.token);
+  await call('PATCH', `/api/admin/products/${product._id}/mark-out-of-stock`, { confirm: true }, admin.token);
   assert.equal((await get(`/api/products/${saved.slug}`)).stock, 0);
   await call('PATCH', `/api/admin/products/${product._id}/stock`, { stock: 5 }, admin.token);
   await call('PATCH', `/api/admin/products/${product._id}/hide`, {}, admin.token);
@@ -567,6 +647,110 @@ test('store content edits update published wording and reject stale saves withou
   assert.equal(published.config.branding.websiteName, 'Workflow Collection');
   assert.deepEqual(published.config.colors, before.config.colors);
   await call('PUT', '/api/admin/store-content', { revision: current.revision, content: current.content, sections: current.sections }, master.token, 409);
+});
+
+test('content studio drafts, reviews, publishes and restores wording without replacing design data', async () => {
+  const master = await createMasterOwner();
+  await get('/api/admin/customization', master.token);
+  const initial = await get('/api/admin/store-content', master.token);
+  const publicBefore = await get('/api/website-config');
+  const draftContent = structuredClone(initial.draft);
+  draftContent.sections[0].heading = 'Content Studio festive edit';
+
+  const draftSaved = await call('PUT', '/api/admin/store-content/draft', { revision: initial.revision, content: draftContent }, master.token);
+  assert.equal((await get('/api/website-config')).config.homepage.sections[0].heading, publicBefore.config.homepage.sections[0].heading);
+  const review = await call('POST', '/api/admin/store-content/preflight', { revision: draftSaved.revision, content: draftContent }, master.token);
+  assert.ok(review.changes.some((item) => item.path === 'sections.hero.heading'));
+  await call('POST', '/api/admin/store-content/preflight', { revision: draftSaved.revision, content: { ...draftContent, colors: { primary: '#000000' } } }, master.token, 403);
+
+  const published = await call('POST', '/api/admin/store-content/publish', { revision: draftSaved.revision, content: draftContent, note: 'Festive copy release' }, master.token);
+  assert.equal(published.version, 2);
+  const publicAfter = await get('/api/website-config');
+  assert.equal(publicAfter.config.homepage.sections[0].heading, 'Content Studio festive edit');
+  assert.deepEqual(publicAfter.config.colors, publicBefore.config.colors);
+  assert.deepEqual(publicAfter.config.homepage.sectionProductIds, publicBefore.config.homepage.sectionProductIds);
+
+  const versions = await get('/api/admin/store-content/history', master.token);
+  assert.equal(versions.length, 2);
+  assert.equal(versions[0].note, 'Festive copy release');
+  assert.equal(versions[1].kind, 'BASELINE');
+  const latest = await get('/api/admin/store-content', master.token);
+  const changedAgain = structuredClone(latest.draft);
+  changedAgain.sections[0].heading = 'Unpublished replacement';
+  const changedDraft = await call('PUT', '/api/admin/store-content/draft', { revision: latest.revision, content: changedAgain }, master.token);
+  const restored = await call('POST', `/api/admin/store-content/history/${versions[0]._id}/restore`, { revision: changedDraft.revision }, master.token);
+  assert.equal(restored.draft.sections[0].heading, 'Content Studio festive edit');
+  assert.equal((await get('/api/website-config')).config.homepage.sections[0].heading, 'Content Studio festive edit');
+});
+
+test('scheduled content saves the draft and publishes through the background release worker', async () => {
+  const master = await createMasterOwner();
+  await get('/api/admin/customization', master.token);
+  const initial = await get('/api/admin/store-content', master.token);
+  const content = structuredClone(initial.draft);
+  content.sections[0].heading = 'Worker published collection';
+  const future = new Date(Date.now() + 5 * 60000).toISOString();
+  const scheduled = await call('POST', '/api/admin/store-content/schedule', { revision: initial.revision, content, scheduledFor: future, note: 'Worker release', timezone: 'Asia/Kolkata' }, master.token);
+  assert.equal(scheduled.draft.sections[0].heading, 'Worker published collection');
+  assert.equal(scheduled.scheduledStatus, 'SCHEDULED');
+  await call('POST', '/api/admin/store-content/schedule', { revision: scheduled.revision, content, scheduledFor: future }, master.token, 409);
+
+  await WebsiteTheme.updateOne({ isActive: true }, { $set: { scheduledContentFor: new Date(Date.now() - 1000), scheduledContentStatus: 'SCHEDULED' } });
+  const processed = await require('../services/storeContentService').processDueContentReleases();
+  assert.equal(processed, 1);
+  const publicAfter = await get('/api/website-config');
+  assert.equal(publicAfter.config.homepage.sections[0].heading, 'Worker published collection');
+  const workspace = await get('/api/admin/store-content', master.token);
+  assert.equal(workspace.scheduledFor, null);
+  const history = await get('/api/admin/store-content/history?paged=1&page=1&limit=20', master.token);
+  assert.equal(history.items[0].kind, 'SCHEDULED');
+  assert.equal(history.items[0].state, 'PUBLISHED');
+  assert.equal(history.pagination.total, 2);
+});
+
+test('failed content releases wait before automatic retry instead of exhausting every attempt', async () => {
+  const master = await createMasterOwner();
+  await get('/api/admin/customization', master.token);
+  const workspace = await get('/api/admin/store-content', master.token);
+  const invalidContent = structuredClone(workspace.draft);
+  invalidContent.sections[0].buttonLink = 'https://outside.example/products';
+  await WebsiteTheme.updateOne({ isActive: true }, { $set: {
+    scheduledContent: invalidContent,
+    scheduledContentId: 'retry-backoff-release',
+    scheduledContentFor: new Date(Date.now() - 1000),
+    scheduledContentStatus: 'SCHEDULED',
+    scheduledContentAttempts: 0,
+  } });
+  const releases = require('../services/storeContentService');
+  assert.equal(await releases.processDueContentReleases(), 1);
+  let theme = await WebsiteTheme.findOne({ isActive: true }).lean();
+  assert.equal(theme.scheduledContentStatus, 'FAILED');
+  assert.equal(theme.scheduledContentAttempts, 1);
+  assert.match(theme.scheduledContentError, /safe store path/i);
+  assert.equal(await releases.processDueContentReleases(), 0);
+  theme = await WebsiteTheme.findOne({ isActive: true }).lean();
+  assert.equal(theme.scheduledContentAttempts, 1);
+});
+
+test('seller content studio is isolated per store and updates only that storefront', async () => {
+  const master = await createMasterOwner();
+  await get('/api/admin/customization', master.token);
+  const sellerA = await createProvisionedSeller('Content Store Alpha');
+  const sellerB = await createProvisionedSeller('Content Store Beta');
+  await Store.updateMany({ _id: { $in: [sellerA.store.id, sellerB.store.id] } }, { $set: { status: 'PUBLISHED', publishedAt: new Date() } });
+  const headersA = { 'x-store-id': sellerA.store.id };
+  const headersB = { 'x-store-id': sellerB.store.id };
+  const currentA = await get('/api/seller/content', sellerA.token, headersA);
+  const currentB = await get('/api/seller/content', sellerB.token, headersB);
+  const alphaContent = structuredClone(currentA.draft);
+  alphaContent.sections[0].heading = 'Alpha private storefront copy';
+  const saved = await call('PUT', '/api/seller/content/draft', { expectedRevision: currentA.revision, content: alphaContent }, sellerA.token, 200, headersA);
+  await call('POST', '/api/seller/content/publish', { expectedRevision: saved.revision, content: alphaContent }, sellerA.token, 200, headersA);
+  const publicA = await get('/api/website-config', undefined, { 'x-store-slug': sellerA.store.slug });
+  const publicB = await get('/api/website-config', undefined, { 'x-store-slug': sellerB.store.slug });
+  assert.equal(publicA.config.homepage.sections[0].heading, 'Alpha private storefront copy');
+  assert.equal(publicB.config.homepage.sections[0].heading, currentB.published.sections[0].heading);
+  assert.notEqual(publicB.config.homepage.sections[0].heading, 'Alpha private storefront copy');
 });
 
 test('owner-controlled client admin handover and role switching retain guarded permissions', async (t) => {
@@ -617,11 +801,83 @@ test('legacy payment aliases create and verify the same signed persisted gateway
   Object.assign(process.env,{RAZORPAY_KEY_ID:'rzp_test_workflow_fixture',RAZORPAY_KEY_SECRET:'workflow-fixture-signing-secret',RAZORPAY_MOCK:'1'});
   await setSettings({razorpayEnabled:true});
   const customer=await createCustomer(),product=await createProduct({stock:3});
-  const payment=await call('POST','/api/create-order',{orderItems:[{product:String(product._id),quantity:1,size:'M',color:'Red'}],shippingAddress:validAddress(),paymentMethod:'UPI'},customer.token);
+  const payment=await call('POST','/api/create-order',{checkoutAttemptId:'legacy_checkout_alias_001',orderItems:[{product:String(product._id),quantity:1,size:'M',color:'Red'}],shippingAddress:validAddress(),paymentMethod:'UPI'},customer.token);
   const paymentId='pay_workflow_fixture';
   const payload={razorpay_order_id:payment.razorpayOrderId,razorpay_payment_id:paymentId,razorpay_signature:require('node:crypto').createHmac('sha256',process.env.RAZORPAY_KEY_SECRET).update(`${payment.razorpayOrderId}|${paymentId}`).digest('hex')};
   await call('POST','/api/verify-payment',payload,customer.token);
   await call('POST','/api/verify-payment',payload,customer.token);
   assert.equal((await get(`/api/orders/${payment.orderId}`,customer.token)).paymentStatus,'Paid');
   assert.equal((await Product.findById(product._id)).stock,2);
+});
+
+test('inventory operations protect stale counts, receive supplier stock and preserve a reversible ledger', async () => {
+  const admin = await createAdmin();
+  const product = await createProduct({ name: 'Inventory workflow kurta', sku: 'INV-WORKFLOW-1', stock: 5, costPrice: 400, lowStockAlert: 4 });
+  await Product.updateOne({ _id: product._id }, { $unset: { inventoryRevision: 1 } });
+
+  const catalog = await get('/api/admin/inventory/catalog?page=1&limit=25&q=INV-WORKFLOW-1', admin.token);
+  assert.equal(catalog.total, 1);
+  assert.equal(catalog.items[0].available, 5);
+  assert.equal(catalog.items[0].inventoryStatus, 'HEALTHY');
+
+  const adjustment = await call('POST', '/api/admin/inventory/adjustments', {
+    productId: product._id, mode: 'ADD', bucket: 'SELLABLE', quantity: 3,
+    expectedStock: 5, expectedRevision: 0, reasonCode: 'CORRECTION',
+    note: 'Counted at demo fixture', idempotencyKey: 'inventory-workflow-adjustment',
+  }, admin.token);
+  assert.equal(adjustment.product.stock, 8);
+  assert.equal(adjustment.movement.stockBefore, 5);
+  assert.equal(adjustment.movement.stockAfter, 8);
+
+  await call('POST', '/api/admin/inventory/adjustments', {
+    productId: product._id, mode: 'SET', bucket: 'SELLABLE', quantity: 9,
+    expectedStock: 5, expectedRevision: 0, reasonCode: 'STOCK_COUNT',
+  }, admin.token, 409);
+  assert.equal((await Product.findById(product._id)).stock, 8);
+
+  const purchase = await call('POST', '/api/admin/inventory/purchase-orders', {
+    supplier: { name: 'Workflow Textiles', phone: '9816978086', email: 'supplier@example.com' },
+    items: [{ productId: product._id, quantity: 10, unitCost: 390 }], notes: 'Demo restock',
+  }, admin.token, 201);
+  assert.equal(purchase.remaining, 10);
+
+  const received = await call('POST', `/api/admin/inventory/purchase-orders/${purchase._id}/receive`, {
+    revision: 0, items: [{ itemId: purchase.items[0]._id, quantity: 6, damagedQuantity: 1 }], note: 'One unit damaged in transit',
+  }, admin.token);
+  assert.equal(received.status, 'PARTIALLY_RECEIVED');
+  assert.equal(received.remaining, 3);
+  let stored = await Product.findById(product._id).lean();
+  assert.equal(stored.stock, 14);
+  assert.equal(stored.nonSellableStock.damaged, 1);
+
+  const history = await get(`/api/admin/inventory/history?product=${product._id}&limit=25`, admin.token);
+  const correction = history.items.find((item) => item.reasonCode === 'CORRECTION');
+  assert.equal(correction.reversible, true);
+  await call('POST', `/api/admin/inventory/adjustments/${correction._id}/reverse`, { note: 'Correction was entered twice' }, admin.token);
+  stored = await Product.findById(product._id).lean();
+  assert.equal(stored.stock, 11);
+  assert.equal((await get(`/api/admin/inventory/history?product=${product._id}&type=REVERSAL`, admin.token)).items.length, 1);
+
+  const summary = await get('/api/admin/inventory/summary', admin.token);
+  assert.equal(summary.sellable, 11);
+  assert.equal(summary.incoming, 3);
+  assert.equal(summary.damaged, 1);
+});
+
+test('concurrent purchase receiving applies a supplier delivery exactly once', async () => {
+  const admin = await createAdmin();
+  const product = await createProduct({ name: 'Concurrent receiving product', sku: 'INV-RECEIVE-LOCK', stock: 1 });
+  const purchase = await call('POST', '/api/admin/inventory/purchase-orders', {
+    supplier: { name: 'Safe Supplier' }, items: [{ productId: product._id, quantity: 4, unitCost: 100 }],
+  }, admin.token, 201);
+  const options = { method: 'POST', token: admin.token, body: { revision: 0, items: [{ itemId: purchase.items[0]._id, quantity: 4, damagedQuantity: 0 }] } };
+  const responses = await Promise.all([
+    request(`/api/admin/inventory/purchase-orders/${purchase._id}/receive`, options),
+    request(`/api/admin/inventory/purchase-orders/${purchase._id}/receive`, options),
+  ]);
+  assert.deepEqual(responses.map((response) => response.status).sort(), [200, 409]);
+  assert.equal((await Product.findById(product._id)).stock, 5);
+  const history = await get(`/api/admin/inventory/history?product=${product._id}&type=PURCHASE_RECEIPT`, admin.token);
+  assert.equal(history.items.length, 1);
+  assert.equal(history.items[0].quantity, 4);
 });

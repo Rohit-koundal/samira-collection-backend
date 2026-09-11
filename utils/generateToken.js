@@ -10,9 +10,11 @@ function tokenPayload(user) {
     name: user.name,
     role: user.role,
     activeMode: user.activeMode,
+    authSessionVersion: Number(user.authSessionVersion || 0),
     offlineSession: !!user.offlineSession,
     ...(user.$locals?.masterAuthenticated && user.masterSessionVersion ? { masterSessionVersion: user.masterSessionVersion } : {}),
     ...(user.$locals?.localOwnerDemo ? { localOwnerDemo: true } : {}),
+    ...(user.$locals?.hostedOwnerDemo ? { hostedOwnerDemo: true } : {}),
   };
 }
 

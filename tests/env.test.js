@@ -7,6 +7,7 @@ const {
   getJwtSecret,
   isDemoOtpMode,
   missingProductionSecrets,
+  productionConfigurationIssues,
 } = require('../config/env');
 
 function withEnv(overrides, work) {
@@ -57,6 +58,31 @@ test('development may fall back to a local-only JWT secret', () => {
   }, () => {
     assert.match(getJwtSecret(), /dev_only/);
     assert.match(getJwtRefreshSecret(), /dev_only/);
+  });
+});
+
+test('strict production validation rejects weak secrets and incomplete required providers', () => {
+  withEnv({
+    NODE_ENV: 'production',
+    JWT_SECRET: 'change_before_production',
+    JWT_REFRESH_SECRET: 'change_before_production',
+    MONGO_URI: 'mongodb://example.invalid/store',
+    REQUIRE_MEDIA_STORAGE: 'true',
+    REQUIRE_REDIS: 'true',
+    PAYMENTS_ENABLED: 'true',
+    R2_ACCOUNT_ID: undefined,
+    CLOUDINARY_CLOUD_NAME: undefined,
+    REDIS_URL: undefined,
+    RAZORPAY_KEY_ID: undefined,
+    RAZORPAY_KEY_SECRET: undefined,
+    RAZORPAY_WEBHOOK_SECRET: undefined,
+  }, () => {
+    const issues = productionConfigurationIssues();
+    assert.ok(issues.some((item) => item.includes('JWT_SECRET')));
+    assert.ok(issues.some((item) => item.includes('different')));
+    assert.ok(issues.some((item) => item.includes('media storage')));
+    assert.ok(issues.some((item) => item.includes('REDIS_URL')));
+    assert.ok(issues.some((item) => item.includes('Razorpay')));
   });
 });
 

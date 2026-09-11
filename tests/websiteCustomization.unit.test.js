@@ -3,9 +3,9 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { DEFAULT_WEBSITE_CONFIG, normalizeWebsiteConfig, getPresetList } = require('../config/websiteCustomization');
 
-test('all seventeen presets have complete, independent configurations and coordinated palettes', () => {
+test('all premium and industry presets have complete, independent configurations and coordinated palettes', () => {
   const presets = getPresetList();
-  assert.equal(presets.length, 17);
+  assert.equal(presets.length, 21);
   for (const preset of presets) {
     assert.equal(preset.config.theme.preset, preset.id);
     assert.equal(preset.config.mobile.enabled, false);
@@ -68,6 +68,7 @@ test('unsafe URLs are removed and catalog values survive normalization', () => {
   const config = normalizeWebsiteConfig({
     branding: { logo: 'javascript:alert(1)', favicon: '/uploads/favicon.png' },
     homepage: { sections: [null, { id: 'hero', buttonLink: '/\\evil.test', image: 'data:text/html,unsafe', backgroundImage: 'https://images.example.com/hero.jpg' }],
+      blocks: [{ id: 'campaign-hero', type: 'hero', image: '/uploads/hero.webp', altText: 'Campaign' }, { id: 'categories', type: 'category-carousel', categoryIds: ['1', '2'] }],
       sectionProductIds: { featured: ['1', '1', '2'] } },
     footer: { logo: '//evil.test/image.png', menus: { shopping: [{ label: 'Bad', path: '/\\evil.test' }] } },
   });
@@ -79,6 +80,7 @@ test('unsafe URLs are removed and catalog values survive normalization', () => {
   assert.equal(config.homepage.sections[0].image, '');
   assert.equal(config.homepage.sections[0].backgroundImage, 'https://images.example.com/hero.jpg');
   assert.deepEqual(config.homepage.sectionProductIds.featured, ['1', '2']);
+  assert.deepEqual(config.homepage.blocks.map((block) => block.type), ['hero', 'category-carousel']);
 });
 
 test('stale draft save, publish, reset, activation and restore requests fail before writes', async (t) => {

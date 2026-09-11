@@ -7,6 +7,11 @@ const variantSchema = new mongoose.Schema({
   color: { type: String, default: '' },
   optionValues: { type: Map, of: String, default: {} },
   stock: { type: Number, default: 0, min: 0 },
+  lowStockAlert: { type: Number, min: 0 },
+  nonSellableStock: {
+    damaged: { type: Number, min: 0, default: 0 },
+    quarantine: { type: Number, min: 0, default: 0 },
+  },
   price: Number,
   originalPrice: Number,
   images: [{ url: String, publicId: String, primary: { type: Boolean, default: false } }],
@@ -73,6 +78,15 @@ const productSchema = new mongoose.Schema({
   variants: { type: [variantSchema], default: [] },
   stock: { type: Number, required: true, default: 0 },
   lowStockAlert: { type: Number, default: 5 },
+  inventoryRevision: { type: Number, min: 0, default: 0 },
+  nonSellableStock: {
+    damaged: { type: Number, min: 0, default: 0 },
+    quarantine: { type: Number, min: 0, default: 0 },
+  },
+  inventoryLocation: { type: String, trim: true, maxlength: 120, default: '' },
+  binLocation: { type: String, trim: true, maxlength: 80, default: '' },
+  lastInventoryChangeAt: Date,
+  lastInventoryChangedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   reorderQuantity: { type: Number, min: 0, default: 0 },
   shippingWeightKg: { type: Number, min: 0, max: 1000, default: 0 },
   packageDimensions: {
@@ -98,6 +112,9 @@ const productSchema = new mongoose.Schema({
   highlights: [String],
   careInstructions: String,
   returnPolicy: String,
+  returnable: { type: Boolean, default: true },
+  exchangeable: { type: Boolean, default: true },
+  returnWindowDays: { type: Number, min: 0, max: 365 },
   metaTitle: String,
   metaDescription: String,
   metaKeywords: String,
@@ -121,6 +138,7 @@ productSchema.index({ storeId: 1, category: 1, createdAt: -1 });
 productSchema.index({ storeId: 1, isActive: 1, createdAt: -1 });
 productSchema.index({ storeId: 1, isArchived: 1, updatedAt: -1 });
 productSchema.index({ storeId: 1, barcode: 1 }, { unique: true, partialFilterExpression: { barcode: { $type: 'string', $gt: '' } } });
+productSchema.index({ storeId: 1, stock: 1, updatedAt: -1 });
 
 productSchema.pre('save', function syncVariantStock(next) {
   if (Array.isArray(this.variants) && this.variants.length) {

@@ -9,6 +9,16 @@ const { logAudit } = require('../services/auditService');
 const { auditSnapshot } = require('../utils/auditData');
 const { normalizeSettingsUpdates } = require('../services/storeSettingsValidation');
 
+const SETTINGS_PERMISSION_FIELDS = Object.freeze({
+  branding: ['storeName', 'brandIdentityEnabled', 'logoUrl', 'faviconUrl', 'tagline', 'seoTitle', 'seoDescription', 'socialShareImage', 'searchIndexingEnabled', 'legalBusinessName', 'gstin', 'invoicePrefix', 'billingAddress'],
+  content: ['contactDetailsEnabled', 'announcementEnabled', 'announcementText', 'supportHours', 'invoiceNote', 'contactEmail', 'contactPhone', 'whatsappNumber', 'address', 'footerText', 'returnPolicy', 'privacyPolicy', 'termsConditions', 'shippingPolicy', 'cancellationPolicy', 'sizeGuide', 'faqs', 'ourStory'],
+  pricing: ['acceptingOrders', 'orderPauseMessage', 'minimumOrderAmount', 'platformFee', 'gstRate'],
+  shipping: ['shippingProvider', 'shippingPricingMode', 'shippingFreeAboveEnabled', 'shippingDefaultWeightKg', 'shippingLengthCm', 'shippingWidthCm', 'shippingHeightCm', 'shippingVolumetricDivisor', 'shippingWeightStepKg', 'shippingAdditionalStepCharge', 'shippingRateZones', 'shippingPickup', 'freeShippingMinAmount', 'deliveryCharge'],
+  payments: ['razorpayEnabled', 'upiEnabled', 'cardPaymentEnabled', 'netBankingEnabled', 'walletEnabled', 'codEnabled', 'codCharge', 'codMinAmount', 'codMaxAmount', 'codPincodes', 'prepaidDiscountType', 'prepaidDiscountValue', 'codConfirmationRequired', 'rtoBlockEnabled', 'rtoBlockMinOrders', 'rtoBlockThreshold', 'rtoRefundDeduction'],
+  returns: ['returnsEnabled', 'returnWindowDays', 'refundDeliveryChargeOnFullReturn', 'refundPlatformFeeOnFullReturn', 'refundCodChargeOnFullReturn', 'customerReturnShippingCharge', 'customerRestockingFeePercent', 'exchangeReservationHours', 'returnSlaHours'],
+  social: ['socialLinks', 'appLinks'],
+});
+
 exports.getSettings = asyncHandler(async (req, res) => {
   const settings = (await Settings.findOne(req.tenantFilter || {})) || await Settings.create({ ...(req.store?._id ? { storeId: req.store._id } : {}) });
   const data = settings.toObject();
@@ -79,15 +89,16 @@ exports.updateSettings = asyncHandler(async (req, res) => {
   const updates = normalizeSettingsUpdates(input, current);
   if (!isMasterOwner(req.user)) {
     const permissions = (await readConfiguration(req.store?._id)).structure.clientPermissions;
-    const paymentFields = ['razorpayEnabled', 'upiEnabled', 'cardPaymentEnabled', 'netBankingEnabled', 'walletEnabled', 'codEnabled', 'codCharge', 'codMinAmount', 'codMaxAmount', 'codPincodes', 'prepaidDiscountType', 'prepaidDiscountValue', 'codConfirmationRequired', 'rtoBlockEnabled', 'rtoBlockMinOrders', 'rtoBlockThreshold', 'platformFee', 'gstRate'];
     const changed = fields => fields.some(key => updates[key] !== undefined && JSON.stringify(updates[key]) !== JSON.stringify(current[key]));
-    if (!permissions.payments && changed(paymentFields)) throw new ApiError('FORBIDDEN', 'Payment configuration is managed by the store owner');
-    if (!permissions.content && changed(Object.keys(updates).filter(key => !paymentFields.includes(key)))) throw new ApiError('FORBIDDEN', 'Store settings are managed by the store owner');
+    const labels = { branding: 'Brand identity', content: 'Store content', pricing: 'Pricing', shipping: 'Shipping', payments: 'Payment', returns: 'Returns', social: 'Social links' };
+    for (const [capability, fields] of Object.entries(SETTINGS_PERMISSION_FIELDS)) {
+      if (permissions?.[capability] === false && changed(fields)) throw new ApiError('FORBIDDEN', `${labels[capability]} configuration is managed by the platform owner`);
+    }
   }
   const filter = previous ? { _id: previous._id, ...(current.updatedAt ? { updatedAt: current.updatedAt } : {}) } : { ...(req.store?._id ? { storeId: req.store._id } : {}) };
   const saved = await Settings.findOneAndUpdate(filter, { $set: updates, ...(!previous && req.store?._id ? { $setOnInsert: { storeId: req.store._id } } : {}) }, { new: true, upsert: !previous, runValidators: true, setDefaultsOnInsert: true });
   if (!saved) throw new ApiError('DUPLICATE_REQUEST', 'Settings changed while saving. Reload and review your changes.');
   require('./websiteCustomizationController')._invalidateActiveCache();
-  logAudit({ req, action: 'SETTINGS_UPDATE', entityType: 'Settings', entityId: saved._id, before: auditSnapshot(previous, Object.keys(updates)), after: auditSnapshot(saved, Object.keys(updates)) });
+  await logAudit({ req, action: 'SETTINGS_UPDATE', entityType: 'Settings', entityId: saved._id, before: auditSnapshot(previous, Object.keys(updates)), after: auditSnapshot(saved, Object.keys(updates)) });
   res.json(saved);
 });

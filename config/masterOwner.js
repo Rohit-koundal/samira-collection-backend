@@ -13,12 +13,20 @@ function isMasterOwner(user) {
 function attachMasterSession(user, claims = {}) {
   if (!user) return user;
   user.$locals = user.$locals || {};
+  const version = String(user.masterSessionVersion || '');
+  const localVersion = version.startsWith('local-demo:');
+  const hostedVersion = version.startsWith('hosted-demo:');
+  const matchingSessionType = localVersion
+    ? claims.localOwnerDemo === true && claims.hostedOwnerDemo !== true
+    : hostedVersion
+      ? claims.hostedOwnerDemo === true && claims.localOwnerDemo !== true
+      : claims.localOwnerDemo !== true && claims.hostedOwnerDemo !== true;
   user.$locals.masterAuthenticated = Boolean(isOwnerAccount(user) && user.systemRole === 'MASTER_OWNER' &&
     user.isPhoneVerified && !user.isBlocked && !user.offlineSession &&
     user.masterSessionVersion && claims.masterSessionVersion === user.masterSessionVersion
-    && !String(user.masterSessionVersion).startsWith('hosted-demo:')
-    && String(user.masterSessionVersion).startsWith('local-demo:') === (claims.localOwnerDemo === true));
+    && matchingSessionType);
   user.$locals.localOwnerDemo = user.$locals.masterAuthenticated && claims.localOwnerDemo === true;
+  user.$locals.hostedOwnerDemo = user.$locals.masterAuthenticated && claims.hostedOwnerDemo === true;
   return user;
 }
 function assertMasterOwner(user) {

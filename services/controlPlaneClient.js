@@ -15,11 +15,20 @@ async function runtimeTelemetry() {
     const Product = require('../models/Product');
     const Order = require('../models/Order');
     const monthStart = new Date(); monthStart.setUTCDate(1); monthStart.setUTCHours(0, 0, 0, 0);
+    const pingStartedAt = Date.now();
+    if (mongoose.connection.readyState === 1) await mongoose.connection.db.admin().ping();
     const [products, ordersPerMonth] = await Promise.all([
       Product.countDocuments({ isArchived: { $ne: true } }),
       Order.countDocuments({ createdAt: { $gte: monthStart }, orderStatus: { $ne: 'Cancelled' } }),
     ]);
-    return { products, ordersPerMonth, databaseStatus: mongoose.connection.readyState === 1 ? 'CONNECTED' : 'DISCONNECTED', serviceStatus: 'HEALTHY' };
+    return {
+      products, ordersPerMonth, databaseStatus: mongoose.connection.readyState === 1 ? 'CONNECTED' : 'DISCONNECTED', serviceStatus: 'HEALTHY',
+      databaseLatencyMs: Date.now() - pingStartedAt, uptimeSeconds: Math.floor(process.uptime()),
+      memoryRssMb: Math.round(process.memoryUsage().rss / 1048576), nodeVersion: process.version,
+      paymentReady: Boolean(process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET),
+      mediaStorageReady: Boolean((process.env.R2_ACCOUNT_ID && process.env.R2_ACCESS_KEY_ID && process.env.R2_SECRET_ACCESS_KEY) || (process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_API_KEY && process.env.CLOUDINARY_API_SECRET)),
+      shippingProvider: String(process.env.SHIPPING_PROVIDER || 'disabled').slice(0, 60),
+    };
   } catch (error) {
     return { databaseStatus: 'DISCONNECTED', serviceStatus: 'DEGRADED', lastError: String(error.message || 'Telemetry unavailable').slice(0, 300) };
   }
@@ -95,7 +104,7 @@ async function licenseStatus({ force = false } = {}) {
   }
   try {
     if (!refreshPromise) refreshPromise = (async () => {
-      const envelope = await remote('/validate', { appVersion: config.appVersion, telemetry: await runtimeTelemetry() });
+      const envelope = await remote('/validate', { appVersion: config.appVersion, protocolVersion: 1, telemetry: await runtimeTelemetry() });
       const payload = parseAndVerify(envelope, config);
       await saveEnvelope(envelope, config);
       return payload;
@@ -127,6 +136,7 @@ function publicStatus(status) {
     updateAvailable: Boolean(status.updateAvailable), updateChannel: status.updateChannel || 'stable',
     release: status.release || null, issuedAt: status.issuedAt || null, validUntil: status.validUntil || null, graceUntil: status.graceUntil || null,
     checkoutConfigured: Boolean(status.checkoutConfigured),
+    pricing: status.pricing && typeof status.pricing === 'object' ? status.pricing : null,
     plans: Array.isArray(status.plans) ? status.plans : [],
   };
 }

@@ -89,9 +89,36 @@ function requireStorePermission(permission) {
     if (!roleAllows(req.storeMember.role, permission)) {
       return next(new ApiError('FORBIDDEN', 'You do not have permission for this action'));
     }
+    const capability = permissionCapability(permission);
+    if (!isMasterOwner(req.user) && capability && req.store?.catalogStructure?.clientPermissions?.[capability] === false) {
+      return next(new ApiError('FORBIDDEN', `${capabilityLabel(capability)} is disabled by the platform owner`));
+    }
     return next();
   };
 }
+
+function requireAnyStorePermission(...permissions) {
+  return (req, res, next) => {
+    if (!req.storeMember) return next(new ApiError('FORBIDDEN', 'Seller access required'));
+    const allowed = permissions.filter((permission) => roleAllows(req.storeMember.role, permission));
+    if (!allowed.length) {
+      return next(new ApiError('FORBIDDEN', 'You do not have permission for this action'));
+    }
+    if (!isMasterOwner(req.user) && allowed.every((permission) => {
+      const capability = permissionCapability(permission);
+      return capability && req.store?.catalogStructure?.clientPermissions?.[capability] === false;
+    })) return next(new ApiError('FORBIDDEN', 'This capability is disabled by the platform owner'));
+    return next();
+  };
+}
+
+const CAPABILITY_BY_PERMISSION = Object.freeze({
+  catalog: 'catalog', inventory: 'inventory', orders: 'orders', returns: 'returns', reviews: 'reviews',
+  marketing: 'discounts', design: 'websiteDesign', content: 'content', reports: 'reports', crm: 'customers',
+  inbox: 'social', instagram: 'social', support: 'customers', audit: 'reports',
+});
+function permissionCapability(permission) { return CAPABILITY_BY_PERMISSION[String(permission || '').split('.')[0]] || ''; }
+function capabilityLabel(value) { return String(value || '').replace(/([A-Z])/g, ' $1').replace(/^./, (letter) => letter.toUpperCase()); }
 
 function requireStoreFeature(feature) {
   return (req, _res, next) => {
@@ -113,6 +140,9 @@ function requireActiveStoreLicenseForWrites(req, _res, next) {
 
 function assertStoreCanAcceptOrders(store) {
   if (!store) return;
+  if (store.checkoutEnabled === false || store.archivedAt || store.status === 'SUSPENDED') {
+    throw new ApiError('SUBSCRIPTION_REQUIRED', 'This store is temporarily not accepting new orders. Please contact the store for help.');
+  }
   const plan = planSummary(store);
   if (['EXPIRED', 'SUSPENDED'].includes(plan.status)) {
     throw new ApiError('SUBSCRIPTION_REQUIRED', 'This store is temporarily not accepting new orders. Please contact the store for help.');
@@ -169,5 +199,6 @@ module.exports = {
   requireActiveStoreLicenseForWrites,
   requireProductCapacity,
   requireStorePermission,
+  requireAnyStorePermission,
   stripClientStoreId,
 };

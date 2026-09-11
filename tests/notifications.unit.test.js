@@ -30,7 +30,9 @@ test('customer inbox filters by recipient, delivered in-app channel, category an
   t.mock.method(Notification, 'countDocuments', async (filter) => { assert.deepEqual(filter, captured); return 43; });
   const { body, error } = await invoke(controller.myNotifications, req({ query: { page: '2', limit: '20', category: 'orders', read: 'unread' } }));
   assert.equal(error, undefined);
-  assert.deepEqual(captured, { user: userId, channel: 'IN_APP', status: 'SENT', audience: { $ne: 'ADMIN' }, readAt: null, event: { $regex: '^ORDER_' } });
+  assert.ok(captured.deliverAfter.$not.$gt instanceof Date);
+  const { deliverAfter, ...visibleFilter } = captured;
+  assert.deepEqual(visibleFilter, { user: userId, channel: 'IN_APP', status: 'SENT', audience: { $ne: 'ADMIN' }, readAt: null, event: { $regex: '^ORDER_' } });
   assert.equal(body.total, 43); assert.equal(body.totalPages, 3); assert.equal(body.items.length, 1);
 });
 
@@ -46,7 +48,9 @@ test('unread summary counts the entire inbox, independently of the list page', a
 
 test('mark all read updates only the signed-in recipient, including updates on other pages', async (t) => {
   t.mock.method(Notification, 'updateMany', async (filter, update) => {
-    assert.deepEqual(filter, { user: userId, channel: 'IN_APP', status: 'SENT', audience: { $ne: 'ADMIN' }, readAt: null });
+    assert.ok(filter.deliverAfter.$not.$gt instanceof Date);
+    const { deliverAfter, ...ownedVisibleFilter } = filter;
+    assert.deepEqual(ownedVisibleFilter, { user: userId, channel: 'IN_APP', status: 'SENT', audience: { $ne: 'ADMIN' }, readAt: null });
     assert.ok(update.$set.readAt instanceof Date);
     return { modifiedCount: 200 };
   });
@@ -74,7 +78,20 @@ test('invalid read filters and notification identifiers are rejected', async () 
 });
 
 test('admin inbox includes staff alerts but still requires the exact recipient', () => {
-  assert.deepEqual(controller.recipientFilter(req({ user: { _id: userId, role: 'admin' } })), { user: userId, channel: 'IN_APP', status: 'SENT' });
+  const filter = controller.recipientFilter(req({ user: { _id: userId, role: 'admin' } }));
+  assert.ok(filter.deliverAfter.$not.$gt instanceof Date);
+  delete filter.deliverAfter;
+  assert.deepEqual(filter, { user: userId, channel: 'IN_APP', status: 'SENT' });
+});
+
+test('scheduled in-app notifications stay queued until their delivery time', async (t) => {
+  t.mock.method(User, 'find', () => ({ select: async () => [] }));
+  const deliverAfter = new Date(Date.now() + 86400000);
+  let stored;
+  t.mock.method(Notification, 'bulkWrite', async (operations) => { stored = operations[0].updateOne.update.$setOnInsert; });
+  await notify({ userId, event: 'REVIEW_REQUEST', title: 'How was your order?', metadata: { orderId: 'order-review-1' }, deliverAfter });
+  assert.equal(stored.deliverAfter, deliverAfter);
+  assert.equal(stored.event, 'REVIEW_REQUEST');
 });
 
 test('order events create separate customer and active-admin alerts, with repeat delivery deduplicated', async (t) => {
@@ -95,6 +112,25 @@ test('order events create separate customer and active-admin alerts, with repeat
   assert.equal(saved.size, 3);
   assert.equal([...saved.values()].filter((item) => item.audience === 'ADMIN').length, 2);
   assert.ok([...saved.values()].every((item) => item.status === 'SENT' && item.storeId === 'store-1' && item.createdAt instanceof Date));
+});
+
+test('a negative review keeps the customer message and sends a priority review event to staff', async (t) => {
+  t.mock.method(User, 'find', () => ({ select: async () => [{ _id: 'staff-review' }] }));
+  let stored = [];
+  t.mock.method(Notification, 'bulkWrite', async (operations) => {
+    stored = operations.map((operation) => operation.updateOne.update.$setOnInsert);
+  });
+  await notify({
+    userId,
+    event: 'REVIEW_SUBMITTED',
+    adminEvent: 'REVIEW_NEGATIVE',
+    title: 'Review published',
+    message: 'Thank you for your feedback.',
+    metadata: { reviewId: 'review-negative-1' },
+  });
+  assert.equal(stored.find((item) => item.audience === 'CUSTOMER').event, 'REVIEW_SUBMITTED');
+  assert.equal(stored.find((item) => item.audience === 'ADMIN').event, 'REVIEW_NEGATIVE');
+  assert.match(stored.find((item) => item.audience === 'ADMIN').title, /negative review/i);
 });
 
 test('anonymous support messages are delivered to staff without an unowned inbox entry', async (t) => {
@@ -132,6 +168,8 @@ test('verified partial refunds accumulate exactly once and finish at the charged
   t.after(() => { if (original === undefined) delete process.env.RAZORPAY_WEBHOOK_SECRET; else process.env.RAZORPAY_WEBHOOK_SECRET = original; });
   events.length = 0;
   const order = { _id: notificationId, user: userId, finalAmount: 1000, refundedAmount: 0, refunds: [], paymentState: 'PAID', paymentStatus: 'Paid', storeId: 'store-1' };
+  const ReturnExchange = require('../models/ReturnExchange');
+  t.mock.method(ReturnExchange, 'findOneAndUpdate', async () => null);
   t.mock.method(Order, 'findOne', async (filter) => {
     assert.deepEqual(filter, { razorpayPaymentId: 'pay_test' });
     return order;
@@ -160,6 +198,29 @@ test('verified partial refunds accumulate exactly once and finish at the charged
   assert.deepEqual(order.refunds.map(item => item.providerRefundId), ['refund_test', 'refund_remainder']);
 });
 
+test('a provider refund completes its return case and reconciles the order status', async (t) => {
+  const original = process.env.RAZORPAY_WEBHOOK_SECRET;
+  process.env.RAZORPAY_WEBHOOK_SECRET = 'unit-test-only';
+  t.after(() => { if (original === undefined) delete process.env.RAZORPAY_WEBHOOK_SECRET; else process.env.RAZORPAY_WEBHOOK_SECRET = original; });
+  events.length = 0;
+  const order = { _id: notificationId, user: userId, finalAmount: 1000, refundedAmount: 0, refunds: [], paymentState: 'PAID', paymentStatus: 'Paid', orderStatus: 'Return Requested', orderItems: [{ _id: 'line-one', quantity: 1 }], storeId: 'store-1' };
+  const ReturnExchange = require('../models/ReturnExchange');
+  const updates = [];
+  t.mock.method(Order, 'findOne', async () => order);
+  t.mock.method(Order, 'findOneAndUpdate', async (_filter, update) => ({ ...order, refundedAmount: update.$inc.refundedAmount, refunds: [update.$push.refunds] }));
+  t.mock.method(Order, 'updateOne', async (_filter, update) => { updates.push(update); Object.assign(order, update.$set); return { modifiedCount: 1 }; });
+  t.mock.method(ReturnExchange, 'findOneAndUpdate', async (_filter, update) => {
+    assert.equal(update.$set.active, false);
+    return { _id: 'return-one', order: order._id, orderItemId: 'line-one', quantity: 1, type: 'return', status: 'Refunded', resolutionStatus: 'Refunded', storeId: order.storeId };
+  });
+  t.mock.method(ReturnExchange, 'find', async () => [{ orderItemId: 'line-one', quantity: 1, type: 'return', status: 'Refunded', resolutionStatus: 'Refunded' }]);
+  const request = signedWebhook({ event: 'refund.processed', payload: { refund: { entity: { id: 'refund_return', payment_id: 'pay_test', amount: 100000 } } } });
+  const res = { json(body) { this.body = body; }, status() { return this; } };
+  await razorpayWebhook(request, res);
+  assert.equal(res.body.success, true);
+  assert.ok(updates.some(update => update.$set?.orderStatus === 'Refunded'));
+});
+
 test('a verified failed payment creates a customer alert only on the first state change', async (t) => {
   const original = process.env.RAZORPAY_WEBHOOK_SECRET;
   process.env.RAZORPAY_WEBHOOK_SECRET = 'unit-test-only';
@@ -183,7 +244,7 @@ test('admin deep links query exact records before limiting results and retain st
     assert.deepEqual(filter, { $and: [{ _id: notificationId }, { storeId: 'store-1' }] });
     return { populate() { return this; }, sort() { return this; }, skip() { return this; }, limit: async () => [] };
   };
-  t.mock.method(ReturnExchange, 'find', filterCheck); t.mock.method(ContactMessage, 'find', filterCheck);
+  t.mock.method(ReturnExchange, 'find', filterCheck); t.mock.method(ReturnExchange, 'countDocuments', async () => 0); t.mock.method(ContactMessage, 'find', filterCheck);
   const request = req({ query: { id: notificationId }, tenantFilter: { storeId: 'store-1' } });
   assert.equal((await invoke(require('../controllers/returnController').adminReturns, request)).error, undefined);
   assert.equal((await invoke(require('../controllers/contactController').adminList, request)).error, undefined);

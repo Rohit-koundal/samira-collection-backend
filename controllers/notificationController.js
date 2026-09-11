@@ -8,6 +8,7 @@ function recipientFilter(req) {
     user: req.user._id,
     channel: 'IN_APP',
     status: 'SENT',
+    deliverAfter: { $not: { $gt: new Date() } },
     ...(req.tenantFilter || {}),
     ...(req.user.role === 'admin' || ['admin', 'seller'].includes(req.user.activeMode) ? {} : { audience: { $ne: 'ADMIN' } }),
   };

@@ -25,6 +25,32 @@ function assertProductionSecrets() {
   if (missing.length) {
     throw new Error(`Missing required production environment variables: ${missing.join(', ')}`);
   }
+  if (process.env.RENDER || process.env.STRICT_PRODUCTION_CONFIG === 'true') {
+    const problems = productionConfigurationIssues();
+    if (problems.length) throw new Error(`Unsafe production configuration: ${problems.join('; ')}`);
+  }
+}
+
+function present(name) { return Boolean(String(process.env[name] || '').trim()); }
+function complete(names) { return names.every(present); }
+
+function productionConfigurationIssues() {
+  if (!isProduction()) return [];
+  const issues = [];
+  const access = String(process.env.JWT_SECRET || '');
+  const refresh = String(process.env.JWT_REFRESH_SECRET || '');
+  if (access.length < 32 || /change.before.production|dev.only|replace.with/i.test(access)) issues.push('JWT_SECRET must be a strong deployment secret');
+  if (refresh.length < 32 || /change.before.production|dev.only|replace.with/i.test(refresh)) issues.push('JWT_REFRESH_SECRET must be a strong deployment secret');
+  if (access && refresh && access === refresh) issues.push('access and refresh token secrets must be different');
+  if (process.env.REQUIRE_MEDIA_STORAGE === 'true' && !(
+    complete(['R2_ACCOUNT_ID', 'R2_ACCESS_KEY_ID', 'R2_SECRET_ACCESS_KEY', 'R2_BUCKET_NAME', 'R2_PUBLIC_URL'])
+    || complete(['CLOUDINARY_CLOUD_NAME', 'CLOUDINARY_API_KEY', 'CLOUDINARY_API_SECRET'])
+  )) issues.push('persistent media storage is required but incomplete');
+  if (process.env.REQUIRE_REDIS === 'true' && !present('REDIS_URL')) issues.push('REDIS_URL is required');
+  if (process.env.PAYMENTS_ENABLED === 'true' && !complete(['RAZORPAY_KEY_ID', 'RAZORPAY_KEY_SECRET', 'RAZORPAY_WEBHOOK_SECRET'])) {
+    issues.push('live payments require Razorpay key, secret and webhook secret');
+  }
+  return issues;
 }
 
 function getJwtSecret() {
@@ -80,4 +106,5 @@ module.exports = {
   isDemoOtpMode,
   isProduction,
   missingProductionSecrets,
+  productionConfigurationIssues,
 };

@@ -73,11 +73,16 @@ const reelImportSchema = new mongoose.Schema({
   startedAt: Date,
   completedAt: Date,
   retentionExpiresAt: { type: Date, index: true },
+  sourcePurgedAt: Date,
+  purgeLeaseUntil: Date,
+  purgeAttemptCount: { type: Number, default: 0 },
+  purgeLastError: { type: String, maxlength: 500, default: '' },
 }, { timestamps: true });
 
 reelImportSchema.plugin(storeIdPlugin);
 reelImportSchema.index({ createdBy: 1, createdAt: -1 });
 reelImportSchema.index({ status: 1, createdAt: -1 });
 reelImportSchema.index({ status: 1, lastHeartbeatAt: 1 });
+reelImportSchema.index({ retentionExpiresAt: 1, sourcePurgedAt: 1, purgeLeaseUntil: 1 }, { name: 'reel_media_cleanup_due' });
 
 module.exports = mongoose.model('ReelImport', reelImportSchema);

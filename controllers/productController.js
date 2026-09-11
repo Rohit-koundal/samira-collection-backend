@@ -8,15 +8,55 @@ const mongoose = require('mongoose');
 const { normalizeProductImages, normalizeProductPayload, sanitizeProductImages } = require('../utils/imageUtils');
 const { deleteImageFromR2, isR2Configured } = require('../services/r2Upload');
 const { hasManagedVariants, normalizeVariantsPayload, totalVariantStock, validateVariantPayload } = require('../services/variantService');
+const { applyInventoryAdjustment, markProductOutOfStock, recordOpeningInventory } = require('../services/inventoryService');
 const { andFilter } = require('../services/storeService');
 const { assertStoreOwned } = require('../middleware/storeMiddleware');
 const { logAudit } = require('../services/auditService');
 const { auditSnapshot } = require('../utils/auditData');
-const PRODUCT_AUDIT_FIELDS = ['name', 'sku', 'slug', 'brand', 'category', 'subCategory', 'price', 'originalPrice', 'salePrice', 'costPrice', 'gstRate', 'hsnCode', 'barcode', 'stock', 'lowStockAlert', 'reorderQuantity', 'shippingWeightKg', 'packageDimensions', 'countryOfOrigin', 'manufacturerDetails', 'warranty', 'supplierName', 'supplierSku', 'restockAt', 'publishAt', 'saleStartAt', 'saleEndAt', 'isActive', 'isArchived', 'isFeatured', 'isBestSeller', 'isNewArrival', 'showOnHomepage', 'showInTrending', 'showInFestive', 'sizes', 'colors', 'fabric', 'occasion', 'description', 'shortDescription', 'variants', 'variantGroupId', 'sizingMode', 'sizeChartProfile', 'sizeChart', 'sizeFitNotes', 'attributeValues', 'specifications', 'highlights', 'careInstructions', 'returnPolicy', 'tags'];
+const PRODUCT_AUDIT_FIELDS = ['name', 'sku', 'slug', 'brand', 'category', 'subCategory', 'price', 'originalPrice', 'salePrice', 'costPrice', 'gstRate', 'hsnCode', 'barcode', 'stock', 'lowStockAlert', 'reorderQuantity', 'shippingWeightKg', 'packageDimensions', 'countryOfOrigin', 'manufacturerDetails', 'warranty', 'supplierName', 'supplierSku', 'restockAt', 'publishAt', 'saleStartAt', 'saleEndAt', 'isActive', 'isArchived', 'isFeatured', 'isBestSeller', 'isNewArrival', 'showOnHomepage', 'showInTrending', 'showInFestive', 'sizes', 'colors', 'fabric', 'occasion', 'description', 'shortDescription', 'variants', 'variantGroupId', 'sizingMode', 'sizeChartProfile', 'sizeChart', 'sizeFitNotes', 'attributeValues', 'specifications', 'highlights', 'careInstructions', 'returnPolicy', 'returnable', 'exchangeable', 'returnWindowDays', 'tags'];
 const { analyzeQuickAddImage, getQuickAddVisionStatus } = require('../services/quickAddVision.service');
 const { wantsPagination, readPagination, buildPaginatedResponse } = require('../utils/validators');
 const { normalizeProductSizing, validateProductSizing } = require('../services/productSizingService');
 const { applyEffectivePricing } = require('../services/productPricingService');
+const { availableStock, stockWarning } = require('../services/dashboardAnalytics');
+const { runInTransaction } = require('../utils/transaction');
+const { ApiError } = require('../utils/apiError');
+const { isMasterOwner } = require('../config/masterOwner');
+
+function inventoryMovementDrafts(beforeProduct, afterProduct, req) {
+  const base = { storeId: afterProduct.storeId, product: afterProduct._id, type: 'MANUAL_ADJUSTMENT', mode: 'SET', bucket: 'SELLABLE', reasonCode: 'CORRECTION', reason: 'Product form inventory update', createdBy: req.user?._id };
+  const beforeVariants = Array.isArray(beforeProduct.variants) ? beforeProduct.variants : [];
+  const afterVariants = Array.isArray(afterProduct.variants) ? afterProduct.variants : [];
+  if (!beforeVariants.length && !afterVariants.length) {
+    const before = Number(beforeProduct.stock || 0); const after = Number(afterProduct.stock || 0);
+    return before === after ? [] : [{ ...base, sku: afterProduct.sku, quantity: after - before, stockBefore: before, stockAfter: after }];
+  }
+  const key = (variant) => String(variant?._id || '') || [variant?.sku, variant?.size, variant?.color].join('::');
+  const previous = new Map(beforeVariants.map((variant) => [key(variant), variant]));
+  const current = new Map(afterVariants.map((variant) => [key(variant), variant]));
+  const keys = new Set([...previous.keys(), ...current.keys()]);
+  return [...keys].flatMap((variantKey) => {
+    const beforeVariant = previous.get(variantKey); const afterVariant = current.get(variantKey);
+    const before = Number(beforeVariant?.stock || 0); const after = Number(afterVariant?.stock || 0);
+    if (before === after) return [];
+    return [{ ...base, variantId: String(afterVariant?._id || beforeVariant?._id || ''), sku: afterVariant?.sku || beforeVariant?.sku || afterProduct.sku, quantity: after - before, stockBefore: before, stockAfter: after }];
+  });
+}
+
+function inventoryFingerprint(product) {
+  const variants = Array.isArray(product?.variants) ? product.variants : [];
+  return JSON.stringify({
+    stock: Number(product?.stock || 0),
+    variants: variants.map((variant) => ({ id: String(variant?._id || ''), sku: variant?.sku || '', size: variant?.size || '', color: variant?.color || '', stock: Number(variant?.stock || 0), active: variant?.isActive !== false })),
+  });
+}
+
+function withInventoryRevision(query, revision) {
+  if (Number(revision) === 0) {
+    return { $and: [query, { $or: [{ inventoryRevision: 0 }, { inventoryRevision: { $exists: false } }] }] };
+  }
+  return { ...query, inventoryRevision: revision };
+}
 
 function catalogQuery(req, extra = {}) {
   return andFilter(extra, req.tenantFilter);
@@ -47,6 +87,11 @@ exports.getProducts = asyncHandler(async (req, res) => {
   const baseUrl = String(req.baseUrl || '');
   const isAdminRequest = baseUrl.startsWith('/api/admin/products')
     || baseUrl.startsWith('/api/seller');
+  const requestedStoreId = String(req.query.storeId || '').trim();
+  if (baseUrl.startsWith('/api/admin/products') && requestedStoreId && isMasterOwner(req.user)) {
+    if (!mongoose.isValidObjectId(requestedStoreId)) throw new ApiError('VALIDATION_ERROR', 'Choose a valid store');
+    req.tenantFilter = { storeId: requestedStoreId };
+  }
   const archiveMode = String(req.query.archive || '').toLowerCase();
   const archiveFilter = archiveMode === 'only'
     ? { isArchived: true }
@@ -107,8 +152,7 @@ exports.getProducts = asyncHandler(async (req, res) => {
   if (req.query.stock === 'in') query.stock = { $gt: 0 };
   if (req.query.stock === 'out') query.stock = 0;
   if (req.query.stock === 'low') {
-    query.stock = { $gt: 0 };
-    query.$expr = { $lte: ['$stock', { $ifNull: ['$lowStockAlert', 5] }] };
+    query.$expr = { $and: [{ $gt: [availableStock, 0] }, stockWarning] };
   }
   if (req.query.status === 'active') query.isActive = true;
   if (req.query.status === 'inactive') query.isActive = false;
@@ -130,8 +174,13 @@ exports.getProducts = asyncHandler(async (req, res) => {
   const sort = sortMap[req.query.sort] || '-createdAt';
   // Admin designer choices need identifiers and labels, not every image,
   // variant, size chart and description in the catalog.
-  if (String(req.baseUrl || '').startsWith('/api/admin/products') && req.query.customizationOptions === 'true') {
-    return res.json(await Product.find(query).select('_id name slug').sort(sort).lean());
+  const designerCatalogRequest = req.query.customizationOptions === 'true'
+    && (String(req.baseUrl || '').startsWith('/api/admin/products') || String(req.baseUrl || '').startsWith('/api/seller'));
+  if (designerCatalogRequest) {
+    // The designer only needs identifiers and labels. Keep this bounded so a
+    // large catalogue cannot freeze the editor or send full product payloads.
+    const optionLimit = Math.max(25, Math.min(500, Number(req.query.optionLimit) || 250));
+    return res.json(await Product.find(query).select('_id name slug').sort(sort).limit(optionLimit).lean());
   }
   if (wantsPagination(req.query)) {
     const { page, limit, skip } = readPagination(req.query, { defaultLimit: 24, maxLimit: 100 });
@@ -162,8 +211,7 @@ async function getCatalogSummary(req) {
   const archived = catalogQuery(req, { isArchived: true });
   const low = catalogQuery(req, {
     isArchived: { $ne: true },
-    stock: { $gt: 0 },
-    $expr: { $lte: ['$stock', { $ifNull: ['$lowStockAlert', 5] }] },
+    $expr: { $and: [{ $gt: [availableStock, 0] }, stockWarning] },
   });
   const out = catalogQuery(req, { isArchived: { $ne: true }, stock: { $lte: 0 } });
   const [total, active, lowStock, outOfStock, archivedCount, value] = await Promise.all([
@@ -252,7 +300,23 @@ exports.createProduct = asyncHandler(async (req, res) => {
   if (error) return res.status(400).json({ message: error });
   const sizingError = validateProductSizing(payload, categoryName);
   if (sizingError) return res.status(400).json({ message: sizingError });
-  const product = await Product.create(normalizeProductPayload({ ...payload, slug: slugify(payload.slug || payload.name) }));
+  const productData = normalizeProductPayload({ ...payload, slug: slugify(payload.slug || payload.name) });
+  if (Number(productData.stock || 0) > 0) {
+    productData.lastInventoryChangeAt = new Date();
+    productData.lastInventoryChangedBy = req.user?._id;
+  }
+  const product = await runInTransaction(async (session) => {
+    const created = session
+      ? (await Product.create([productData], { session }))[0]
+      : await Product.create(productData);
+    try {
+      await recordOpeningInventory(created, { userId: req.user?._id, reference: 'Product create' }, session);
+    } catch (ledgerError) {
+      if (!session) await Product.deleteOne({ _id: created._id }).catch(() => null);
+      throw ledgerError;
+    }
+    return created;
+  });
   logAudit({ req, action: 'PRODUCT_CREATE', entityType: 'Product', entityId: product._id, storeId: product.storeId, after: auditSnapshot(product, PRODUCT_AUDIT_FIELDS) });
   res.status(201).json(normalizeProductResponse(product, req));
 });
@@ -261,7 +325,13 @@ exports.updateProduct = asyncHandler(async (req, res) => {
   const existingProduct = await Product.findOne(catalogQuery(req, { _id: req.params.id }));
   if (!existingProduct) return res.status(404).json({ message: 'Product not found' });
   assertStoreOwned(existingProduct, req);
+  const expectedInventoryRevision = req.body?.inventoryRevision === undefined ? null : Number(req.body.inventoryRevision);
+  if (expectedInventoryRevision !== null && (!Number.isSafeInteger(expectedInventoryRevision) || expectedInventoryRevision < 0)) return res.status(400).json({ message: 'Inventory revision must be a whole number of zero or more' });
+  if (expectedInventoryRevision !== null && expectedInventoryRevision !== Number(existingProduct.inventoryRevision || 0)) {
+    throw new ApiError('INVENTORY_CHANGED', 'Inventory changed after this product was opened. Reload the product before saving.');
+  }
   const basePayload = await applyProductStructure(withStoreId({ ...req.body, images: sanitizeProductImages(req.body.images) }, req), existingProduct);
+  delete basePayload.inventoryRevision;
   if (basePayload.price !== undefined && basePayload.originalPrice === undefined && Number(basePayload.price) > Number(existingProduct.originalPrice || 0)) {
     basePayload.originalPrice = basePayload.price;
   }
@@ -278,16 +348,37 @@ exports.updateProduct = asyncHandler(async (req, res) => {
   const sizingError = validateProductSizing(validationPayload, categoryName);
   if (sizingError) return res.status(400).json({ message: sizingError });
   const nextImages = Array.isArray(payload.images) && payload.images.length ? payload.images : existingProduct.images || [];
-  const product = await Product.findByIdAndUpdate(
-    req.params.id,
-    normalizeProductPayload({
+  const product = await runInTransaction(async (session) => {
+    const currentRevision = Number(existingProduct.inventoryRevision || 0);
+    const inventoryChanged = inventoryFingerprint(existingProduct) !== inventoryFingerprint({ ...existingProduct.toObject(), ...payload });
+    const update = normalizeProductPayload({
       ...payload,
       slug: slugify(payload.slug || existingProduct.slug || payload.name || existingProduct.name),
       images: nextImages,
       storeId: existingProduct.storeId,
-    }),
-    { new: true, runValidators: true },
-  );
+      inventoryRevision: currentRevision + (inventoryChanged ? 1 : 0),
+      ...(inventoryChanged ? { lastInventoryChangeAt: new Date(), lastInventoryChangedBy: req.user?._id } : {}),
+    });
+    const saved = await Product.findOneAndUpdate(
+      catalogQuery(req, withInventoryRevision({ _id: req.params.id }, currentRevision)),
+      update,
+      { new: true, runValidators: true, session },
+    );
+    if (!saved) throw new ApiError('INVENTORY_CHANGED', 'Product or inventory changed while this update was being saved. Reload and try again.');
+    const movements = inventoryMovementDrafts(existingProduct, saved, req);
+    try {
+      if (movements.length) await InventoryTransaction.insertMany(movements, session ? { session } : {});
+    } catch (error) {
+      if (!session) {
+        await Product.updateOne(
+          { _id: saved._id, inventoryRevision: currentRevision + (inventoryChanged ? 1 : 0) },
+          { $set: { stock: existingProduct.stock, variants: existingProduct.variants, inventoryRevision: currentRevision } },
+        ).catch(() => null);
+      }
+      throw error;
+    }
+    return saved;
+  });
   await cleanupRemovedProductImages(existingProduct.images || [], product.images || []);
   logAudit({
     req,
@@ -331,69 +422,45 @@ exports.updateStock = asyncHandler(async (req, res) => {
   if (!['number', 'string'].includes(typeof rawStock) || String(rawStock).trim() === '' || !Number.isSafeInteger(stock) || stock < 0) {
     return res.status(400).json({ message: 'Stock must be a whole number of zero or more' });
   }
-  const product = await Product.findOne(catalogQuery(req, { _id: req.params.id }));
-  if (!product) return res.status(404).json({ message: 'Product not found' });
-  assertStoreOwned(product, req);
-  const previousStock = product.stock;
-
-  if (req.body.variantId) {
-    const variant = product.variants.id(req.body.variantId);
-    if (!variant) return res.status(404).json({ message: 'Variant not found' });
-    const variantBefore = Number(variant.stock || 0);
-    variant.stock = stock;
-    product.stock = totalVariantStock(product);
-    await product.save();
-    if (stock !== variantBefore && mongoose.connection.readyState === 1) await InventoryTransaction.create({
-      storeId: product.storeId, product: product._id, variantId: String(variant._id), sku: product.sku,
-      type: 'MANUAL_ADJUSTMENT', quantity: stock - variantBefore, stockBefore: variantBefore, stockAfter: stock,
-      reason: 'Manual variant stock update', createdBy: req.user?._id,
-    });
-    logAudit({ req, action: 'STOCK_UPDATE', entityType: 'Product', entityId: product._id, storeId: product.storeId, before: { stock: previousStock }, after: { stock: product.stock, variantId: req.body.variantId } });
-    return res.json(product);
-  }
-
-  if (hasManagedVariants(product)) {
-    return res.status(400).json({
-      message: 'This product tracks stock by size and colour. Update a specific variant instead.',
-      code: 'VARIANT_UNAVAILABLE',
-    });
-  }
-
-  product.stock = stock;
-  await product.save();
-  if (stock !== previousStock && mongoose.connection.readyState === 1) await InventoryTransaction.create({
-    storeId: product.storeId, product: product._id, sku: product.sku,
-    type: 'MANUAL_ADJUSTMENT', quantity: stock - previousStock, stockBefore: previousStock, stockAfter: stock,
-    reason: 'Manual stock update', createdBy: req.user?._id,
+  const result = await applyInventoryAdjustment({
+    productId: req.params.id,
+    variantId: req.body.variantId,
+    mode: 'SET',
+    bucket: 'SELLABLE',
+    quantity: stock,
+    expectedStock: req.body.expectedStock,
+    expectedRevision: req.body.expectedRevision,
+    reasonCode: String(req.body.reasonCode || 'CORRECTION').toUpperCase(),
+    reason: req.body.reason || (req.body.variantId ? 'Manual variant stock update' : 'Manual stock update'),
+    note: req.body.note,
+    reference: req.body.reference,
+    idempotencyKey: req.body.idempotencyKey,
+    tenantFilter: req.tenantFilter,
+    userId: req.user?._id,
   });
-  logAudit({ req, action: 'STOCK_UPDATE', entityType: 'Product', entityId: product._id, storeId: product.storeId, before: { stock: previousStock }, after: { stock: product.stock } });
-  res.json(product);
+  await logAudit({
+    req, action: 'STOCK_UPDATE', entityType: 'Product', entityId: result.product._id, storeId: result.product.storeId,
+    before: result.movement ? { stock: result.movement.stockBefore } : {},
+    after: result.movement ? { stock: result.movement.stockAfter, variantId: req.body.variantId } : {},
+  });
+  res.json(result.product);
 });
 
 exports.markOutOfStock = asyncHandler(async (req, res) => {
-  const product = await Product.findOne(catalogQuery(req, { _id: req.params.id }));
-  if (!product) return res.status(404).json({ message: 'Product not found' });
-  assertStoreOwned(product, req);
-  const before = auditSnapshot(product, ['stock', 'variants']);
-  const movements = hasManagedVariants(product)
-    ? product.variants.filter((variant) => Number(variant.stock || 0) !== 0).map((variant) => ({
-      storeId: product.storeId, product: product._id, variantId: String(variant._id), sku: product.sku,
-      type: 'MANUAL_ADJUSTMENT', quantity: -Number(variant.stock || 0), stockBefore: Number(variant.stock || 0), stockAfter: 0,
-      reason: 'Marked out of stock', createdBy: req.user?._id,
-    }))
-    : Number(product.stock || 0) !== 0 ? [{
-      storeId: product.storeId, product: product._id, sku: product.sku,
-      type: 'MANUAL_ADJUSTMENT', quantity: -Number(product.stock || 0), stockBefore: Number(product.stock || 0), stockAfter: 0,
-      reason: 'Marked out of stock', createdBy: req.user?._id,
-    }] : [];
-  if (hasManagedVariants(product)) {
-    product.variants.forEach((variant) => { variant.stock = 0; });
-  }
-  product.stock = 0;
-  await product.save();
-  if (movements.length) await InventoryTransaction.insertMany(movements);
-  logAudit({ req, action: 'STOCK_UPDATE', entityType: 'Product', entityId: product._id, storeId: product.storeId, before, after: auditSnapshot(product, ['stock', 'variants']) });
-  res.json(product);
+  if (req.body?.confirm !== true) return res.status(400).json({ message: 'Confirm before marking every sellable unit out of stock', code: 'CONFIRMATION_REQUIRED' });
+  const result = await markProductOutOfStock({
+    productId: req.params.id,
+    expectedRevision: req.body.expectedRevision,
+    reasonCode: String(req.body.reasonCode || 'CORRECTION').toUpperCase(),
+    reason: req.body.reason || 'Marked out of stock',
+    note: req.body.note,
+    reference: req.body.reference,
+    idempotencyKey: req.body.idempotencyKey,
+    tenantFilter: req.tenantFilter,
+    userId: req.user?._id,
+  });
+  await logAudit({ req, action: 'STOCK_UPDATE', entityType: 'Product', entityId: result.product._id, storeId: result.product.storeId, before: { stock: result.movements.reduce((sum, item) => sum + Math.abs(item.quantity), 0) }, after: { stock: 0 } });
+  res.json(result.product);
 });
 
 exports.hideProduct = (req, res, next) => {
@@ -428,6 +495,14 @@ exports.duplicateProduct = asyncHandler(async (req, res) => {
   data.isActive = false;
   data.isArchived = false;
   data.publishAt = null;
+  // A catalog copy is a new SKU workflow, not a physical stock receipt.
+  // Starting at zero prevents the same units being sellable twice.
+  data.stock = 0;
+  data.variants = (data.variants || []).map((variant) => ({ ...variant, stock: 0, nonSellableStock: { damaged: 0, quarantine: 0 } }));
+  data.nonSellableStock = { damaged: 0, quarantine: 0 };
+  data.inventoryRevision = 0;
+  data.lastInventoryChangeAt = undefined;
+  data.lastInventoryChangedBy = undefined;
   const product = await Product.create(data);
   logAudit({ req, action: 'PRODUCT_DUPLICATE', entityType: 'Product', entityId: product._id, storeId: product.storeId, after: auditSnapshot(product, PRODUCT_AUDIT_FIELDS), summary: `Duplicated from ${source.name}` });
   res.status(201).json(normalizeProductResponse(product, req));
@@ -443,10 +518,21 @@ exports.bulkUpdateProducts = asyncHandler(async (req, res) => {
   if (action === 'activate' && products.some((product) => product.isArchived)) {
     return res.status(409).json({ message: 'Restore archived products before making them active.' });
   }
-  const inventoryMovements = [];
   for (const product of products) {
     assertStoreOwned(product, req);
     const before = auditSnapshot(product, ['isActive', 'isArchived', 'deletedAt', 'stock', 'variants', 'isFeatured', 'isBestSeller']);
+    if (action === 'out-of-stock') {
+      const result = await markProductOutOfStock({
+        productId: product._id,
+        reasonCode: 'CORRECTION',
+        reason: 'Bulk marked out of stock',
+        idempotencyKey: `catalog-bulk:${req.requestId || Date.now()}:${product._id}`,
+        tenantFilter: req.tenantFilter,
+        userId: req.user?._id,
+      });
+      await logAudit({ req, action: 'PRODUCT_BULK_OUT_OF_STOCK', entityType: 'Product', entityId: product._id, storeId: product.storeId, before, after: auditSnapshot(result.product, ['stock', 'variants']) });
+      continue;
+    }
     if (action === 'activate') {
       product.isActive = true;
     } else if (action === 'deactivate') product.isActive = false;
@@ -462,31 +548,9 @@ exports.bulkUpdateProducts = asyncHandler(async (req, res) => {
     else if (action === 'unfeature') product.isFeatured = false;
     else if (action === 'best-seller') product.isBestSeller = true;
     else if (action === 'remove-best-seller') product.isBestSeller = false;
-    else if (action === 'out-of-stock') {
-      if (hasManagedVariants(product)) {
-        product.variants.forEach((variant) => {
-          const previous = Number(variant.stock || 0);
-          if (previous) inventoryMovements.push({
-            storeId: product.storeId, product: product._id, variantId: String(variant._id), sku: product.sku,
-            type: 'MANUAL_ADJUSTMENT', quantity: -previous, stockBefore: previous, stockAfter: 0,
-            reason: 'Bulk marked out of stock', createdBy: req.user?._id,
-          });
-          variant.stock = 0;
-        });
-      } else {
-        const previous = Number(product.stock || 0);
-        if (previous) inventoryMovements.push({
-          storeId: product.storeId, product: product._id, sku: product.sku,
-          type: 'MANUAL_ADJUSTMENT', quantity: -previous, stockBefore: previous, stockAfter: 0,
-          reason: 'Bulk marked out of stock', createdBy: req.user?._id,
-        });
-      }
-      product.stock = 0;
-    }
     await product.save();
     logAudit({ req, action: `PRODUCT_BULK_${action.replaceAll('-', '_').toUpperCase()}`, entityType: 'Product', entityId: product._id, storeId: product.storeId, before, after: auditSnapshot(product, ['isActive', 'isArchived', 'deletedAt', 'stock', 'variants', 'isFeatured', 'isBestSeller']) });
   }
-  if (inventoryMovements.length && mongoose.connection.readyState === 1) await InventoryTransaction.insertMany(inventoryMovements);
   res.json({ message: `${products.length} product${products.length === 1 ? '' : 's'} updated`, count: products.length });
 });
 
@@ -507,8 +571,7 @@ exports.exportProducts = asyncHandler(async (req, res) => {
   if (req.query.status === 'inactive') filter.isActive = false;
   if (req.query.stock === 'out') filter.stock = { $lte: 0 };
   if (req.query.stock === 'low') {
-    filter.stock = { $gt: 0 };
-    filter.$expr = { $lte: ['$stock', { $ifNull: ['$lowStockAlert', 5] }] };
+    filter.$expr = { $and: [{ $gt: [availableStock, 0] }, stockWarning] };
   }
   const products = await Product.find(catalogQuery(req, filter)).populate('category').sort('-updatedAt').limit(5000).lean();
   res.json({
@@ -568,6 +631,7 @@ function validateProduct(data, creating = true) {
   if (data.gstRate !== undefined && (!Number.isFinite(Number(data.gstRate)) || Number(data.gstRate) < 0 || Number(data.gstRate) > 100)) return 'GST rate must be between 0 and 100';
   if (data.reorderQuantity !== undefined && (!Number.isSafeInteger(Number(data.reorderQuantity)) || Number(data.reorderQuantity) < 0)) return 'Reorder quantity must be a whole number of zero or more';
   if (data.shippingWeightKg !== undefined && (!Number.isFinite(Number(data.shippingWeightKg)) || Number(data.shippingWeightKg) < 0 || Number(data.shippingWeightKg) > 1000)) return 'Packed unit weight must be between 0 and 1000 kg';
+  if (data.returnWindowDays !== undefined && data.returnWindowDays !== null && data.returnWindowDays !== '' && (!Number.isSafeInteger(Number(data.returnWindowDays)) || Number(data.returnWindowDays) < 0 || Number(data.returnWindowDays) > 365)) return 'Product return window must be a whole number between 0 and 365 days';
   if (data.packageDimensions && ['lengthCm', 'widthCm', 'heightCm'].some((field) => !Number.isFinite(Number(data.packageDimensions[field] || 0)) || Number(data.packageDimensions[field] || 0) < 0 || Number(data.packageDimensions[field] || 0) > 1000)) return 'Package dimensions must be between 0 and 1000 cm';
   for (const key of ['restockAt', 'publishAt', 'saleStartAt', 'saleEndAt']) if (data[key] && Number.isNaN(new Date(data[key]).getTime())) return 'Choose valid product schedule dates';
   if (data.saleStartAt && data.saleEndAt && new Date(data.saleStartAt) >= new Date(data.saleEndAt)) return 'Sale end must be after sale start';

@@ -16,7 +16,16 @@ const ATTENTION = {
   transit: { orderStatus: { $in: ['Shipped', 'Out for Delivery'] } },
   cod: { orderStatus: { $nin: CLOSED }, paymentMethod: 'COD', codConfirmationStatus: 'PENDING', paymentStatus: 'Pending' },
   collection: { orderStatus: 'Delivered', paymentMethod: 'COD', paymentStatus: 'Pending' },
+  resolution: { $or: [{ 'cancellationRefund.status': { $in: ['FAILED', 'MANUAL_REQUIRED'] } }, { itemCancellationRefunds: { $elemMatch: { status: { $in: ['FAILED', 'MANUAL_REQUIRED'] } } } }, { 'rto.refundStatus': { $in: ['FAILED', 'MANUAL_REQUIRED'] } }] },
+  rto: { 'rto.status': { $in: ['IN_TRANSIT', 'RECEIVED', 'QC_PENDING', 'RESTOCKED', 'QUARANTINED', 'DAMAGED', 'MISSING', 'REFUND_PENDING'] } },
 };
+// A COD order is collected at its post-cancellation payable value. Online
+// payments were captured at the original total and are reduced through the
+// refund ledger, so their collected base remains finalAmount.
+const payableAmount = { $ifNull: ['$adjustedFinalAmount', { $ifNull: ['$finalAmount', 0] }] };
+const collectedBase = { $cond: [{ $eq: ['$paymentMethod', 'COD'] }, payableAmount, { $ifNull: ['$finalAmount', 0] }] };
+const netPaidAmount = { $max: [0, { $subtract: [collectedBase, { $ifNull: ['$refundedAmount', 0] }] }] };
+const activeItemQuantity = { $max: [0, { $subtract: [{ $ifNull: ['$orderItems.quantity', 1] }, { $ifNull: ['$orderItems.cancelledQuantity', 0] }] }] };
 const dateKey = (date) => new Date(date.getTime() + OFFSET).toISOString().slice(0, 10);
 
 function calendarDate(value) {
@@ -68,7 +77,7 @@ const activeVariants = { $filter: { input: { $ifNull: ['$variants', []] }, as: '
 const availableStock = { $cond: [{ $gt: [{ $size: { $ifNull: ['$variants', []] } }, 0] }, { $sum: { $map: { input: activeVariants, as: 'variant', in: { $max: [0, { $ifNull: ['$$variant.stock', 0] }] } } } }, { $ifNull: ['$stock', 0] }] };
 const stockWarning = { $or: [
   { $lte: [availableStock, { $ifNull: ['$lowStockAlert', 5] }] },
-  { $anyElementTrue: [{ $map: { input: activeVariants, as: 'variant', in: { $lte: [{ $ifNull: ['$$variant.stock', 0] }, { $ifNull: ['$lowStockAlert', 5] }] } } }] },
+  { $anyElementTrue: [{ $map: { input: activeVariants, as: 'variant', in: { $lte: [{ $ifNull: ['$$variant.stock', 0] }, { $ifNull: ['$$variant.lowStockAlert', { $ifNull: ['$lowStockAlert', 5] }] }] } } }] },
 ] };
 
 async function adminOrderFilter(query = {}, tenantFilter) {
@@ -150,8 +159,8 @@ async function dashboardOverview(query = {}, tenantFilter) {
     { $match: filter },
     { $facet: {
       orders: [{ $count: 'value' }],
-      paid: [{ $match: { paymentStatus: 'Paid' } }, { $group: { _id: null, value: { $sum: '$finalAmount' } } }],
-      booked: [{ $match: BOOKED }, { $group: { _id: null, value: { $sum: '$finalAmount' }, count: { $sum: 1 } } }],
+      paid: [{ $match: { paymentStatus: 'Paid' } }, { $group: { _id: null, value: { $sum: netPaidAmount } } }],
+      booked: [{ $match: BOOKED }, { $group: { _id: null, value: { $sum: payableAmount }, count: { $sum: 1 } } }],
       customers: [{ $match: BOOKED }, { $group: { _id: '$user' } }, { $count: 'value' }],
     } },
   ];
@@ -163,12 +172,12 @@ async function dashboardOverview(query = {}, tenantFilter) {
       { $match: scoped(current) },
       { $facet: {
         statuses: [{ $group: { _id: '$orderStatus', value: { $sum: 1 } } }],
-        series: [{ $group: { _id: { $dateToString: { date: '$createdAt', format: range.granularity === 'month' ? '%Y-%m' : '%Y-%m-%d', timezone: TIMEZONE } }, value: { $sum: { $cond: [{ $eq: ['$paymentStatus', 'Paid'] }, '$finalAmount', 0] } }, orders: { $sum: 1 } } }],
+        series: [{ $group: { _id: { $dateToString: { date: '$createdAt', format: range.granularity === 'month' ? '%Y-%m' : '%Y-%m-%d', timezone: TIMEZONE } }, value: { $sum: { $cond: [{ $eq: ['$paymentStatus', 'Paid'] }, netPaidAmount, 0] } }, orders: { $sum: 1 } } }],
         products: [{ $match: BOOKED }, { $sort: { createdAt: -1 } }, { $unwind: '$orderItems' }, { $group: {
           _id: { $ifNull: ['$orderItems.product', '$orderItems.name'] },
           productId: { $first: '$orderItems.product' }, name: { $first: '$orderItems.name' }, image: { $first: '$orderItems.image' },
-          sold: { $sum: { $ifNull: ['$orderItems.quantity', 1] } },
-          revenue: { $sum: { $multiply: [{ $ifNull: ['$orderItems.price', 0] }, { $ifNull: ['$orderItems.quantity', 1] }] } },
+          sold: { $sum: activeItemQuantity },
+          revenue: { $sum: { $multiply: [{ $ifNull: ['$orderItems.price', 0] }, activeItemQuantity] } },
         } }, { $sort: { sold: -1, revenue: -1, _id: 1 } }, { $limit: 10 }],
       } },
     ]),
@@ -181,7 +190,7 @@ async function dashboardOverview(query = {}, tenantFilter) {
       out: [{ $match: { ...activeCatalog, $expr: { $lte: [availableStock, 0] } } }, { $count: 'value' }],
       products: [{ $match: { ...activeCatalog, $expr: stockWarning } }, { $addFields: { availableStock } }, { $sort: { availableStock: 1, _id: 1 } }, { $limit: 6 }, { $project: { name: 1, sku: 1, availableStock: 1, lowStockAlert: 1 } }],
     } }]),
-    Order.aggregate([{ $match: scoped({ ...attentionDates, orderStatus: { $nin: CLOSED } }) }, { $facet: Object.fromEntries(Object.entries(ATTENTION).map(([key, filter]) => [key, [{ $match: filter }, { $group: { _id: null, value: { $sum: 1 }, amount: { $sum: '$finalAmount' } } }]])) }]),
+    Order.aggregate([{ $match: scoped(attentionDates) }, { $facet: Object.fromEntries(Object.entries(ATTENTION).map(([key, filter]) => [key, [{ $match: filter }, { $group: { _id: null, value: { $sum: 1 }, amount: { $sum: payableAmount } } }]])) }]),
     ReturnExchange.countDocuments(scoped({ ...attentionDates, status: 'Requested' })),
   ]);
   const c = currentRows[0] || {}; const p = previousRows[0] || {};
@@ -192,7 +201,7 @@ async function dashboardOverview(query = {}, tenantFilter) {
   const orderLimit = [5, 10, 20].includes(Number(query.orderLimit)) ? Number(query.orderLimit) : 5;
   const total = value(c, 'orders'); const totalPages = Math.max(1, Math.ceil(total / orderLimit));
   const page = Math.min(orderPage, totalPages);
-  const recentOrders = await Order.find(scoped(current)).select('user shippingAddress.fullName invoiceNumber createdAt finalAmount orderStatus paymentStatus paymentMethod orderItems.quantity')
+  const recentOrders = await Order.find(scoped(current)).select('user shippingAddress.fullName invoiceNumber createdAt finalAmount adjustedFinalAmount orderStatus paymentStatus paymentMethod orderItems.quantity orderItems.cancelledQuantity')
     .populate('user', 'name').sort({ createdAt: -1, _id: -1 }).skip((page - 1) * orderLimit).limit(orderLimit).lean();
   return {
     schemaVersion: 2,
@@ -202,11 +211,11 @@ async function dashboardOverview(query = {}, tenantFilter) {
     salesOverview: buildSeries(range, details.series || []),
     orderOverview: ORDER_STATUSES.map(label => ({ label, value: details.statuses?.find(row => row._id === label)?.value || 0 })).filter(row => row.value),
     topProducts: (details.products || []).map(row => ({ ...row, id: row.productId ? String(row.productId) : '', key: String(row._id) })),
-    recentOrders: recentOrders.map(order => ({ ...order, itemsCount: order.orderItems?.reduce((sum, item) => sum + Number(item.quantity || 0), 0) || 0 })),
+    recentOrders: recentOrders.map(order => ({ ...order, displayAmount: Number(order.adjustedFinalAmount ?? order.finalAmount ?? 0), itemsCount: order.orderItems?.reduce((sum, item) => sum + Math.max(0, Number(item.quantity || 0) - Number(item.cancelledQuantity || 0)), 0) || 0 })),
     recentPagination: { page, limit: orderLimit, total, totalPages },
     inventory: { total: value(inventory, 'total'), active: value(inventory, 'active'), alerts: value(inventory, 'alerts'), out: value(inventory, 'out'), products: inventory.products || [] },
     attention: { ...Object.fromEntries(Object.keys(ATTENTION).map(key => [key, operationsRows[0]?.[key]?.[0] || { value: 0, amount: 0 }])), returns: { value: returns } },
   };
 }
 
-module.exports = { dashboardOverview, dashboardRange, calendarDate, periodFilter, buildSeries, metric, adminOrderFilter, ATTENTION, BOOKED, stockWarning, availableStock };
+module.exports = { dashboardOverview, dashboardRange, calendarDate, periodFilter, buildSeries, metric, adminOrderFilter, ATTENTION, BOOKED, stockWarning, availableStock, payableAmount, collectedBase, netPaidAmount };

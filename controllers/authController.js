@@ -12,6 +12,7 @@ const { ApiError } = require('../utils/apiError');
 const { listMemberships } = require('../services/storeService');
 const { normalizeIndianMobile } = require('../utils/phoneUtils');
 const { getOwnerDemoProvider, allowsOwnerDemoSession } = require('../config/localOwnerDemo');
+const { clearRefreshCookie, refreshTokenFromRequest, returnRefreshTokenInBody, setRefreshCookie } = require('../utils/authCookies');
 
 const otpRateLimit = new Map();
 const offlineProfiles = new Map();
@@ -220,14 +221,14 @@ exports.verifyOtp = async (req, res) => {
   try {
     const { phone, record } = await verifyOtpRecord(req.body.phone, req.body.otp, req);
     const demoOwner = record.purpose === 'master_demo_login' && record.provider === getOwnerDemoProvider(req);
-    const localOwnerDemo = demoOwner && record.provider === 'local-demo';
+    const ownerDemoProvider = demoOwner ? record.provider : '';
     if (isOwnerPhone(phone) && (mongoose.connection.readyState !== 1 || (!demoOwner && (record.purpose !== 'master_login' || !record.trustedDelivery)))) {
       return res.status(403).json({ message: 'Please request and verify a new owner OTP delivered by SMS.' });
     }
     const user = mongoose.connection.readyState === 1
-      ? await upsertPhoneLoginUser(phone, { activeMode: 'customer', masterVerified: isOwnerPhone(phone), localOwnerDemo })
+      ? await upsertPhoneLoginUser(phone, { activeMode: 'customer', masterVerified: isOwnerPhone(phone), ownerDemoProvider })
       : buildOfflineLoginUser(phone, { activeMode: 'customer' });
-    res.json({ success: true, ...authPayload(user) });
+    res.json({ success: true, ...issueAuthSession(req, res, user) });
   } catch (error) {
     res.status(error.statusCode || 400).json({ message: error.message });
   }
@@ -242,6 +243,7 @@ exports.me = async (req, res) => {
       name: item.store?.name,
       slug: item.store?.slug,
       role: item.role,
+      permissions: item.role === 'OWNER' ? ['*'] : (require('../models/StoreMember').PERMISSIONS_BY_ROLE[item.role] || []),
       status: item.store?.status,
       platform: require('../config/storePlans').planSummary(item.store),
     }));
@@ -250,11 +252,16 @@ exports.me = async (req, res) => {
 };
 
 exports.logout = async (req, res) => {
+  clearRefreshCookie(res, req);
+  if (!req.user.offlineSession && req.user._id) {
+    await User.updateOne({ _id: req.user._id }, { $inc: { authSessionVersion: 1 } });
+  }
   res.json({ success: true, message: 'Logged out successfully' });
 };
 
 exports.refresh = async (req, res) => {
-  const token = req.body?.refreshToken;
+  const token = refreshTokenFromRequest(req)
+    || (typeof res?.cookie !== 'function' ? String(req.body?.refreshToken || '') : '');
   if (!token) return res.status(401).json({ message: 'Refresh token required' });
 
   try {
@@ -266,12 +273,16 @@ exports.refresh = async (req, res) => {
     if (canRefreshOfflineSession(decoded)) {
       user = buildOfflineLoginUser(decoded.phone, { activeMode: decoded.activeMode || 'customer' });
     } else {
-      user = await User.findById(decoded.id).select('-password +masterSessionVersion');
+      user = await User.findById(decoded.id).select('-password +masterSessionVersion +authSessionVersion');
       if (!user || user.isBlocked) return res.status(401).json({ message: 'Account unavailable' });
+      if (Number(decoded.authSessionVersion || 0) !== Number(user.authSessionVersion || 0)) {
+        clearRefreshCookie(res, req);
+        return res.status(401).json({ message: 'This session has ended. Please login again.' });
+      }
       attachMasterSession(user, decoded);
     }
 
-    res.json({ success: true, ...authPayload(user) });
+    res.json({ success: true, ...issueAuthSession(req, res, user) });
   } catch (error) {
     if (['JsonWebTokenError', 'TokenExpiredError', 'NotBeforeError'].includes(error.name)) {
       return res.status(401).json({ message: 'Refresh token expired. Please login again.' });
@@ -300,27 +311,30 @@ exports.switchMode = async (req, res) => {
   }
   if (req.user.offlineSession) {
     req.user.activeMode = mode;
-    return res.json({ success: true, ...authPayload(req.user) });
+    return res.json({ success: true, ...issueAuthSession(req, res, req.user) });
   }
   req.user.activeMode = mode;
   await req.user.save();
-  res.json({ success: true, ...authPayload(req.user) });
+  res.json({ success: true, ...issueAuthSession(req, res, req.user) });
 };
 
 function sanitize(user) {
   const data = typeof user.toObject === 'function' ? user.toObject() : { ...user };
   delete data.password;
   delete data.masterSessionVersion;
+  delete data.authSessionVersion;
   data.systemRole = user.$locals?.masterAuthenticated && isOwnerAccount(user) && !user.offlineSession ? 'MASTER_OWNER' : 'USER';
   data.id = String(data._id || data.id);
   return data;
 }
 
-function authPayload(user) {
+function issueAuthSession(req, res, user) {
+  const refreshToken = generateRefreshToken(user);
+  setRefreshCookie(res, refreshToken, req);
   return {
     user: sanitize(user),
     token: generateToken(user),
-    refreshToken: generateRefreshToken(user),
+    ...(returnRefreshTokenInBody() || typeof res?.cookie !== 'function' ? { refreshToken } : {}),
   };
 }
 
@@ -328,9 +342,14 @@ function getAdminPhones() {
   return String(process.env.ADMIN_PHONE_NUMBERS || '').split(',').map((item) => normalizePhone(item)).filter(Boolean);
 }
 
-async function upsertPhoneLoginUser(phone, { activeMode = 'customer', masterVerified = false, localOwnerDemo = false } = {}) {
+async function upsertPhoneLoginUser(phone, { activeMode = 'customer', masterVerified = false, ownerDemoProvider = '' } = {}) {
   const isAdminPhone = getAdminPhones().includes(phone) || masterVerified;
-  const ownerVersion = masterVerified ? `${localOwnerDemo ? 'local-demo:' : ''}${crypto.randomUUID()}` : undefined;
+  const ownerVersion = masterVerified ? `${ownerDemoProvider ? `${ownerDemoProvider}:` : ''}${crypto.randomUUID()}` : undefined;
+  const ownerClaims = {
+    masterSessionVersion: ownerVersion,
+    localOwnerDemo: ownerDemoProvider === 'local-demo',
+    hostedOwnerDemo: ownerDemoProvider === 'hosted-demo',
+  };
   let user = await User.findOne({ phone });
   if (!user) {
     user = await User.create({
@@ -343,7 +362,7 @@ async function upsertPhoneLoginUser(phone, { activeMode = 'customer', masterVeri
       activeMode,
       ...(masterVerified ? { systemRole: 'MASTER_OWNER', masterSessionVersion: ownerVersion } : {}),
     });
-    if (masterVerified) attachMasterSession(user, { masterSessionVersion: ownerVersion, localOwnerDemo });
+    if (masterVerified) attachMasterSession(user, ownerClaims);
     return user;
   }
 
@@ -366,7 +385,7 @@ async function upsertPhoneLoginUser(phone, { activeMode = 'customer', masterVeri
   user.activeMode = activeMode;
   if (masterVerified) { user.systemRole = 'MASTER_OWNER'; user.masterSessionVersion = ownerVersion; }
   await user.save();
-  if (masterVerified) attachMasterSession(user, { masterSessionVersion: ownerVersion, localOwnerDemo });
+  if (masterVerified) attachMasterSession(user, ownerClaims);
   return user;
 }
 

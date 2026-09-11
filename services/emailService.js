@@ -64,6 +64,32 @@ async function sendViaBrevo(email, otp) {
   };
 }
 
+async function sendTransactionalEmail({ to, subject, htmlContent, attachments = [] }) {
+  const apiKey = process.env.BREVO_API_KEY;
+  const senderEmail = process.env.BREVO_SENDER_EMAIL;
+  if (!apiKey || !senderEmail) {
+    const error = new Error('Transactional email is not configured. Add BREVO_API_KEY and BREVO_SENDER_EMAIL.');
+    error.statusCode = 503;
+    throw error;
+  }
+  const response = await fetch('https://api.brevo.com/v3/smtp/email', {
+    method: 'POST',
+    headers: { accept: 'application/json', 'api-key': apiKey, 'content-type': 'application/json' },
+    body: JSON.stringify({
+      sender: { email: senderEmail, name: process.env.BREVO_SENDER_NAME || 'Samira Collection' },
+      to: [{ email: to }], subject, htmlContent,
+      attachment: attachments.map((item) => ({ name: item.name, content: Buffer.from(item.content).toString('base64') })),
+    }),
+  });
+  if (!response.ok) {
+    const details = await safeJson(response);
+    const error = new Error(details?.message || 'Unable to send scheduled report');
+    error.statusCode = response.status || 500;
+    throw error;
+  }
+  return response.json();
+}
+
 async function safeJson(response) {
   try {
     return await response.json();
@@ -72,4 +98,4 @@ async function safeJson(response) {
   }
 }
 
-module.exports = { sendOtpEmail };
+module.exports = { sendOtpEmail, sendTransactionalEmail };

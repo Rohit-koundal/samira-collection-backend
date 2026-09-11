@@ -11,6 +11,7 @@ const Otp = require('../models/Otp');
 const policy = require('../config/masterOwner');
 const { DEFAULT_STRUCTURE, INDUSTRY_PRESETS } = require('../config/industryPresets');
 const service = require('../services/masterConfigurationService');
+const governance = require('../services/masterGovernanceService');
 const projectGenerator = require('../services/projectGeneratorService');
 const copy = (value) => JSON.parse(JSON.stringify(value));
 const owner = () => policy.attachMasterSession({
@@ -53,7 +54,7 @@ test('owner requires the pinned phone, verified DB identity, admin mode and a cu
 
 test('master route middleware and controller handlers reject client admins before database work', async () => {
   const controller = require('../controllers/masterController');
-  for (const action of ['workspace', 'previewProject', 'generateProject', 'updateInstallation', 'rotateInstallationKey', 'deployInstallation', 'createRelease', 'update', 'export', 'import', 'createPreset', 'deletePreset', 'provisionAdmin']) {
+  for (const action of ['workspace', 'previewProject', 'generateProject', 'updateInstallation', 'rotateInstallationKey', 'deployInstallation', 'createRelease', 'storePortfolio', 'storePortfolioOperations', 'exportStoreData', 'updateStoreProfile', 'updateStoreSubscription', 'grantStoreAccess', 'updateStoreLifecycle', 'createStoreMember', 'updateStoreMember', 'transferStoreOwner', 'previewStoreIndustry', 'storeIndustryAffectedProducts', 'convertStoreIndustry', 'storeMigrationProducts', 'updateStoreMigrationReview', 'completeStoreMigration', 'rollbackStoreIndustry', 'updateStorePlatform', 'update', 'configurationImpact', 'configurationImpactProducts', 'configurationHistory', 'configurationVersion', 'restoreConfigurationVersion', 'export', 'import', 'createPreset', 'updatePreset', 'duplicatePreset', 'deletePreset', 'presetUsage', 'provisionAdmin']) {
     let error;
     await controller[action]({ user: { role: 'admin', systemRole: 'USER' }, body: {}, params: {} }, response(), (err) => { error = err; });
     assert.equal(error?.statusCode, 403, action);
@@ -130,7 +131,7 @@ test('standalone project generator creates a renamed isolated source package wit
   assert.doesNotMatch(entries.get(prefix + 'backend/app.js').toString('utf8'), /\/api\/master|masterController/);
   assert.doesNotMatch(entries.get(prefix + 'backend/routes/websiteCustomizationRoutes.js').toString('utf8'), /masterOnly|unlocked/);
   assert.doesNotMatch(entries.get(prefix + 'src/pages/admin/WebsiteCustomizer.jsx').toString('utf8'), /Master configuration|\/master/);
-  for (const name of ['src/pages/admin/MasterConfiguration.jsx', 'src/pages/admin/PlatformStores.jsx', 'src/pages/seller/Subscription.jsx', 'src/components/layout/MasterRoute.jsx', 'backend/controllers/masterController.js', 'backend/controllers/subscriptionController.js', 'backend/models/SubscriptionPayment.js', 'backend/routes/masterRoutes.js', 'backend/services/projectGeneratorService.js', 'backend/services/subscriptionService.js']) assert.ok(!entries.has(prefix + name), name);
+  for (const name of ['src/pages/admin/MasterConfiguration.jsx', 'src/pages/admin/PlatformStores.jsx', 'src/pages/admin/PlatformStores.test.jsx', 'src/pages/seller/Subscription.jsx', 'src/components/layout/MasterRoute.jsx', 'backend/controllers/masterController.js', 'backend/controllers/subscriptionController.js', 'backend/models/SubscriptionPayment.js', 'backend/models/MasterConfigurationVersion.js', 'backend/models/StorePortfolioOperation.js', 'backend/models/SubscriptionPricing.js', 'backend/routes/masterRoutes.js', 'backend/services/masterGovernanceService.js', 'backend/services/projectGeneratorService.js', 'backend/services/storePortfolioService.js', 'backend/services/storeDataExportService.js', 'backend/services/subscriptionPricingService.js', 'backend/services/subscriptionService.js', 'backend/tests/storePortfolio.integration.test.js']) assert.ok(!entries.has(prefix + name), name);
   assert.ok(![...entries.keys()].some((name) => name.includes('/node_modules/') || name.includes('/uploads/') || name.includes('/.git/') || name.startsWith(prefix + 'ai-video-worker/')));
   assert.ok(!entries.has(prefix + '.env'));
   assert.ok(!entries.has(prefix + 'backend/.env'));
@@ -158,6 +159,47 @@ test('rejects malicious, duplicate and incomplete structural definitions', () =>
   assert.equal(service.validateStructure({ ...copy(DEFAULT_STRUCTURE), id: 'custom-store', name: 'Custom Store', industry: 'custom-store' }).industry, 'custom-store');
   assert.throws(() => service.validateStructure({ ...copy(DEFAULT_STRUCTURE), industry: 'electronics' }), { statusCode: 400 });
   assert.throws(() => service.validateStructure({ ...copy(DEFAULT_STRUCTURE), features: { sizing: true, specifications: false } }), { statusCode: 400 });
+});
+
+test('strict schema validation rejects invalid defaults and dangling storefront references', () => {
+  const base = copy(DEFAULT_STRUCTURE);
+  const dropdown = { ...base.attributes[0], key: 'finish', label: 'Finish', type: 'dropdown', options: ['Matte'], defaultValue: 'Glossy' };
+  assert.throws(() => service.validateStructure({ ...base, attributes: [...base.attributes, dropdown] }), /default value/);
+  const numeric = { ...base.attributes[0], key: 'weight_value', label: 'Weight', type: 'number', validation: { min: 10 }, defaultValue: 5 };
+  assert.throws(() => service.validateStructure({ ...base, attributes: [...base.attributes, numeric] }), /at least 10/);
+  assert.throws(() => service.validateStructure({ ...base, filters: [...base.filters, { key: 'missing_field', label: 'Missing' }] }), /does not match/);
+  assert.throws(() => service.validateStructure({ ...base, productCard: { ...base.productCard, attributeKeys: ['missing_field'] } }), /unknown attribute/);
+  assert.throws(() => service.validateStructure({ ...base, seo: { ...base.seo, descriptionAttributes: ['missing_field'] } }), /unknown attribute/);
+  assert.throws(() => service.validateStructure({ ...base, clientPermissions: { ...base.clientPermissions, shipping: 'yes' } }), /Shipping permission/);
+});
+
+test('configuration diff classifies destructive schema changes and binds review tokens to a revision', () => {
+  const extra = { key: 'retired_field', label: 'Retired field', type: 'text', required: false, filterable: false, searchable: false, showOnCard: false, showOnDetail: true, showInSpecifications: true, variant: false, options: [], defaultValue: '', group: 'Legacy', validation: {} };
+  const before = service.validateStructure({ ...copy(DEFAULT_STRUCTURE), attributes: [...copy(DEFAULT_STRUCTURE.attributes), extra] });
+  const after = service.validateStructure(copy(DEFAULT_STRUCTURE));
+  const changes = governance.listChanges(before, after);
+  assert.ok(changes.some((item) => item.kind === 'REMOVED' && item.risk === 'BREAKING'));
+  const token = governance.impactToken(2, after);
+  assert.doesNotThrow(() => governance.assertImpactToken({ revision: 2 }, after, token));
+  assert.throws(() => governance.assertImpactToken({ revision: 3 }, after, token), { statusCode: 400 });
+});
+
+test('affected product export returns exact records with migration reasons', async (t) => {
+  const extra = { key: 'retired_field', label: 'Retired field', type: 'text', required: false, filterable: false, searchable: false, showOnCard: false, showOnDetail: true, showInSpecifications: true, variant: false, options: [], defaultValue: '', group: 'Legacy', validation: {} };
+  const before = service.validateStructure({ ...copy(DEFAULT_STRUCTURE), attributes: [...copy(DEFAULT_STRUCTURE.attributes), extra] });
+  const after = service.validateStructure(copy(DEFAULT_STRUCTURE));
+  let capturedQuery;
+  const row = { _id: 'product-1', name: 'Legacy saree', sku: 'SC-1', slug: 'legacy-saree', industry: 'fashion', categoryDefinitionKey: 'sarees', attributeValues: { retired_field: 'Old' }, specifications: [], variants: [], isActive: true, updatedAt: new Date('2026-09-11T00:00:00.000Z') };
+  const chain = {
+    select() { return this; }, sort() { return this; }, skip() { return this; }, limit() { return this; }, async lean() { return [row]; },
+  };
+  t.mock.method(Product, 'find', (query) => { capturedQuery = query; return chain; });
+  t.mock.method(Product, 'countDocuments', async () => 1);
+  const result = await governance.listAffectedProducts({ revision: 2, structure: before }, after, { page: 1, limit: 100 });
+  assert.equal(capturedQuery.storeId, null);
+  assert.equal(result.total, 1);
+  assert.equal(result.items[0].name, 'Legacy saree');
+  assert.deepEqual(result.items[0].reasons, ['Removed attributes: retired_field']);
 });
 
 test('public configuration never includes lock history, owner identity or client permissions', () => {
@@ -219,7 +261,41 @@ test('used attribute definitions cannot be renamed or removed silently', async (
   stubConfig(t, before);
   t.mock.method(Configuration, 'findOneAndUpdate', async () => ({}));
   t.mock.method(Product, 'exists', async () => ({ _id: 'existing' }));
-  await assert.rejects(service.updateConfiguration(owner(), { revision: 2, structure: { ...before.structure, attributes: [], categoryDefinitions: [], variantConfig: { enabled: false, attributes: [] }, productCard: { fields: ['name', 'price'], attributeKeys: [] }, seo: { titlePattern: '{product}', descriptionAttributes: [] } } }), /used by products/);
+  await assert.rejects(service.updateConfiguration(owner(), { revision: 2, structure: { ...before.structure, attributes: [], categoryDefinitions: [], filters: [{ key: 'category' }, { key: 'price' }, { key: 'availability' }], variantConfig: { enabled: false, attributes: [] }, productCard: { fields: ['name', 'price'], attributeKeys: [] }, seo: { titlePattern: '{product}', descriptionAttributes: [] } } }), /used by products/);
+});
+
+test('delegated seller permission middleware enforces master capability boundaries on the server', () => {
+  const { requireStorePermission, requireAnyStorePermission } = require('../middleware/storeMiddleware');
+  const denied = { user: { role: 'admin' }, storeMember: { role: 'OWNER' }, store: { catalogStructure: { clientPermissions: { catalog: false, inventory: true } } } };
+  let error;
+  requireStorePermission('catalog.write')(denied, response(), (value) => { error = value; });
+  assert.equal(error?.statusCode, 403);
+  error = undefined;
+  requireAnyStorePermission('catalog.write', 'inventory.write')(denied, response(), (value) => { error = value; });
+  assert.equal(error, undefined);
+  let allowed = false;
+  requireStorePermission('catalog.write')({ ...denied, user: owner() }, response(), (value) => { assert.equal(value, undefined); allowed = true; });
+  assert.equal(allowed, true);
+});
+
+test('delegated settings updates enforce each granular master capability', async (t) => {
+  const Settings = require('../models/Settings');
+  const config = configuration(true);
+  Object.assign(config.structure.clientPermissions, { branding: false, shipping: false, payments: false, returns: false, social: false });
+  stubConfig(t, config);
+  const current = { _id: 'settings', storeName: 'Store', logoUrl: '', deliveryCharge: 99, codEnabled: true, returnWindowDays: 7, socialLinks: {}, toObject() { return { ...this, toObject: undefined }; } };
+  t.mock.method(Settings, 'findOne', async () => current);
+  const write = t.mock.method(Settings, 'findOneAndUpdate', async () => assert.fail('Forbidden settings must not be written'));
+  const controller = require('../controllers/settingsController');
+  for (const body of [
+    { logoUrl: 'https://example.com/logo.png' }, { deliveryCharge: 120 }, { codEnabled: false },
+    { returnWindowDays: 14 }, { socialLinks: { instagram: 'https://instagram.com/example' } },
+  ]) {
+    let error;
+    await controller.updateSettings({ user: { role: 'admin' }, body, tenantFilter: {} }, response(), (value) => { error = value; });
+    assert.equal(error?.statusCode, 403, Object.keys(body)[0]);
+  }
+  assert.equal(write.mock.callCount(), 0);
 });
 
 test('fashion product sizes and variants remain unchanged and specifications use owner labels', async (t) => {
@@ -434,6 +510,7 @@ test('hybrid OTP sends real owner SMS while customer demo uses 123456 without SM
   process.env.SMS_PROVIDER = 'twilio';
   process.env.OTP_MODE = 'demo';
   process.env.DEMO_OTP = '123456';
+  process.env.ALLOW_HOSTED_OWNER_DEMO = 'false';
   try {
     let record;
     t.mock.method(crypto, 'randomInt', () => 765432);
@@ -476,7 +553,68 @@ test('hybrid OTP sends real owner SMS while customer demo uses 123456 without SM
     assert.equal(delivery.mock.callCount(), 1);
   } finally {
     mongoose.connection.readyState = previousState;
-    for (const key of ['JWT_SECRET', 'JWT_REFRESH_SECRET', 'SMS_PROVIDER', 'OTP_MODE', 'DEMO_OTP']) {
+    for (const key of ['JWT_SECRET', 'JWT_REFRESH_SECRET', 'SMS_PROVIDER', 'OTP_MODE', 'DEMO_OTP', 'ALLOW_HOSTED_OWNER_DEMO']) {
+      if (saved[key] === undefined) delete process.env[key]; else process.env[key] = saved[key];
+    }
+  }
+});
+
+test('explicit hosted demo lets the owner use 123456 without Twilio and invalidates the session when demo mode is disabled', async (t) => {
+  const saved = { ...process.env };
+  const previousState = mongoose.connection.readyState;
+  mongoose.connection.readyState = 1;
+  Object.assign(process.env, {
+    NODE_ENV: 'production', OTP_MODE: 'demo', DEMO_OTP: '123456', ALLOW_HOSTED_OWNER_DEMO: 'true',
+    JWT_SECRET: 'hosted-demo-unit-access', JWT_REFRESH_SECRET: 'hosted-demo-unit-refresh', OTP_RESEND_COOLDOWN_SECONDS: '0',
+  });
+  try {
+    const sms = t.mock.method(require('../services/providers/twilioSmsProvider'), 'sendOtp', async () => assert.fail('Hosted demo must not send SMS'));
+    let record;
+    t.mock.method(Otp, 'findOne', () => ({ sort: async () => record && !record.isUsed ? record : null }));
+    t.mock.method(Otp, 'updateMany', async () => {});
+    t.mock.method(Otp, 'create', async value => {
+      record = { ...value, _id: 'hosted-demo-otp', isUsed: false, trustedDelivery: false, attempts: 0, createdAt: new Date(), save: async () => record };
+      return record;
+    });
+    t.mock.method(Otp, 'findOneAndUpdate', async predicate => {
+      assert.equal(predicate.purpose, 'master_demo_login');
+      assert.equal(predicate.provider, 'hosted-demo');
+      if (record.isUsed) return null;
+      record.isUsed = true; return record;
+    });
+    const user = { _id: '0123456789abcdef01234567', phone: '9816978086', name: 'Owner', role: 'customer', save: async () => user };
+    t.mock.method(User, 'findOne', async () => user);
+    t.mock.method(User, 'findById', () => ({ select: async () => user }));
+    const controller = require('../controllers/authController');
+    const { protect } = require('../middleware/authMiddleware');
+    const jwt = require('jsonwebtoken');
+    const req = body => ({ body, ip: 'hosted-demo-unit', headers: { host: 'samira.example', origin: 'https://samira.example' } });
+
+    const sent = response(); await controller.sendOtp(req({ phone: '9816978086' }), sent);
+    assert.equal(sent.statusCode, 200);
+    assert.equal(sent.body.otpMode, 'demo');
+    assert.equal(sent.body.demoOtp, '123456');
+    assert.equal(record.provider, 'hosted-demo');
+    assert.equal(sms.mock.callCount(), 0);
+
+    const verified = response(); await controller.verifyOtp(req({ phone: '9816978086', otp: '123456' }), verified);
+    assert.equal(verified.statusCode, 200);
+    assert.equal(jwt.decode(verified.body.token).hostedOwnerDemo, true);
+    const switched = response(); await controller.switchMode({ user, body: { mode: 'admin' }, query: {} }, switched);
+    assert.equal(policy.isMasterOwner(user), true);
+
+    const accessReq = { headers: { authorization: `Bearer ${switched.body.token}` } };
+    let authorized = false;
+    await protect(accessReq, response(), () => { authorized = true; });
+    assert.equal(authorized, true);
+
+    process.env.OTP_MODE = 'production';
+    const rejected = response();
+    await protect({ headers: { authorization: `Bearer ${switched.body.token}` } }, rejected, () => assert.fail('Hosted demo token must stop working'));
+    assert.equal(rejected.statusCode, 401);
+  } finally {
+    mongoose.connection.readyState = previousState;
+    for (const key of ['NODE_ENV', 'OTP_MODE', 'DEMO_OTP', 'ALLOW_HOSTED_OWNER_DEMO', 'JWT_SECRET', 'JWT_REFRESH_SECRET', 'OTP_RESEND_COOLDOWN_SECONDS']) {
       if (saved[key] === undefined) delete process.env[key]; else process.env[key] = saved[key];
     }
   }
@@ -494,7 +632,7 @@ function localDemoRequest(body = {}, extra = {}) {
 
 function enableLocalDemo(t) {
   const values = { NODE_ENV: 'production', OTP_MODE: 'demo', LOCAL_OWNER_DEMO: 'true', DEMO_OTP: '123456',
-    JWT_SECRET: 'local-demo-unit-access', JWT_REFRESH_SECRET: 'local-demo-unit-refresh', OTP_RESEND_COOLDOWN_SECONDS: '60' };
+    ALLOW_HOSTED_OWNER_DEMO: 'false', JWT_SECRET: 'local-demo-unit-access', JWT_REFRESH_SECRET: 'local-demo-unit-refresh', OTP_RESEND_COOLDOWN_SECONDS: '60' };
   const previous = Object.fromEntries(Object.keys(values).map(key => [key, process.env[key]]));
   Object.assign(process.env, values);
   t.after(() => Object.keys(values).forEach(key => {
@@ -598,7 +736,18 @@ test('local demo OTP expiry and attempt limits remain enforced', async (t) => {
   await assert.rejects(otpService.verifyOtp('9816978086', '123456', localDemoRequest()), /Maximum OTP attempts/);
 });
 
-test('tokens from the removed hosted owner demo path are rejected', () => {
+test('hosted owner demo sessions require the explicit switch and demo OTP mode', (t) => {
+  const previousMode = process.env.OTP_MODE;
+  const previousSwitch = process.env.ALLOW_HOSTED_OWNER_DEMO;
+  t.after(() => {
+    if (previousMode === undefined) delete process.env.OTP_MODE; else process.env.OTP_MODE = previousMode;
+    if (previousSwitch === undefined) delete process.env.ALLOW_HOSTED_OWNER_DEMO; else process.env.ALLOW_HOSTED_OWNER_DEMO = previousSwitch;
+  });
   const { allowsOwnerDemoSession } = require('../config/localOwnerDemo');
+  process.env.OTP_MODE = 'demo'; process.env.ALLOW_HOSTED_OWNER_DEMO = 'true';
+  assert.equal(allowsOwnerDemoSession({ hostedOwnerDemo: true }, {}), true);
+  process.env.ALLOW_HOSTED_OWNER_DEMO = 'false';
+  assert.equal(allowsOwnerDemoSession({ hostedOwnerDemo: true }, {}), false);
+  process.env.ALLOW_HOSTED_OWNER_DEMO = 'true'; process.env.OTP_MODE = 'production';
   assert.equal(allowsOwnerDemoSession({ hostedOwnerDemo: true }, {}), false);
 });

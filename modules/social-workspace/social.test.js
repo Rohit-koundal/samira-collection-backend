@@ -4,21 +4,23 @@ const crypto = require('node:crypto');
 const path = require('node:path');
 const fs = require('node:fs/promises');
 process.env.NODE_ENV = 'test'; process.env.JWT_SECRET = 'social-isolated-test-key'; process.env.MONGOMS_RUNTIME_DOWNLOAD = 'false';
-Object.assign(process.env, { META_APP_ID: 'test-app', META_APP_SECRET: 'test-meta-secret', META_WEBHOOK_VERIFY_TOKEN: 'test-verify', META_REDIRECT_URI: 'http://localhost:5000/api/social/oauth/callback', FRONTEND_URL: 'http://localhost:3000', PUBLIC_API_URL: 'https://media.example.test', R2_PUBLIC_URL: 'https://media.example.test', R2_ACCOUNT_ID: '', R2_ACCESS_KEY_ID: '', R2_SECRET_ACCESS_KEY: '', CLOUDINARY_CLOUD_NAME: '', CLOUDINARY_API_KEY: '', CLOUDINARY_API_SECRET: '' });
+Object.assign(process.env, { META_APP_ID: 'test-app', META_APP_SECRET: 'test-meta-secret', META_WEBHOOK_VERIFY_TOKEN: 'test-verify', META_REDIRECT_URI: 'http://localhost:5000/api/social/oauth/callback', INSTAGRAM_BUSINESS_APP_ID: 'test-instagram-app', INSTAGRAM_BUSINESS_APP_SECRET: 'test-instagram-secret', INSTAGRAM_BUSINESS_REDIRECT_URI: 'http://localhost:5000/api/social/oauth/instagram/callback', FRONTEND_URL: 'http://localhost:3000', PUBLIC_API_URL: 'https://media.example.test', R2_PUBLIC_URL: 'https://media.example.test', R2_ACCOUNT_ID: '', R2_ACCESS_KEY_ID: '', R2_SECRET_ACCESS_KEY: '', CLOUDINARY_CLOUD_NAME: '', CLOUDINARY_API_KEY: '', CLOUDINARY_API_SECRET: '' });
 const mongoose = require('mongoose');
 const express = require('express');
 const { MongoMemoryServer } = require('mongodb-memory-server');
 const User = require('../../models/User'), Store = require('../../models/Store'), StoreMember = require('../../models/StoreMember'), Product = require('../../models/Product');
-const { Connection, OAuth, Thread, Message, Post } = require('./models');
+const Order = require('../../models/Order'), CustomerCrm = require('../../models/CustomerCrm');
+const { Connection, OAuth, Thread, Message, Post, WebhookEvent } = require('./models');
 const { generateToken } = require('../../utils/generateToken');
 const { encryptSecret, decryptSecret } = require('../../utils/secretBox');
 const meta = require('./meta'), oauth = require('./oauth'), inbox = require('./inbox'), publishing = require('./publishing'), media = require('./media');
+const webhookWorker = require('./webhookWorker');
 
 test('signatures, encryption, messaging policy and media URL guards', async t => {
   const raw = Buffer.from('{"entry":[]}'), signature = 'sha256=' + crypto.createHmac('sha256', process.env.META_APP_SECRET).update(raw).digest('hex');
   assert.equal(meta.verifySignature(raw, signature), true); assert.equal(meta.verifySignature(Buffer.from('{}'), signature), false); assert.equal(meta.verifySignature(raw, ''), false);
   const token = encryptSecret('synthetic-page-token'); assert.notEqual(token, 'synthetic-page-token'); assert.equal(decryptSecret(token), 'synthetic-page-token');
-  assert.equal(meta.replyAllowed({ lastInboundAt: new Date(Date.now() - 10000) }), true); assert.equal(meta.replyAllowed({ lastInboundAt: new Date(Date.now() - 86400000) }), false); assert.equal(meta.replyAllowed({ lastInboundAt: new Date(Date.now() + 1000) }), false); assert.equal(meta.replyAllowed({}), false);
+  assert.equal(meta.replyAllowed({ lastInboundAt: new Date(Date.now() - 10000) }), true); assert.equal(meta.replyAllowed({ contextType: 'comment', lastInboundAt: new Date(Date.now() - 10000) }), false); assert.equal(meta.replyAllowed({ lastInboundAt: new Date(Date.now() - 86400000) }), false); assert.equal(meta.replyAllowed({ lastInboundAt: new Date(Date.now() + 1000) }), false); assert.equal(meta.replyAllowed({}), false);
   for (const url of ['http://media.example.test/image.jpg', 'https://evil.test/image.jpg', 'https://media.example.test.evil.test/a', 'https://user:pass@media.example.test/a']) assert.throws(() => media.trustedUrl(url));
   assert.equal(media.trustedUrl('https://media.example.test/a.jpg').hostname, 'media.example.test');
   for (const ip of ['127.0.0.1', '10.1.2.3', '169.254.169.254', '172.16.0.1', '192.168.1.1', '100.64.0.1', '224.0.0.1']) assert.equal(media.publicIPv4(ip), false);
@@ -31,7 +33,7 @@ test('social workspace uses isolated persistence and mocked Meta only', { timeou
   try {
     mongo = await MongoMemoryServer.create({ binary: { version: '7.0.14', systemBinary: process.platform === 'win32' ? path.resolve(__dirname, '../../node_modules/.cache/mongodb-binaries/mongod-x64-win32-7.0.14.exe') : undefined } });
     await mongoose.connect(mongo.getUri(), { dbName: 'isolated_social_studio' });
-    await Promise.all([Connection, OAuth, Thread, Message, Post].map(model => model.init()));
+    await Promise.all([Connection, OAuth, Thread, Message, Post, WebhookEvent].map(model => model.init()));
     const [owner, other, support, marketing, customer] = await User.create([
       { phone: '9000000091', activeMode: 'seller', availableModes: ['customer', 'seller'] },
       { phone: '9000000092', activeMode: 'seller', availableModes: ['customer', 'seller'] },
@@ -47,6 +49,19 @@ test('social workspace uses isolated persistence and mocked Meta only', { timeou
     global.fetch = async (url, options = {}) => {
       const address = new URL(url);
       if (address.hostname === '127.0.0.1') return originalFetch(url, options);
+      if (address.hostname === 'api.instagram.com') return new Response(JSON.stringify({ access_token: 'synthetic-instagram-short-token', user_id: '30001' }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      if (address.hostname === 'graph.instagram.com') {
+        const edge = address.pathname.replace(/^\/v\d+\.0\//, '').replace(/^\//, '');
+        const data = edge === 'access_token'
+          ? { access_token: 'synthetic-instagram-long-token', expires_in: 5184000 }
+          : edge === 'me' || edge === '30001'
+            ? { user_id: '30001', username: 'directshop', name: 'Direct Shop' }
+            : edge === '30001/subscribed_apps'
+              ? { success: true }
+              : null;
+        if (!data) throw new Error('Unexpected Instagram mock API call: ' + edge);
+        return new Response(JSON.stringify(data), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
       if (address.hostname === 'rupload.facebook.com') { calls.push({ edge: 'reel-upload', method: options.method, params: { file_url: options.headers.file_url } }); return new Response('{"success":true}', { status: 200 }); }
       assert.equal(address.hostname, 'graph.facebook.com', 'Tests must never call other networks');
       const edge = address.pathname.replace(/^\/v\d+\.0\//, ''), method = options.method || 'GET', params = Object.fromEntries(method === 'GET' ? address.searchParams : new URLSearchParams(options.body));
@@ -77,6 +92,7 @@ test('social workspace uses isolated persistence and mocked Meta only', { timeou
     media.prepare = async (_post, video) => video ? 'https://media.example.test/reel.mp4' : ['https://media.example.test/prepared.jpg'];
     const app = express();
     app.get('/api/social/oauth/start', oauth.wrap(oauth.navigate)); app.get('/api/social/oauth/callback', oauth.wrap(oauth.callback));
+    app.get('/api/social/oauth/instagram/start', oauth.wrap(oauth.navigateInstagram)); app.get('/api/social/oauth/instagram/callback', oauth.wrap(oauth.callbackInstagram));
     app.get('/api/social/webhook', inbox.verifyWebhook); app.post('/api/social/webhook', express.raw({ type: '*/*' }), oauth.wrap(inbox.webhook));
     app.post('/api/social/data-deletion', express.urlencoded({ extended: false }), oauth.wrap(oauth.deauthorize)); app.get('/api/social/deletion-status/:code', oauth.wrap(oauth.deletionStatus));
     app.use(express.json()); app.use('/api/social', require('./routes'));
@@ -123,7 +139,7 @@ test('social workspace uses isolated persistence and mocked Meta only', { timeou
       assert.equal((await request('/status', { user: other })).data.accounts.length, 0);
     });
     await t.test('signed webhook delivery is idempotent, tracks unread and resists stale/future events', async () => {
-      const sendEvent = async payload => { const raw = JSON.stringify(payload), signature = 'sha256=' + crypto.createHmac('sha256', process.env.META_APP_SECRET).update(raw).digest('hex'); return request('/webhook', { method: 'POST', raw, signature, user: null }); };
+      const sendEvent = async payload => { const raw = JSON.stringify(payload), signature = 'sha256=' + crypto.createHmac('sha256', process.env.META_APP_SECRET).update(raw).digest('hex'); const response = await request('/webhook', { method: 'POST', raw, signature, user: null }); for (let i = 0; i < 50 && await WebhookEvent.exists({ status: { $in: ['pending', 'processing'] } }); i++) { await webhookWorker.tick(); await new Promise(resolve => setTimeout(resolve, 5)); } return response; };
       const payload = { object: 'page', entry: [{ id: '10001', messaging: [{ sender: { id: 'customer1' }, recipient: { id: '10001' }, timestamp: Date.now() - 1000, message: { mid: 'incoming-1', text: 'Do you have medium?', attachments: [{ type: 'image', payload: { url: 'https://media.example.test/customer-photo.jpg' } }, { type: 'file', payload: { url: 'javascript:alert(1)' } }] } }] }] };
       assert.equal((await request('/webhook', { method: 'POST', raw: JSON.stringify(payload), user: null })).status, 403);
       assert.equal((await sendEvent(payload)).status, 200); assert.equal((await sendEvent(payload)).status, 200);
@@ -131,7 +147,8 @@ test('social workspace uses isolated persistence and mocked Meta only', { timeou
       assert.deepEqual((await Message.findOne({ externalId: 'incoming-1' }).lean()).attachments, [{ type: 'image', url: 'https://media.example.test/customer-photo.jpg' }]);
       thread = await Thread.findOne({ participantId: 'customer1' });
       assert.equal((await request('/threads')).data.unread, 1);
-      await request('/threads/' + thread._id, { method: 'PATCH', body: { readAt: thread.lastInboundAt, resolved: true } });
+      await request('/threads/' + thread._id + '/read', { method: 'POST', body: { readAt: thread.lastInboundAt } });
+      await request('/threads/' + thread._id, { method: 'PATCH', body: { resolved: true } });
       await sendEvent(payload); assert.equal((await request('/threads')).data.unread, 0); assert.equal((await Thread.findById(thread._id)).resolved, true);
       await inbox.record(account, { id: 'stale', participantId: 'customer1', direction: 'inbound', text: 'old', sentAt: Date.now() - 86400000 });
       assert.equal((await Thread.findById(thread._id)).preview, 'Do you have medium?');
@@ -319,6 +336,57 @@ test('social workspace uses isolated persistence and mocked Meta only', { timeou
       assert.equal((await request('/posts/' + post._id + '/retry', { method: 'POST', body: {}, user: marketing })).status, 409);
       await publishing.tick();
       assert.equal(calls.length, after); assert.equal(await Post.countDocuments({ _id: post._id }), 1);
+    });
+    await t.test('team workflow, customer context and real store insights remain tenant scoped', async () => {
+      await User.updateOne({ _id: customer._id }, { $set: { name: 'Ananya Customer', email: 'ananya@example.test' } });
+      await Order.create({ storeId: store._id, user: customer._id, orderItems: [{ product: product._id, name: product.name, quantity: 1, price: 1299 }], finalAmount: 1299, paymentMethod: 'COD', paymentStatus: 'Pending', orderStatus: 'Confirmed' });
+      await CustomerCrm.create({ storeId: store._id, user: customer._id, tags: ['Instagram Customer'] });
+      const workflow = await request('/threads/' + thread._id, { method: 'PATCH', user: support, body: { assignedTo: support._id, priority: 'HIGH', labels: ['Sizing', 'VIP'], snoozedUntil: new Date(Date.now() + 3600000) } });
+      assert.equal(workflow.status, 200); assert.equal(workflow.data.thread.priority, 'HIGH'); assert.equal(String(workflow.data.thread.assignedTo._id), String(support._id));
+      assert.equal((await request('/threads/' + thread._id, { method: 'PATCH', user: marketing, body: { resolved: true } })).status, 403);
+      assert.equal((await request('/threads/' + thread._id + '/notes', { method: 'POST', user: support, body: { text: 'Customer asked for medium size.' } })).status, 200);
+      const search = await request('/customers?search=Ananya', { user: support }); assert.equal(search.data.customers.length, 1);
+      assert.equal((await request('/threads/' + thread._id + '/customer', { method: 'PUT', user: support, body: { customerId: customer._id } })).status, 200);
+      const context = await request('/threads/' + thread._id + '/context', { user: support }); assert.equal(context.data.customer.name, 'Ananya Customer'); assert.equal(context.data.orders.length, 1);
+      assert.equal((await request('/threads/' + thread._id + '/context', { user: other })).status, 404);
+      const insight = await request('/insights?days=30', { user: support }); assert.equal(insight.status, 200); assert.ok(insight.data.messages.inbound >= 1);
+      const workspace = await request('/status', { user: support }); assert.ok(workspace.data.agents.some(agent => String(agent.id) === String(support._id)));
+    });
+    await t.test('delivery, read, reaction and postback webhooks update the durable conversation state', async () => {
+      const outgoing = await Message.create({ storeId: store._id, threadId: thread._id, connectionId: account._id, externalId: 'receipt-1', direction: 'outbound', text: 'Hello', status: 'sent', sentAt: new Date(Date.now() - 1000) });
+      const payload = { object: 'page', entry: [{ id: '10001', messaging: [
+        { sender: { id: '10001' }, recipient: { id: 'customer1' }, timestamp: Date.now(), delivery: { mids: ['receipt-1'], watermark: Date.now() } },
+        { sender: { id: 'customer1' }, recipient: { id: '10001' }, timestamp: Date.now(), read: { watermark: Date.now() } },
+        { sender: { id: 'customer1' }, recipient: { id: '10001' }, timestamp: Date.now(), reaction: { mid: 'receipt-1', action: 'react', emoji: '❤' } },
+        { sender: { id: 'customer1' }, recipient: { id: '10001' }, timestamp: Date.now(), postback: { title: 'View product', payload: 'PRODUCT_1' } },
+      ] }] };
+      const raw = JSON.stringify(payload), signature = 'sha256=' + crypto.createHmac('sha256', process.env.META_APP_SECRET).update(raw).digest('hex');
+      assert.equal((await request('/webhook', { method: 'POST', raw, signature, user: null })).status, 200);
+      for (let i = 0; i < 50 && await WebhookEvent.exists({ status: { $in: ['pending', 'processing'] } }); i++) { await webhookWorker.tick(); await new Promise(resolve => setTimeout(resolve, 5)); }
+      const saved = await Message.findById(outgoing._id); assert.equal(saved.status, 'read'); assert.equal(saved.reaction.action, 'react');
+      assert.equal(await Message.countDocuments({ externalId: { $regex: '^postback:' } }), 1);
+    });
+    await t.test('channel captions can be scheduled safely and cancelled before execution', async () => {
+      const created = await request('/posts', { method: 'POST', user: marketing, body: { productId: product._id, images: ['https://media.example.test/photo.jpg'], caption: 'Main caption', channelCaptions: { instagram: 'Instagram caption', facebook: 'Facebook caption' }, campaign: 'Festive launch' } });
+      const scheduledFor = new Date(Date.now() + 3600000).toISOString(), before = calls.length;
+      const scheduled = await request('/posts/' + created.data.post._id + '/publish', { method: 'POST', user: marketing, body: { connectionIds: [ig._id], scheduledFor } });
+      assert.equal(scheduled.status, 202); assert.equal(scheduled.data.post.status, 'scheduled'); assert.equal(scheduled.data.post.targets[0].caption, 'Instagram caption');
+      await publishing.tick(); assert.equal(calls.length, before);
+      const cancelled = await request('/posts/' + created.data.post._id + '/cancel-schedule', { method: 'POST', user: marketing, body: {} });
+      assert.equal(cancelled.status, 200); assert.equal(cancelled.data.post.status, 'draft'); assert.equal(cancelled.data.post.targets.length, 0);
+    });
+    await t.test('direct Instagram Login completes one-use OAuth without exposing its token', async () => {
+      assert.equal((await request('/connect', { method: 'POST', user: support, body: { provider: 'instagram' } })).status, 403);
+      const response = await request('/connect', { method: 'POST', body: { provider: 'instagram' } }); assert.equal(response.status, 200);
+      const startUrl = new URL(response.data.url), state = startUrl.searchParams.get('state');
+      const navigated = await request('/oauth/instagram/start' + startUrl.search, { user: null }); assert.equal(navigated.status, 302); assert.match(navigated.headers.get('location'), /instagram\.com\/oauth\/authorize/);
+      const cookie = navigated.headers.get('set-cookie').split(';')[0];
+      const callback = await request('/oauth/instagram/callback?state=' + state + '&code=test-direct', { user: null, cookie }); assert.equal(callback.status, 302);
+      const selectionId = new URL(callback.headers.get('location')).searchParams.get('connectionSession'); assert.ok(selectionId);
+      const pending = await request('/pending/' + selectionId); assert.equal(pending.data.provider, 'instagram'); assert.equal(pending.data.pages[0].instagram.username, 'directshop'); assert.ok(!JSON.stringify(pending.data).includes('synthetic-instagram'));
+      const activated = await request('/pending/' + selectionId, { method: 'POST', body: { pageIds: ['30001'] } }); assert.equal(activated.status, 200, JSON.stringify(activated.data));
+      const direct = await Connection.findOne({ accountId: '30001' }).select('+token'); assert.equal(direct.authMethod, 'instagram'); assert.equal(direct.apiHost, 'graph.instagram.com'); assert.equal(decryptSecret(direct.token), 'synthetic-instagram-long-token'); assert.equal(meta.capabilities(direct).publish, true);
+      assert.equal((await request('/oauth/instagram/callback?state=' + state + '&code=test-direct', { user: null, cookie })).status, 400);
     });
     await t.test('disconnect erases tenant account messages and token, preserving sibling account', async () => {
       assert.equal((await request('/accounts/' + account._id, { method: 'DELETE', user: other })).status, 404);

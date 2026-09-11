@@ -64,3 +64,11 @@ reverseSchema.add({ order: { type: mongoose.Schema.Types.ObjectId, ref: 'Order',
 reverseSchema.index({ returnRequest: 1 }, { unique: true });
 reverseSchema.index({ provider: 1, nextSyncAt: 1 });
 module.exports.ReverseShipment = mongoose.model('ReverseShipment', reverseSchema);
+// A replacement is a second forward parcel linked to an exchange case. Keeping
+// it in a separate collection avoids weakening the one-forward-shipment rule.
+const replacementSchema = shipmentSchema.clone();
+replacementSchema.remove('order');
+replacementSchema.add({ order: { type: mongoose.Schema.Types.ObjectId, ref: 'Order', required: true } });
+replacementSchema.index({ returnRequest: 1 }, { unique: true });
+replacementSchema.index({ provider: 1, nextSyncAt: 1 });
+module.exports.ReplacementShipment = mongoose.model('ReplacementShipment', replacementSchema);

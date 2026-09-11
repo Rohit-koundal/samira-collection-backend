@@ -209,6 +209,7 @@ test('catalog archive, restore, duplicate, bulk update and export workflows rema
   const copy = await request(`/api/admin/products/${second._id}/duplicate`, { method: 'POST', token, body: {} });
   assert.equal(copy.status, 201);
   assert.equal(copy.data.isActive, false);
+  assert.equal(copy.data.stock, 0);
   assert.notEqual(copy.data.sku, second.sku);
 
   const bulk = await request('/api/admin/products/bulk', {

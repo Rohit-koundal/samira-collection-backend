@@ -10,6 +10,12 @@ const clone = (value) => JSON.parse(JSON.stringify(value));
 const bad = (message) => { throw new ApiError('VALIDATION_ERROR', message); };
 const text = (value, max) => typeof value === 'string' ? value.trim().slice(0, max) : '';
 const title = (value) => String(value || '').replace(/[-_]/g, ' ').replace(/\b\w/g, (letter) => letter.toUpperCase());
+const CLIENT_PERMISSION_KEYS = Object.freeze([
+  'branding', 'websiteDesign', 'content', 'catalog', 'pricing', 'inventory', 'orders', 'returns',
+  'reviews', 'discounts', 'payments', 'shipping', 'social', 'reports', 'customers', 'staff', 'integrations',
+]);
+const SYSTEM_FILTER_KEYS = new Set(['category', 'subcategory', 'price', 'availability', 'rating', 'discount', 'delivery_availability']);
+const PRODUCT_CARD_FIELDS = new Set(['name', 'price', 'originalPrice', 'discountPercentage', 'rating', 'stock', 'category', 'shortDescription']);
 
 function safeInteger(value, fallback, min, max) {
   const number = Number(value);
@@ -27,6 +33,26 @@ function cleanDefault(value, type) {
   if (type === 'boolean') return value === true || String(value).toLowerCase() === 'true';
   if (type === 'number' || type === 'measurement' || type === 'range') return Number.isFinite(Number(value)) ? Number(value) : '';
   return text(String(value), 500);
+}
+
+function checkedDefault(value, type, options, validation, label) {
+  const result = cleanDefault(value, type);
+  if (result === '') return result;
+  if (['dropdown', 'multi_select'].includes(type)) {
+    const selected = Array.isArray(value)
+      ? value.map((item) => text(String(item), 100)).filter(Boolean)
+      : String(result).split(',').map((item) => item.trim()).filter(Boolean);
+    if (selected.some((item) => !options.includes(item))) bad(`${label} has a default value that is not in its options`);
+    return type === 'multi_select' ? selected.join(', ') : selected[0];
+  }
+  if (['number', 'measurement', 'range'].includes(type)) {
+    if (validation.min !== undefined && result < validation.min) bad(`${label} default must be at least ${validation.min}`);
+    if (validation.max !== undefined && result > validation.max) bad(`${label} default must be at most ${validation.max}`);
+  }
+  if (type === 'date' && !/^\d{4}-\d{2}-\d{2}$/.test(String(result))) bad(`${label} needs a valid YYYY-MM-DD default date`);
+  if (validation.minLength && String(result).length < validation.minLength) bad(`${label} default is shorter than its minimum length`);
+  if (validation.maxLength && String(result).length > validation.maxLength) bad(`${label} default is longer than its maximum length`);
+  return result;
 }
 
 function cleanValidation(value, type) {
@@ -65,15 +91,18 @@ function cleanCategories(value, attributes) {
       const entryKey = text(entry?.key, 40);
       const entryLabel = text(entry?.label, 80);
       const type = ATTRIBUTE_TYPES.includes(entry?.type) ? entry.type : 'text';
-      if (!/^[a-z][a-z0-9_]{0,39}$/.test(entryKey) || !entryLabel || localDefinitionKeys.has(entryKey)) bad(`${name} has an invalid or duplicate attribute definition`);
+      if (!/^[a-z][a-z0-9_]{0,39}$/.test(entryKey) || ['constructor', 'prototype', '__proto__'].includes(entryKey) || !entryLabel || localDefinitionKeys.has(entryKey)) bad(`${name} has an invalid or duplicate attribute definition`);
       localDefinitionKeys.add(entryKey);
+      const options = cleanOptions(entry.options, 100);
+      if (['dropdown', 'multi_select'].includes(type) && !options.length) bad(`${name} ${entryLabel} needs at least one option`);
+      const validation = cleanValidation(entry.validation, type);
       return {
         key: entryKey, label: entryLabel, type, unit: text(entry.unit, 20), required: entry.required === true,
         filterable: entry.filterable === true, searchable: entry.searchable !== false, showOnCard: entry.showOnCard === true,
         showOnDetail: entry.showOnDetail !== false, showInSpecifications: entry.showInSpecifications !== false,
-        variant: entry.variant === true, options: cleanOptions(entry.options, 100), defaultValue: cleanDefault(entry.defaultValue, type),
+        variant: entry.variant === true, options, defaultValue: checkedDefault(entry.defaultValue, type, options, validation, entryLabel),
         sortOrder: safeInteger(entry.sortOrder, attributes.length + index + 1, 0, 1000), group: text(entry.group, 60) || 'Specifications',
-        validation: cleanValidation(entry.validation, type),
+        validation,
       };
     }).filter(Boolean) : [];
     const localKeys = new Set(localAttributes.map((entry) => typeof entry === 'string' ? entry : entry.key));
@@ -91,18 +120,27 @@ function cleanCategories(value, attributes) {
       parentKey = result.find((candidate) => candidate.key === parentKey)?.parentKey || '';
     }
   });
+  const configuredKeys = new Set([...attributeKeys, ...result.flatMap((item) => (item.attributes || []).map((entry) => typeof entry === 'string' ? entry : entry.key))]);
+  result.forEach((item) => {
+    if ((item.filters || []).some((key) => !configuredKeys.has(key) && !SYSTEM_FILTER_KEYS.has(key))) bad(`${item.name} contains an unknown filter key`);
+  });
   return result;
 }
 
-function cleanFilters(value, attributes) {
+function cleanFilters(value, attributes, categories = []) {
   const fallback = ['category', 'price', ...attributes.filter((item) => item.filterable).map((item) => item.key), 'availability'];
   const list = value === undefined ? fallback : value;
   if (!Array.isArray(list) || list.length > 40) bad('Use at most 40 catalog filters');
   const seen = new Set();
+  const allowed = new Set([
+    ...attributes.map((item) => item.key),
+    ...categories.flatMap((item) => (item.attributes || []).map((entry) => typeof entry === 'string' ? entry : entry.key)),
+  ]);
   return list.map((item) => {
     const raw = typeof item === 'string' ? { key: item } : item;
     const key = text(raw?.key, 40).toLowerCase();
     if (!/^[a-z][a-z0-9_]{0,39}$/.test(key) || seen.has(key)) bad('Filter keys must be unique lowercase identifiers');
+    if (!SYSTEM_FILTER_KEYS.has(key) && !allowed.has(key)) bad(`${title(key)} filter does not match a configured product attribute`);
     seen.add(key);
     return { key, label: text(raw.label, 80) || title(key), type: text(raw.type, 30) || 'value', enabled: raw.enabled !== false };
   });
@@ -115,7 +153,7 @@ function cleanNamedList(value, fallback = [], limit, label) {
   return list.map((item) => {
     const raw = typeof item === 'string' ? { key: item } : item;
     const key = text(raw?.key, 40);
-    if (!key || seen.has(key)) bad(`${title(label)} need unique keys`);
+    if (!/^[a-zA-Z][a-zA-Z0-9_-]{0,39}$/.test(key) || seen.has(key)) bad(`${title(label)} need unique safe keys`);
     seen.add(key);
     return { key, label: text(raw.label, 80) || title(key) };
   });
@@ -138,10 +176,11 @@ function cleanVariantConfig(value, attributes) {
 function cleanProductCard(value, attributes) {
   const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
   const allowed = new Set(attributes.map((item) => item.key));
-  return {
-    fields: cleanOptions(source.fields === undefined ? ['name', 'price', 'discountPercentage'] : source.fields, 8),
-    attributeKeys: cleanOptions(source.attributeKeys === undefined ? attributes.filter((item) => item.showOnCard).map((item) => item.key) : source.attributeKeys, 4).filter((key) => allowed.has(key)),
-  };
+  const fields = cleanOptions(source.fields === undefined ? ['name', 'price', 'discountPercentage'] : source.fields, 8);
+  const attributeKeys = cleanOptions(source.attributeKeys === undefined ? attributes.filter((item) => item.showOnCard).map((item) => item.key) : source.attributeKeys, 4);
+  if (fields.some((key) => !PRODUCT_CARD_FIELDS.has(key))) bad('Product card contains an unknown core field');
+  if (attributeKeys.some((key) => !allowed.has(key))) bad('Product card contains an unknown attribute');
+  return { fields, attributeKeys };
 }
 
 function cleanInventory(value, variantEnabled) {
@@ -163,7 +202,9 @@ function cleanReturns(value) {
 function cleanSeo(value, attributes) {
   const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
   const allowed = new Set(attributes.map((item) => item.key));
-  return { titlePattern: text(source.titlePattern, 120) || '{product} | {store}', descriptionAttributes: cleanOptions(source.descriptionAttributes, 10).filter((key) => allowed.has(key)) };
+  const descriptionAttributes = cleanOptions(source.descriptionAttributes, 10);
+  if (descriptionAttributes.some((key) => !allowed.has(key))) bad('SEO description contains an unknown attribute');
+  return { titlePattern: text(source.titlePattern, 120) || '{product} | {store}', descriptionAttributes };
 }
 
 function validateStructure(input) {
@@ -187,7 +228,7 @@ function validateStructure(input) {
       filterable: item.filterable === true, searchable: item.searchable !== false,
       showOnCard: item.showOnCard === true, showOnDetail: item.showOnDetail !== false,
       showInSpecifications: item.showInSpecifications !== false, variant: item.variant === true,
-      options, defaultValue: cleanDefault(item.defaultValue, type), sortOrder: safeInteger(item.sortOrder, index + 1, 0, 1000),
+      options, defaultValue: checkedDefault(item.defaultValue, type, options, validation, label), sortOrder: safeInteger(item.sortOrder, index + 1, 0, 1000),
       group: text(item.group, 60) || 'Specifications', validation,
     };
   });
@@ -195,7 +236,10 @@ function validateStructure(input) {
   if (!input.features.specifications) bad('Product specifications must remain enabled for configured attributes');
   const builtin = INDUSTRY_IDS.includes(industry) ? getIndustryPreset(industry) : null;
   if (builtin && !builtin.features.sizing && input.features.sizing) bad('Size selection is not enabled for this industry');
-  for (const key of ['content', 'payments']) if (typeof input.clientPermissions?.[key] !== 'boolean') bad('Choose valid client permissions');
+  if (input.clientPermissions !== undefined && (!input.clientPermissions || typeof input.clientPermissions !== 'object' || Array.isArray(input.clientPermissions))) bad('Choose valid client permissions');
+  for (const key of CLIENT_PERMISSION_KEYS) {
+    if (input.clientPermissions?.[key] !== undefined && typeof input.clientPermissions[key] !== 'boolean') bad(`${title(key)} permission must be true or false`);
+  }
   const selectedPreset = builtin || input;
   const shortList = (value, fallback, label) => {
     const list = value === undefined ? fallback : value;
@@ -203,13 +247,13 @@ function validateStructure(input) {
     return [...new Set(list.map((item) => text(item, 80)).filter(Boolean))];
   };
   const categoryDefinitions = cleanCategories(input.categoryDefinitions === undefined ? selectedPreset.categoryDefinitions : input.categoryDefinitions, attributes);
-  const filters = cleanFilters(input.filters === undefined ? selectedPreset.filters : input.filters, attributes);
+  const filters = cleanFilters(input.filters === undefined ? selectedPreset.filters : input.filters, attributes, categoryDefinitions);
   const variantConfig = cleanVariantConfig(input.variantConfig === undefined ? selectedPreset.variantConfig : input.variantConfig, attributes);
   return {
     id: text(input.id, 40) || industry,
     name: text(input.name, 80) || title(industry),
     industry,
-    version: Math.max(2, safeInteger(input.version, 2, 1, 100)),
+    version: Math.max(2, safeInteger(input.version, 2, 1, 100000)),
     active: input.active !== false,
     attributes,
     features: {
@@ -217,7 +261,7 @@ function validateStructure(input) {
       comparison: input.features.comparison === true, perishable: input.features.perishable === true,
       customization: input.features.customization === true, technical: input.features.technical === true,
     },
-    clientPermissions: { content: input.clientPermissions.content, payments: input.clientPermissions.payments },
+    clientPermissions: Object.fromEntries(CLIENT_PERMISSION_KEYS.map((key) => [key, input.clientPermissions?.[key] === undefined ? true : input.clientPermissions[key] === true])),
     defaultCategories: shortList(input.defaultCategories, selectedPreset.defaultCategories, 'starter categories'),
     categoryDefinitions,
     filters,
@@ -265,18 +309,21 @@ async function updateConfiguration(user, { revision, structure, locked, note = '
   if (changingStructure && locked !== undefined) bad('Save changes and lock as separate actions');
   if (!changingStructure && typeof locked !== 'boolean') bad('Choose a lock action or provide a structure');
   const next = changingStructure ? validateStructure(structure) : before.structure;
+  if (changingStructure) next.version = Math.max(Number(before.structure?.version || 1) + 1, Number(next.version || 2));
   if (changingStructure) {
     const changingIndustry = next.industry !== before.structure.industry || next.features.sizing !== before.structure.features.sizing;
-    if (changingIndustry && confirmIndustryChange !== true && await Product.exists({ isArchived: { $ne: true } })) {
+    if (changingIndustry && confirmIndustryChange !== true && await Product.exists({ storeId: null, isArchived: { $ne: true } })) {
       bad('This store contains products. Export/review the catalog and archive incompatible products before conversion. Products and orders are never deleted automatically.');
     }
     const changedKeys = before.structure.attributes.filter((field) =>
       JSON.stringify(next.attributes.find((item) => item.key === field.key)) !== JSON.stringify(field)).map((item) => item.key);
-    if (!changingIndustry && changedKeys.length && await Product.exists({ 'specifications.key': { $in: changedKeys }, isArchived: { $ne: true } })) {
+    if (!changingIndustry && changedKeys.length && await Product.exists({ storeId: null, 'specifications.key': { $in: changedKeys }, isArchived: { $ne: true } })) {
       bad('An attribute being changed is used by products. Migrate those product values before changing or removing its definition.');
     }
   }
-  const event = { revision: before.revision, structure: before.structure, locked: before.locked, at: new Date(), actor: String(user._id), note: text(note, 240) || (changingStructure ? 'Structure updated' : locked ? 'Configuration locked' : 'Configuration unlocked') };
+  // Keep only a small compatibility trail here. Full immutable snapshots live in
+  // MasterConfigurationVersion so this singleton cannot grow on every publish.
+  const event = { revision: before.revision, locked: before.locked, at: new Date(), actor: String(user._id), note: text(note, 240) || (changingStructure ? 'Structure updated' : locked ? 'Configuration locked' : 'Configuration unlocked') };
   const saved = await Configuration.findOneAndUpdate({ _id: 'store', revision }, {
     $set: { structure: next, locked: changingStructure ? false : locked, updatedBy: user._id },
     $inc: { revision: 1 }, $push: { history: { $each: [event], $slice: -30 } },

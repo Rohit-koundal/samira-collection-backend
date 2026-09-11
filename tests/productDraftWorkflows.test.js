@@ -6,6 +6,7 @@ const { createAdmin, createCustomer } = require('./factories');
 const Category = require('../models/Category');
 const Product = require('../models/Product');
 const ProductDraft = require('../models/ProductDraft');
+const InventoryTransaction = require('../models/InventoryTransaction');
 const { publishPreparedDraft } = require('../controllers/productDraftController');
 
 test.before(startTestEnvironment);
@@ -56,6 +57,10 @@ test('manual product draft preserves commercial, fulfilment and scheduling detai
   assert.equal(product.packageDimensions.lengthCm, 30);
   assert.equal(product.supplierName, 'Local artisan');
   assert.equal(product.publishAt.toISOString(), '2030-01-01T10:00:00.000Z');
+  const opening = await InventoryTransaction.find({ product: product._id, type: 'IMPORT' });
+  assert.equal(opening.length, 1);
+  assert.equal(opening[0].stockBefore, 0);
+  assert.equal(opening[0].stockAfter, 6);
 });
 
 test('manual add-product autosave is isolated per user and updates one cross-device draft', async () => {

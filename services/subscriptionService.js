@@ -5,24 +5,16 @@ const SubscriptionPayment = require('../models/SubscriptionPayment');
 const { createRazorpayOrder, isRazorpayConfigured } = require('./razorpayService');
 const { verifyRazorpaySignature } = require('../utils/paymentUtils');
 const { ApiError } = require('../utils/apiError');
+const { priceFor, readPlanPricing } = require('./subscriptionPricingService');
 const {
-  PLAN_IDS, STORE_PLANS, nextPeriodEnd, normalizeBillingCycle, normalizePlan, planSummary,
+  PLAN_IDS, nextPeriodEnd, normalizeBillingCycle, normalizePlan, planSummary,
 } = require('../config/storePlans');
 
 const PAID_CYCLES = ['MONTHLY', 'YEARLY', 'LIFETIME'];
 
-function planCatalog() {
-  return Object.values(STORE_PLANS).map((plan) => ({
-    id: plan.id,
-    name: plan.name,
-    description: plan.description,
-    features: [...plan.features],
-    limits: { ...plan.limits },
-    prices: { ...plan.prices },
-  }));
-}
+async function planCatalog() { return (await readPlanPricing()).plans; }
 
-function readPurchase(input = {}, store) {
+async function readPurchase(input = {}, store) {
   const plan = normalizePlan(input.plan, '');
   const billingCycle = normalizeBillingCycle(input.billingCycle, '');
   if (!PLAN_IDS.includes(plan)) throw new ApiError('VALIDATION_ERROR', 'Choose a valid subscription plan');
@@ -33,9 +25,7 @@ function readPurchase(input = {}, store) {
   if (current.status === 'ACTIVE' && nextRank < currentRank) throw new ApiError('VALIDATION_ERROR', 'A lower plan can be selected after the current access period ends. Contact the platform owner if you need an immediate change.');
   if (current.status === 'ACTIVE' && current.billingCycle === 'LIFETIME' && billingCycle !== 'LIFETIME') throw new ApiError('VALIDATION_ERROR', 'Lifetime access cannot be replaced with a time-limited plan.');
   if (current.status === 'ACTIVE' && current.billingCycle === 'LIFETIME' && current.id === plan) throw new ApiError('DUPLICATE_REQUEST', 'Lifetime access is already active for this plan.');
-  const amount = STORE_PLANS[plan].prices[billingCycle.toLowerCase()];
-  if (!Number.isFinite(amount) || amount < 1) throw new ApiError('SERVICE_UNAVAILABLE', 'This subscription option is not available');
-  return { plan, billingCycle, amount };
+  return { plan, billingCycle, ...(await priceFor(plan, billingCycle)) };
 }
 
 async function usageFor(storeId) {
@@ -50,18 +40,22 @@ async function usageFor(storeId) {
 }
 
 async function subscriptionStatus(store) {
-  const [usage, payments] = await Promise.all([
+  const [usage, payments, pricing] = await Promise.all([
     usageFor(store._id),
     SubscriptionPayment.find({ store: store._id }).sort('-createdAt').limit(20).lean(),
+    readPlanPricing(),
   ]);
   return {
     subscription: planSummary(store),
-    plans: planCatalog(),
+    plans: pricing.plans,
+    pricing: { revision: pricing.revision, currency: pricing.currency, taxMode: pricing.taxMode, gstPercent: pricing.gstPercent },
     usage,
     checkout: { configured: isRazorpayConfigured(), keyId: isRazorpayConfigured() ? process.env.RAZORPAY_KEY_ID : null },
     payments: payments.map((item) => ({
       id: String(item._id), plan: item.plan, billingCycle: item.billingCycle,
       amount: item.amount, currency: item.currency, status: item.status,
+      baseAmount: item.baseAmount ?? item.amount, taxAmount: item.taxAmount || 0,
+      taxMode: item.taxMode || null, gstPercent: item.gstPercent ?? null, pricingRevision: item.pricingRevision ?? null,
       paymentId: item.razorpayPaymentId || null, paidAt: item.paidAt || null, createdAt: item.createdAt,
     })),
   };
@@ -69,11 +63,11 @@ async function subscriptionStatus(store) {
 
 async function createCheckout({ store, user, input }) {
   if (!isRazorpayConfigured()) throw new ApiError('SERVICE_UNAVAILABLE', 'Online subscription payment is not configured. Contact the platform owner.');
-  const purchase = readPurchase(input, store);
+  const purchase = await readPurchase(input, store);
   const recent = new Date(Date.now() - 15 * 60 * 1000);
   let payment = await SubscriptionPayment.findOne({
     store: store._id, user: user._id, plan: purchase.plan, billingCycle: purchase.billingCycle,
-    amount: purchase.amount, status: 'CREATED', razorpayOrderId: { $exists: true }, createdAt: { $gte: recent },
+    amount: purchase.amount, pricingRevision: purchase.pricingRevision, status: 'CREATED', razorpayOrderId: { $exists: true }, createdAt: { $gte: recent },
   }).sort('-createdAt');
 
   if (!payment) {

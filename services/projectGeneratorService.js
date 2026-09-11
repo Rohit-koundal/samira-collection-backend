@@ -18,6 +18,7 @@ const CLIENT_PROJECT_EXCLUDES = new Set([
   'src/pages/admin/MasterConfiguration.jsx',
   'src/pages/admin/MasterConfiguration.test.jsx',
   'src/pages/admin/PlatformStores.jsx',
+  'src/pages/admin/PlatformStores.test.jsx',
   'src/pages/admin/ClientInstallations.jsx',
   'src/pages/seller/Subscription.jsx',
   'src/components/layout/MasterRoute.jsx',
@@ -25,11 +26,19 @@ const CLIENT_PROJECT_EXCLUDES = new Set([
   'backend/controllers/masterController.js',
   'backend/routes/masterRoutes.js',
   'backend/services/projectGeneratorService.js',
+  'backend/services/masterGovernanceService.js',
+  'backend/services/storePortfolioService.js',
+  'backend/services/storeDataExportService.js',
+  'backend/services/subscriptionPricingService.js',
+  'backend/models/MasterConfigurationVersion.js',
+  'backend/models/StorePortfolioOperation.js',
+  'backend/models/SubscriptionPricing.js',
   'backend/controllers/subscriptionController.js',
   'backend/models/SubscriptionPayment.js',
   'backend/services/subscriptionService.js',
   'backend/controllers/clientPlatformController.js',
   'backend/models/ClientInstallation.js',
+  'backend/models/ClientInstallationOperation.js',
   'backend/models/InstallationPayment.js',
   'backend/models/PlatformRelease.js',
   'backend/routes/platformControlRoutes.js',
@@ -37,6 +46,7 @@ const CLIENT_PROJECT_EXCLUDES = new Set([
   'backend/tests/masterOwner.unit.test.js',
   'backend/tests/applicationWorkflows.integration.test.js',
   'backend/tests/subscription.integration.test.js',
+  'backend/tests/storePortfolio.integration.test.js',
   'backend/tests/clientPlatform.unit.test.js',
   'backend/tests/clientPlatform.integration.test.js',
   'backend/tests/websiteCustomization.test.js',
@@ -245,6 +255,8 @@ function transformEntry(entry, project, structure) {
       .replace(/^const \{ masterOnly \} = .*\r?\nrouter\.use\(masterOnly\);\r?\n/m, '')
       .replace(/const \{ readConfiguration \} = require\('\.\.\/services\/masterConfigurationService'\);[\s\S]*?next\(\);\n\}\);\n/, '')
       .replace("router.post('/themes/:id/publish', unlocked, customization.publishTheme);", "router.post('/themes/:id/publish', customization.publishTheme);")
+      .replace("router.post('/themes/:id/schedule', unlocked, customization.scheduleTheme);", "router.post('/themes/:id/schedule', customization.scheduleTheme);")
+      .replace("router.delete('/themes/:id/schedule', unlocked, customization.cancelThemeSchedule);", "router.delete('/themes/:id/schedule', customization.cancelThemeSchedule);")
       .replace("router.post('/themes/:id/activate', unlocked, customization.activateTheme);", "router.post('/themes/:id/activate', customization.activateTheme);");
     return { ...entry, data: Buffer.from(content) };
   }
@@ -259,7 +271,8 @@ function transformEntry(entry, project, structure) {
   if (name === 'backend/routes/sellerRoutes.js') {
     const content = entry.data.toString('utf8')
       .replace(/^const subscription = .*\r?\n/m, '')
-      .replace('requireActiveStoreLicenseForWrites, requireProductCapacity, ', '')
+      .replace(/^const \{[^}]+\} = require\('\.\.\/middleware\/storeMiddleware'\);\r?$/m,
+        "const { requireAnyStorePermission, requireStoreFeature, requireStorePermission, stripClientStoreId } = require('../middleware/storeMiddleware');")
       .replace(/^router\.(?:get|post)\('\/subscription.*\r?\n/gm, '')
       .replace(/^router\.use\(requireActiveStoreLicenseForWrites\);\r?\n/m, '')
       .replace(/,\s*requireProductCapacity(?=\s*,)/g, '');
@@ -326,6 +339,7 @@ function environmentExamples(project) {
         `DEFAULT_STORE_NAME=${JSON.stringify(project.companyName)}`,
         `DEFAULT_STORE_SLUG=${project.projectSlug}`,
         `DEFAULT_INDUSTRY=${project.industry}`,
+        'STANDALONE_CLIENT_MODE=true',
         'APP_VERSION=1.0.0',
         '# Managed access values are issued in client-installation.json when this package is generated.',
         'CONTROL_PLANE_URL=',
@@ -337,13 +351,27 @@ function environmentExamples(project) {
         'FRONTEND_URL=http://localhost:3000',
         'JWT_SECRET=replace-with-a-long-random-secret',
         'JWT_REFRESH_SECRET=replace-with-a-different-long-random-secret',
+        'ALLOW_REFRESH_TOKEN_BODY=false',
+        'RETURN_REFRESH_TOKEN_IN_BODY=false',
+        'AUTH_COOKIE_DOMAIN=',
+        'AUTH_COOKIE_SAME_SITE=lax',
+        'AUTH_COOKIE_SECURE=false',
+        'JSON_BODY_LIMIT=1mb',
+        'API_RATE_LIMIT_WINDOW_MS=900000',
+        'API_RATE_LIMIT_MAX=1200',
         'ADMIN_PHONE_NUMBERS=',
         'OTP_MODE=demo',
         'DEMO_OTP=123456',
+        '# Keep false in client packages; only the platform owner may enable hosted owner demo access.',
+        'ALLOW_HOSTED_OWNER_DEMO=false',
         'SMS_PROVIDER=mock',
         'SMS_ACCOUNT_SID=',
         'SMS_AUTH_TOKEN=',
         'SMS_SENDER_ID=',
+        'BREVO_API_KEY=',
+        'BREVO_SENDER_EMAIL=',
+        `BREVO_SENDER_NAME=${JSON.stringify(project.companyName)}`,
+        'REPORT_SCHEDULE_INTERVAL_MS=300000',
         'GEMINI_API_KEY=',
         'RAZORPAY_KEY_ID=',
         'RAZORPAY_KEY_SECRET=',
@@ -501,7 +529,7 @@ async function previewProject(input, structure) {
     industryName: project.industryName,
     sourceFiles: packagedFiles,
     approximateSourceBytes: counters.bytes,
-    includes: ['Frontend application', 'Backend API', 'Industry product schema', 'Responsive storefront and admin', 'Installable phone app with safe offline shell', 'Bag, wishlist, checkout, orders, returns, tracking and notifications', 'Signed subscription and update connector', 'Production security headers and server-side validation', ...(project.includeAiWorker ? ['AI video worker source'] : [])],
+    includes: ['Frontend application', 'Backend API', 'Industry product schema', 'Responsive storefront and admin', 'Installable phone app with safe offline shell', 'Bag, wishlist, checkout, orders, returns, tracking and notifications', 'Reports and Insights Center with protected exports', 'Signed subscription and update connector', 'Production security headers and server-side validation', ...(project.includeAiWorker ? ['AI video worker source'] : [])],
     excludes: ['Master Configuration, Store Portfolio and Client Control', 'Existing products and orders', 'Database records', 'Existing environment secrets', 'Uploaded media', 'Git history', 'Dependencies and build output'],
   };
 }
@@ -530,6 +558,7 @@ async function generateProject(input, structure, options = {}) {
       cartWishlistCheckout: true,
       ordersReturnsTracking: true,
       customerNotifications: true,
+      reportsAndInsights: true,
       sellerAndAdminMobileViews: true,
       backendTrustValidation: true,
       signedPlatformEntitlements: true,

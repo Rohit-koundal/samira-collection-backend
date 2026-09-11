@@ -13,7 +13,7 @@ const SECTION_DEFAULTS = [
   { id: 'reviews', label: 'Customer Reviews', visible: true, order: 90, heading: 'Loved by Our Customers', description: 'Real stories from the Samira community.', buttonText: '', buttonLink: '', image: '', backgroundImage: '' },
   { id: 'newsletter', label: 'Newsletter', visible: true, order: 100, heading: 'Join Samira Circle', description: 'Get early access to new drops, offers, and styling updates.', buttonText: 'Subscribe', buttonLink: '', image: '', backgroundImage: '' },
   { id: 'instagram', label: 'Instagram / Social', visible: true, order: 110, heading: 'Style Inspiration', description: 'Discover more from our latest collection.', buttonText: 'Explore', buttonLink: '/products', image: '', backgroundImage: '' },
-];
+].map((section) => ({ ...section, mobileImage: '', imageAlt: '', imagePosition: 'center' }));
 
 const DEFAULT_WEBSITE_CONFIG = {
   schemaVersion: 2,
@@ -42,6 +42,18 @@ const DEFAULT_WEBSITE_CONFIG = {
     announcementText: 'Free Shipping Above ₹999',
     announcementBackground: '#830b31',
     announcementTextColor: '#ffffff',
+    announcementLink: '',
+    announcementStartsAt: '',
+    announcementEndsAt: '',
+    menuItems: [
+      { label: 'Home', path: '/' },
+      { label: 'Shop All', path: '/products' },
+      { label: 'New Arrivals', path: '/products?newArrival=true&collection=new-arrivals' },
+      { label: 'Best Sellers', path: '/products?bestSeller=true&collection=best-sellers' },
+      { label: 'Featured', path: '/products?featured=true&collection=featured' },
+      { label: 'Offers', path: '/products?discount=20' },
+      { label: 'Contact Us', path: '/contact' },
+    ],
   },
   homepage: {
     sections: SECTION_DEFAULTS,
@@ -55,6 +67,7 @@ const DEFAULT_WEBSITE_CONFIG = {
       ethnicSets: [],
       accessories: [],
     },
+    blocks: [],
   },
   typography: {
     headingFont: 'Playfair Display',
@@ -133,6 +146,7 @@ const DEFAULT_WEBSITE_CONFIG = {
     headerBackground: '#ffffff', headerText: '#334155',
     pageBackground: '#fcfaf7', gridGap: 12, cardRadius: 14, imageRatio: 'original',
     columns: 2, useDesktopCatalog: false,
+    showTitle: true, showPrice: true, showDiscount: true, showRating: true, showWishlist: true, showAddToCart: true,
     sections: ['hero', 'services', 'categories', 'sale', 'promotional', 'trending', 'newArrivals', 'ethnicSets', 'accessories']
       .map((id, index) => ({ id, visible: true, order: index * 10, heading: '' })),
   },
@@ -247,6 +261,26 @@ const PRESET_OVERRIDES = {
     productCards: { borderRadius: 10, shadow: 'none', layout: 'compact', imageRatio: '4/5' },
     theme: { preset: 'graphite' },
   },
+  mobileTech: {
+    colors: { primary: '#1557d0', secondary: '#edf4ff', accent: '#16a3a6', background: '#f7f9fc' },
+    typography: { headingFont: 'Inter', headingWeight: 700 }, buttons: { borderRadius: 10, hoverEffect: 'lift' },
+    productCards: { borderRadius: 14, shadow: 'soft', layout: 'compact', imageRatio: '1/1' }, theme: { preset: 'mobileTech' },
+  },
+  jewelleryLuxe: {
+    colors: { primary: '#49351f', secondary: '#f8f0df', accent: '#c49646', background: '#fffdf7' },
+    typography: { headingFont: 'Playfair Display', headingWeight: 600 }, buttons: { borderRadius: 999, hoverEffect: 'glow' },
+    productCards: { borderRadius: 18, shadow: 'elevated', layout: 'minimal', imageRatio: '1/1' }, theme: { preset: 'jewelleryLuxe' },
+  },
+  beautyGlow: {
+    colors: { primary: '#8a3d68', secondary: '#faedf5', accent: '#ca8b73', background: '#fffafd' },
+    typography: { headingFont: 'Georgia', headingWeight: 400 }, buttons: { borderRadius: 24, hoverEffect: 'lift' },
+    productCards: { borderRadius: 22, shadow: 'soft', layout: 'classic', imageRatio: '1/1' }, theme: { preset: 'beautyGlow' },
+  },
+  homeWarm: {
+    colors: { primary: '#4f5a43', secondary: '#eef0e8', accent: '#a7724d', background: '#fbfaf6' },
+    typography: { headingFont: 'Georgia', headingWeight: 400 }, buttons: { borderRadius: 8, hoverEffect: 'darken' },
+    productCards: { borderRadius: 12, shadow: 'none', layout: 'minimal', imageRatio: '1/1' }, theme: { preset: 'homeWarm' },
+  },
 };
 
 const PRESET_LABELS = {
@@ -265,6 +299,10 @@ const PRESET_LABELS = {
   lilac: 'Lilac Bloom',
   coastal: 'Coastal Linen',
   graphite: 'Modern Graphite',
+  mobileTech: 'Mobile Tech Pro',
+  jewelleryLuxe: 'Jewellery Luxe',
+  beautyGlow: 'Beauty Glow',
+  homeWarm: 'Warm Home',
 };
 
 function clone(value) {
@@ -293,9 +331,49 @@ function normalizeSections(sections) {
     section.order = Math.max(0, Math.min(1000, Number(section.order ?? (index + 1) * 10)));
     section.buttonLink = safeInternalPath(section.buttonLink);
     section.image = safeImageUrl(section.image);
+    section.mobileImage = safeImageUrl(section.mobileImage);
+    section.imageAlt = cleanText(section.imageAlt, 180);
+    section.imagePosition = oneOf(section.imagePosition, ['top', 'center', 'bottom'], 'center');
     section.backgroundImage = safeImageUrl(section.backgroundImage);
     return section;
   }).sort((a, b) => a.order - b.order);
+}
+
+const BLOCK_TYPES = ['hero', 'image-text', 'offer', 'trust', 'faq', 'video', 'product-grid', 'category-grid', 'category-carousel', 'reviews', 'newsletter', 'social', 'countdown', 'coupon'];
+function normalizeBlocks(blocks) {
+  const used = new Set();
+  return (Array.isArray(blocks) ? blocks : []).slice(0, 24).map((input, index) => {
+    const source = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
+    let id = cleanText(source.id, 80).replace(/[^a-zA-Z0-9_-]/g, '') || `block-${index + 1}`;
+    while (used.has(id)) id = `${id}-${index + 1}`;
+    used.add(id);
+    return {
+      id,
+      type: oneOf(source.type, BLOCK_TYPES, 'image-text'),
+      visible: source.visible !== false,
+      showOnDesktop: source.showOnDesktop !== false,
+      showOnMobile: source.showOnMobile !== false,
+      order: bounded(source.order, 0, 2000, 120 + index * 10),
+      eyebrow: cleanText(source.eyebrow, 80),
+      title: cleanText(source.title, 140),
+      body: cleanText(source.body, 1200),
+      buttonText: cleanText(source.buttonText, 80),
+      buttonLink: safeInternalPath(source.buttonLink),
+      image: safeImageUrl(source.image),
+      mobileImage: safeImageUrl(source.mobileImage),
+      altText: cleanText(source.altText, 180),
+      videoUrl: safeMediaUrl(source.videoUrl),
+      couponCode: cleanText(source.couponCode, 40).toUpperCase().replace(/[^A-Z0-9_-]/g, ''),
+      endsAt: safeDate(source.endsAt),
+      alignment: oneOf(source.alignment, ['left', 'center', 'right'], 'left'),
+      imagePosition: oneOf(source.imagePosition, ['top', 'center', 'bottom'], 'center'),
+      backgroundColor: validOptionalColor(source.backgroundColor),
+      textColor: validOptionalColor(source.textColor),
+      productIds: normalizeIds(source.productIds).slice(0, 12),
+      categoryIds: normalizeIds(source.categoryIds).slice(0, 8),
+      items: (Array.isArray(source.items) ? source.items : []).slice(0, 8).map((item) => cleanText(item, 160)).filter(Boolean),
+    };
+  }).sort((left, right) => left.order - right.order);
 }
 
 function validColor(value, fallback) {
@@ -320,6 +398,10 @@ function normalizeWebsiteConfig(input = {}) {
   config.branding.tagline = cleanText(config.branding.tagline, 240);
   config.branding.logo = safeImageUrl(config.branding.logo);
   config.branding.favicon = safeImageUrl(config.branding.favicon);
+  config.header.announcementLink = safeInternalPath(config.header.announcementLink);
+  config.header.announcementStartsAt = safeDate(config.header.announcementStartsAt);
+  config.header.announcementEndsAt = safeDate(config.header.announcementEndsAt);
+  config.header.menuItems = normalizeMenu(config.header.menuItems).slice(0, 8);
   config.footer.logo = safeImageUrl(config.footer.logo);
   config.homepage.sections = normalizeSections(input?.homepage?.sections || config.homepage.sections);
   config.homepage.featuredCategoryIds = normalizeIds(config.homepage.featuredCategoryIds);
@@ -330,6 +412,7 @@ function normalizeWebsiteConfig(input = {}) {
     .slice(0, 50)
     .map((item) => ({ categoryId: cleanText(item?.categoryId, 100), image: safeImageUrl(item?.image) }))
     .filter((item) => item.categoryId && item.image);
+  config.homepage.blocks = normalizeBlocks(input?.homepage?.blocks || config.homepage.blocks);
   Object.keys(config.footer.socialLinks).forEach((key) => { config.footer.socialLinks[key] = safeExternalUrl(config.footer.socialLinks[key]); });
   Object.keys(config.footer.menus).forEach((key) => { config.footer.menus[key] = normalizeMenu(config.footer.menus[key]); });
 
@@ -375,6 +458,9 @@ function normalizeWebsiteConfig(input = {}) {
   config.mobile.gridGap = bounded(config.mobile.gridGap, 8, 24, 12);
   config.mobile.cardRadius = bounded(config.mobile.cardRadius, 0, 24, 14);
   config.mobile.imageRatio = oneOf(config.mobile.imageRatio, ['original', '1/1', '4/5', '3/4'], 'original');
+  for (const key of ['showTitle', 'showPrice', 'showDiscount', 'showRating', 'showWishlist', 'showAddToCart']) {
+    config.mobile[key] = typeof config.mobile[key] === 'boolean' ? config.mobile[key] : true;
+  }
   config.tablet.columns = Math.round(bounded(config.tablet.columns, 2, 4, 3));
   config.tablet.gridGap = bounded(config.tablet.gridGap, 8, 32, 16);
   config.layout.productsPerRow.desktop = Math.round(config.layout.productsPerRow.desktop);
@@ -398,6 +484,25 @@ function safeImageUrl(value) {
 function safeExternalUrl(value) {
   const url = cleanText(value, 2000);
   return !url || /^https:\/\//i.test(url) ? url : '';
+}
+
+function safeMediaUrl(value) {
+  const url = cleanText(value, 2000);
+  if (!url) return '';
+  if (!/^(https?:\/\/|\/(?!\/))[^\\\s]*$/i.test(url)) return '';
+  return /\.(mp4|webm)(?:[?#].*)?$/i.test(url) ? url : '';
+}
+
+function safeDate(value) {
+  const text = cleanText(value, 40);
+  if (!text) return '';
+  const timestamp = new Date(text).getTime();
+  return Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : '';
+}
+
+function validOptionalColor(value) {
+  const color = cleanText(value, 20);
+  return !color || /^#[0-9a-f]{6}$/i.test(color) ? color.toLowerCase() : '';
 }
 
 function safeInternalPath(value) {
@@ -444,6 +549,10 @@ function getPresetList({ appearanceOnly = false } = {}) {
     lilac: 'Airy lavender, modern type and soft corners.',
     coastal: 'Linen whites, muted teal and fine outlines.',
     graphite: 'Crisp monochrome and compact contemporary cards.',
+    mobileTech: 'Clean blue commerce styling for phones and electronics.',
+    jewelleryLuxe: 'Warm gold and editorial styling for jewellery catalogues.',
+    beautyGlow: 'Soft rose presentation for beauty and cosmetics stores.',
+    homeWarm: 'Natural neutrals for home, decor and lifestyle products.',
   };
   const collections = {
     default: 'Signature', premium: 'Signature', indigo: 'Signature',
@@ -457,6 +566,10 @@ function getPresetList({ appearanceOnly = false } = {}) {
     lilac: 'Nature',
     coastal: 'Nature',
     graphite: 'Minimal',
+    mobileTech: 'Industry', jewelleryLuxe: 'Industry', beautyGlow: 'Industry', homeWarm: 'Industry',
+  };
+  const industries = {
+    mobileTech: ['mobile', 'electronics'], jewelleryLuxe: ['jewellery'], beautyGlow: ['cosmetics'], homeWarm: ['home'],
   };
   return Object.keys(PRESET_OVERRIDES).map((id) => {
     const config = buildPresetConfig(id);
@@ -468,12 +581,13 @@ function getPresetList({ appearanceOnly = false } = {}) {
       header: Object.fromEntries(['background', 'textColor', 'announcementBackground', 'announcementTextColor'].map((key) => [key, config.header[key]])),
       footer: { background: config.footer.background, textColor: config.footer.textColor },
     } : config;
-    return { id, name: PRESET_LABELS[id], description: descriptions[id], collection: collections[id],
+    return { id, name: PRESET_LABELS[id], description: descriptions[id], collection: collections[id], recommendedFor: industries[id] || ['all'],
       swatches: { primary: config.colors.primary, secondary: config.colors.secondary, accent: config.colors.accent, background: config.colors.background }, config: appearance };
   });
 }
 
 module.exports = {
+  BLOCK_TYPES,
   DEFAULT_WEBSITE_CONFIG,
   SECTION_DEFAULTS,
   buildPresetConfig,

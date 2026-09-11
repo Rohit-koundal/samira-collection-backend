@@ -14,6 +14,11 @@ const INVENTORY_TRANSACTION_TYPES = [
   'MANUAL_ADJUSTMENT',
   'RESTOCK',
   'IMPORT',
+  'DAMAGE',
+  'SHRINKAGE',
+  'SAMPLE',
+  'PURCHASE_RECEIPT',
+  'REVERSAL',
 ];
 
 const inventoryTransactionSchema = new mongoose.Schema({
@@ -28,13 +33,27 @@ const inventoryTransactionSchema = new mongoose.Schema({
   quantity: { type: Number, required: true },
   stockBefore: Number,
   stockAfter: Number,
-  reason: String,
+  mode: { type: String, enum: ['SET', 'ADD', 'REMOVE', 'SYSTEM'], default: 'SYSTEM' },
+  bucket: { type: String, enum: ['SELLABLE', 'DAMAGED', 'QUARANTINE'], default: 'SELLABLE' },
+  reasonCode: { type: String, trim: true, maxlength: 50, default: '' },
+  reason: { type: String, trim: true, maxlength: 200, default: '' },
+  note: { type: String, trim: true, maxlength: 500, default: '' },
+  reference: { type: String, trim: true, maxlength: 120, default: '' },
+  idempotencyKey: { type: String, trim: true, maxlength: 120 },
+  reversalOf: { type: mongoose.Schema.Types.ObjectId, ref: 'InventoryTransaction' },
+  reversedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'InventoryTransaction' },
+  purchaseOrder: { type: mongoose.Schema.Types.ObjectId, ref: 'InventoryPurchaseOrder' },
+  unitCost: { type: Number, min: 0 },
   createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
 }, { timestamps: true });
 
-inventoryTransactionSchema.index({ product: 1, createdAt: -1 });
+inventoryTransactionSchema.index({ storeId: 1, product: 1, createdAt: -1 });
 inventoryTransactionSchema.index({ order: 1, type: 1 });
 inventoryTransactionSchema.index({ storeId: 1, createdAt: -1 });
+inventoryTransactionSchema.index(
+  { storeId: 1, idempotencyKey: 1 },
+  { unique: true, partialFilterExpression: { idempotencyKey: { $type: 'string' } } },
+);
 
 module.exports = mongoose.model('InventoryTransaction', inventoryTransactionSchema);
 module.exports.INVENTORY_TRANSACTION_TYPES = INVENTORY_TRANSACTION_TYPES;

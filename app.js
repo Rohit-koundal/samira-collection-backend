@@ -1,6 +1,7 @@
 const path = require('path');
 const express = require('express');
 const cors = require('cors');
+const rateLimit = require('express-rate-limit');
 const mongoose = require('mongoose');
 const { notFound, errorHandler } = require('./middleware/errorMiddleware');
 const { optionalProtect, protect } = require('./middleware/authMiddleware');
@@ -38,9 +39,11 @@ app.get('/api/social/webhook', socialInbox.verifyWebhook);
 app.post('/api/social/webhook', express.raw({ type: '*/*', limit: '1mb' }), socialOAuth.wrap(socialInbox.webhook));
 app.get('/api/social/oauth/start', socialOAuth.wrap(socialOAuth.navigate));
 app.get('/api/social/oauth/callback', socialOAuth.wrap(socialOAuth.callback));
+app.get('/api/social/oauth/instagram/start', socialOAuth.wrap(socialOAuth.navigateInstagram));
+app.get('/api/social/oauth/instagram/callback', socialOAuth.wrap(socialOAuth.callbackInstagram));
 app.post(['/api/social/deauthorize', '/api/social/data-deletion'], express.urlencoded({ extended: false, limit: '16kb' }), socialOAuth.wrap(socialOAuth.deauthorize));
 app.get('/api/social/deletion-status/:code', socialOAuth.wrap(socialOAuth.deletionStatus));
-app.use(express.json({ limit: '30mb' }));
+app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || '1mb' }));
 app.use(require('./middleware/auditMiddleware').auditAdminRequests);
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 app.get('/uploads/:filename', sendImagePlaceholder);
@@ -49,21 +52,47 @@ app.get('/placeholder.jpg', sendImagePlaceholder);
 app.get('/', (req, res) => res.json({ message: 'Samira Collection API is running' }));
 app.get('/health', async (req, res) => {
   const dbStates = ['disconnected', 'connected', 'connecting', 'disconnecting'];
+  const database = dbStates[mongoose.connection.readyState] || 'unknown';
   const imageStorage = isR2Configured() ? 'r2' : isCloudinaryConfigured() ? 'cloudinary' : 'local';
   const persistentImageStorageConfigured = imageStorage !== 'local';
   const redis = await redisHealthStatus();
   const release = String(process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || '').trim().slice(0, 12) || null;
-  res.json({
-    status: process.env.NODE_ENV === 'production' && !persistentImageStorageConfigured ? 'degraded' : 'ok',
+  const databaseRequired = process.env.NODE_ENV === 'production' || process.env.REQUIRE_DATABASE === 'true';
+  const mediaStorageRequired = process.env.REQUIRE_MEDIA_STORAGE === 'true';
+  const redisRequired = process.env.REQUIRE_REDIS === 'true';
+  const tenantIndexesReady = app.locals.tenantIndexesReady !== false;
+  const ready = (!databaseRequired || database === 'connected')
+    && (!mediaStorageRequired || persistentImageStorageConfigured)
+    && (!redisRequired || redis === 'connected')
+    && tenantIndexesReady;
+  res.status(ready ? 200 : 503).json({
+    status: ready ? 'ok' : 'degraded',
+    ready,
     release,
-    database: dbStates[mongoose.connection.readyState] || 'unknown',
+    database,
     environment: process.env.NODE_ENV || 'development',
     imageStorage,
     persistentImageStorageConfigured,
     redis,
-    allowedOrigins: getAllowedOrigins(),
+    checks: {
+      database: { required: databaseRequired, ready: database === 'connected' },
+      mediaStorage: { required: mediaStorageRequired, ready: persistentImageStorageConfigured },
+      redis: { required: redisRequired, ready: redis === 'connected' },
+      tenantIndexes: { required: databaseRequired, ready: tenantIndexesReady },
+    },
+    ...(process.env.NODE_ENV === 'production' ? {} : { allowedOrigins: getAllowedOrigins() }),
   });
 });
+
+const apiLimiter = rateLimit({
+  windowMs: Math.max(60000, Number(process.env.API_RATE_LIMIT_WINDOW_MS || 15 * 60 * 1000)),
+  limit: Math.max(100, Number(process.env.API_RATE_LIMIT_MAX || 1200)),
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  skip: () => process.env.NODE_ENV === 'test',
+  message: { success: false, code: 'RATE_LIMITED', message: 'Too many requests. Please wait a moment and try again.' },
+});
+app.use('/api', apiLimiter);
 
 app.use('/api/platform', require('./routes/platformControlRoutes'));
 app.use('/api', optionalProtect);
@@ -81,9 +110,10 @@ app.use('/api/admin/products', protect, adminOnly, require('./routes/adminProduc
 app.use('/api/admin/categories', protect, adminOnly, require('./routes/categoryRoutes'));
 app.use('/api/admin/orders', protect, adminOnly, require('./routes/orderRoutes'));
 app.use('/api/admin/coupons', protect, adminOnly, optionalResolveStore, requireAdminCustomerStoreAccess, require('./routes/couponRoutes'));
-app.use('/api/admin/banners', protect, adminOnly, require('./routes/bannerRoutes'));
-app.use('/api/admin/reviews', protect, adminOnly, require('./routes/reviewRoutes'));
-app.use('/api/admin/returns', protect, adminOnly, require('./routes/returnRoutes'));
+app.use('/api/admin/banners', protect, adminOnly, optionalResolveStore, requireAdminCustomerStoreAccess, require('./routes/bannerRoutes'));
+app.use('/api/admin/campaigns', protect, adminOnly, optionalResolveStore, requireAdminCustomerStoreAccess, require('./routes/campaignRoutes'));
+app.use('/api/admin/reviews', protect, adminOnly, optionalResolveStore, requireAdminCustomerStoreAccess, require('./routes/reviewRoutes'));
+app.use('/api/admin/returns', protect, adminOnly, optionalResolveStore, requireAdminCustomerStoreAccess, require('./routes/returnRoutes'));
 app.use('/api/admin/settings', protect, adminOnly, optionalResolveStore, require('./routes/settingsRoutes'));
 app.use('/api/admin/business', protect, adminOnly, optionalResolveStore, requireAdminCustomerStoreAccess, require('./routes/businessRoutes'));
 app.use('/api/admin/store-content', protect, adminOnly, require('./routes/storeContentRoutes'));

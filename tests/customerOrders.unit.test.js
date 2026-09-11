@@ -1,6 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { returnEligibility, returnOrderStatus } = require('../services/returnEligibilityService');
+const { refundEstimate } = require('../services/returnWorkflowService');
 const Order = require('../models/Order');
 const Settings = require('../models/Settings');
 const ReturnExchange = require('../models/ReturnExchange');
@@ -14,7 +15,7 @@ const orderId = '0123456789abcdef11111111';
 const userId = '0123456789abcdef22222222';
 const first = { _id: '0123456789abcdef33333333', product: productId, name: 'Saree', size: 'M', color: 'Red', quantity: 2 };
 const second = { ...first, _id: '0123456789abcdef44444444', size: 'L', quantity: 1 };
-const delivered = () => ({ _id: orderId, user: userId, orderStatus: 'Delivered', deliveredAt: new Date(), orderItems: [first, second], statusTimeline: [], save: async () => {} });
+const delivered = () => ({ _id: orderId, user: userId, orderStatus: 'Delivered', deliveredAt: new Date(), orderItems: [first, second], shippingAddress: { fullName: 'Asha Sharma', mobile: '9812345678', houseNo: '12', area: 'Market Road', city: 'Delhi', state: 'Delhi', pincode: '110001' }, statusTimeline: [], save: async () => {} });
 const response = () => ({ statusCode: 200, status(code) { this.statusCode = code; return this; }, json(body) { this.body = body; return this; } });
 const invoke = async (handler, req) => { const res = response(); let error; await handler(req, res, (err) => { error = err; }); return { res, error }; };
 
@@ -40,11 +41,24 @@ test('uses the actual delivery date and store window', () => {
   const order = { ...delivered(), deliveredAt: '2026-09-01T00:00:00Z' };
   assert.equal(returnEligibility(order, [], 7, Date.parse('2026-09-09')).items[0].canRequest, false);
   assert.equal(returnEligibility(order, [], 14, Date.parse('2026-09-09')).items[0].canRequest, true);
+  const unlimited = returnEligibility(order, [], { returnsEnabled: true, returnWindowDays: null }, Date.parse('2030-09-09'));
+  assert.equal(unlimited.items[0].canRequest, true); assert.equal(unlimited.items[0].deadline, null);
+  assert.equal(returnEligibility(order, [], { returnsEnabled: false, returnWindowDays: null }).items[0].canRequest, false);
 });
 test('does not allow undelivered cancelled or refunded orders to start a return', () => {
   for (const orderStatus of ['Pending', 'Shipped', 'Cancelled', 'Refunded']) {
     assert.equal(returnEligibility({ ...delivered(), deliveredAt: null, orderStatus }, [], 7).items[0].canRequest, false);
   }
+});
+test('refund estimates allocate discounts and apply purchase-time return charges only where eligible', () => {
+  const order = { orderItems: [{ ...first, price: 1000 }, { ...second, price: 500 }], couponDiscount: 300, prepaidDiscount: 150, deliveryCharge: 100, platformFee: 20, codCharge: 10 };
+  const settings = { refundDeliveryChargeOnFullReturn: true, refundPlatformFeeOnFullReturn: true, refundCodChargeOnFullReturn: true, customerReturnShippingCharge: 50, customerRestockingFeePercent: 10 };
+  const partial = refundEstimate(order, order.orderItems[1], 1, settings, { priorRequests: [{ type: 'exchange', quantity: 2, status: 'Exchanged' }] });
+  assert.equal(partial.estimatedRefundAmount, 319); assert.equal(partial.refundableDeliveryCharge, 0);
+  const full = refundEstimate(order, order.orderItems[1], 1, settings, { priorRequests: [{ type: 'return', quantity: 2, status: 'Refunded' }] });
+  assert.equal(full.estimatedRefundAmount, 449); assert.equal(full.refundableDeliveryCharge, 100); assert.equal(full.restockingFee, 41);
+  const sellerFault = refundEstimate(order, order.orderItems[1], 1, settings, { sellerFault: true });
+  assert.equal(sellerFault.returnShippingCharge, 0); assert.equal(sellerFault.restockingFee, 0);
 });
 test('eligibility endpoint scopes both order and requests to the signed-in customer', async (t) => {
   t.mock.method(Order, 'findOne', async (filter) => { assert.equal(filter.user, userId); return delivered(); });
@@ -150,16 +164,19 @@ test('default-store legacy invoices can use global settings without using anothe
   assert.equal(error, undefined); assert.equal(res.body.storeDetails.storeName, 'Original global store');
 });
 
-test('new orders snapshot only invoice seller fields and keep original prices and SKUs', () => {
+test('new orders snapshot seller identity, product facts and purchase-time return policy', () => {
   const { buildPersistedOrderFields } = require('../services/orderSnapshotService');
-  const snapshot = buildPersistedOrderFields({ userId, draft: { settings: { storeName: 'Seller', gstin: 'GST', contactPhone: '9000000000', unrelatedSecret: 'excluded' }, items: [{ product: productId, name: 'Saree', sku: 'SKU-123', quantity: 2, price: 899, originalPrice: 1899 }], totals: { finalAmount: 1798 } }, shippingAddress: { fullName: 'Customer' } });
+  const snapshot = buildPersistedOrderFields({ userId, draft: { settings: { storeName: 'Seller', gstin: 'GST', contactPhone: '9000000000', unrelatedSecret: 'excluded', returnsEnabled: true, returnWindowDays: null, customerRestockingFeePercent: 5, rtoRefundDeduction: 99 }, items: [{ product: productId, name: 'Saree', sku: 'SKU-123', quantity: 2, price: 899, originalPrice: 1899 }], totals: { finalAmount: 1798 } }, shippingAddress: { fullName: 'Customer' } });
   assert.equal(snapshot.invoiceSeller.storeName, 'Seller'); assert.equal(snapshot.invoiceSeller.unrelatedSecret, undefined);
   assert.equal(snapshot.orderItems[0].sku, 'SKU-123'); assert.equal(snapshot.orderItems[0].originalPrice, 1899);
+  assert.equal(snapshot.returnPolicySnapshot.returnWindowDays, null); assert.equal(snapshot.returnPolicySnapshot.customerRestockingFeePercent, 5); assert.equal(snapshot.returnPolicySnapshot.rtoRefundDeduction, 99);
 });
 
 test('closing a refunded request preserves its financial resolution', async (t) => {
   const request = { _id: productId, order: orderId, orderItemId: first._id, quantity: 2, type: 'return', status: 'Refunded', inventoryRestored: true, save: async () => {} };
   const order = { ...delivered(), orderItems: [first] };
+  t.mock.method(ReturnExchange, 'findOneAndUpdate', async () => request);
+  t.mock.method(ReturnExchange, 'updateOne', async () => ({ modifiedCount: 1 }));
   t.mock.method(ReturnExchange, 'findOne', async () => request);
   t.mock.method(ReturnExchange, 'find', async () => [request]);
   t.mock.method(Order, 'findById', async () => order);

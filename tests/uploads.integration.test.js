@@ -81,6 +81,32 @@ test('invalid media and missing files are explained as validation errors without
   assert.equal((await request('/api/admin/uploads', { method: 'POST', token: admin.token, body: {} })).status, 400);
 });
 
+test('review and return evidence photos require customer authentication and valid image bytes', async (t) => {
+  const customer = await createCustomer();
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=', 'base64');
+  const unauthenticated = await upload('/api/reviews/uploads', 'images', png, 'image/png', 'review.png');
+  assert.equal(unauthenticated.status, 401);
+  const spoofed = await upload('/api/reviews/uploads', 'images', Buffer.from('not-an-image'), 'image/png', 'spoofed.png', customer.token);
+  assert.equal(spoofed.status, 400);
+  assert.match(spoofed.data.message, /valid JPG, PNG, or WEBP/i);
+  const valid = await upload('/api/reviews/uploads', 'images', png, 'image/png', 'customer-review.png', customer.token);
+  assert.equal(valid.status, 201, JSON.stringify(valid.data));
+  assert.equal(valid.data.files.length, 1);
+  const stored = path.resolve(__dirname, '..', 'uploads', path.basename(valid.data.files[0].url));
+  t.after(() => fs.unlink(stored).catch(() => null));
+  assert.deepEqual(await fs.readFile(stored), png);
+  const returnUnauthenticated = await upload('/api/returns/uploads', 'images', png, 'image/png', 'return.png');
+  assert.equal(returnUnauthenticated.status, 401);
+  const returnSpoofed = await upload('/api/returns/uploads', 'images', Buffer.from('not-an-image'), 'image/png', 'spoofed-return.png', customer.token);
+  assert.equal(returnSpoofed.status, 400);
+  const returnValid = await upload('/api/returns/uploads', 'images', png, 'image/png', 'customer-return.png', customer.token);
+  assert.equal(returnValid.status, 201, JSON.stringify(returnValid.data));
+  assert.equal(returnValid.data.files.length, 1);
+  const returnStored = path.resolve(__dirname, '..', 'uploads', path.basename(returnValid.data.files[0].url));
+  t.after(() => fs.unlink(returnStored).catch(() => null));
+  assert.deepEqual(await fs.readFile(returnStored), png);
+});
+
 test('bulk-uploaded draft photos remain available through editing and publication with local storage', async (t) => {
   const admin = await createAdmin();
   const marker = `qa-bulk-${crypto.randomUUID()}`;

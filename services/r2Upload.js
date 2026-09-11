@@ -15,6 +15,8 @@ const allowedFolders = new Set([
   'reel-imports/normalized',
   'reel-imports/frames',
   'reel-imports/candidates',
+  'reviews',
+  'returns',
 ]);
 
 function isR2Configured() {

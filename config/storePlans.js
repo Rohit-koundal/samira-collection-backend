@@ -109,6 +109,7 @@ function planSummary(store, now = new Date()) {
     trialDays: TRIAL_DAYS,
     daysRemaining: endsAt && status !== 'EXPIRED' ? Math.max(0, Math.ceil((endsAt.getTime() - now.getTime()) / DAY_MS)) : null,
     renewalMessage: String(store?.license?.renewalMessage || '').trim(),
+    featureOverrides: [...overrides],
     features: [...new Set([...base.features, ...overrides])].filter((feature) => !disabled.has(feature)),
     disabledFeatures: [...disabled],
     limits: resolvedLimits(store, base),

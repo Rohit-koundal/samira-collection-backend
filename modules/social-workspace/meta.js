@@ -1,10 +1,14 @@
 const crypto = require('crypto');
-const SCOPES = ['pages_show_list', 'pages_read_engagement', 'pages_manage_metadata', 'pages_messaging', 'pages_manage_posts', 'instagram_basic', 'instagram_manage_messages', 'instagram_content_publish'];
+const SCOPES = ['pages_show_list', 'pages_read_engagement', 'pages_manage_metadata', 'pages_messaging', 'pages_manage_posts', 'instagram_basic', 'instagram_manage_messages', 'instagram_manage_comments', 'instagram_content_publish'];
+const INSTAGRAM_SCOPES = ['instagram_business_basic', 'instagram_business_manage_messages', 'instagram_business_manage_comments', 'instagram_business_content_publish'];
 function config() {
   return {
     appId: process.env.META_APP_ID || '', secret: process.env.META_APP_SECRET || '',
     version: /^v\d+\.0$/.test(process.env.META_GRAPH_VERSION || '') ? process.env.META_GRAPH_VERSION : 'v23.0',
     callback: process.env.META_REDIRECT_URI || '', verifyToken: process.env.META_WEBHOOK_VERIFY_TOKEN || '',
+    instagramAppId: process.env.INSTAGRAM_BUSINESS_APP_ID || '',
+    instagramSecret: process.env.INSTAGRAM_BUSINESS_APP_SECRET || '',
+    instagramCallback: process.env.INSTAGRAM_BUSINESS_REDIRECT_URI || '',
     frontend: String(process.env.FRONTEND_URL || 'http://localhost:3000').replace(/\/$/, ''),
   };
 }
@@ -12,13 +16,14 @@ function fail(message, status = 400, code = 'SOCIAL_ERROR') { return Object.assi
 function hash(value) { return crypto.createHash('sha256').update(String(value)).digest('hex'); }
 function equal(a, b) { const left = Buffer.from(String(a || '')), right = Buffer.from(String(b || '')); return left.length === right.length && crypto.timingSafeEqual(left, right); }
 function verifySignature(body, signature) {
-  return Boolean(config().secret && Buffer.isBuffer(body) && equal(signature, 'sha256=' + crypto.createHmac('sha256', config().secret).update(body).digest('hex')));
+  if (!Buffer.isBuffer(body)) return false;
+  return [config().secret, config().instagramSecret].filter(Boolean).some(secret => equal(signature, 'sha256=' + crypto.createHmac('sha256', secret).update(body).digest('hex')));
 }
 function signedRequest(value) {
   const [signature, payload, extra] = String(value || '').split('.');
-  if (!signature || !payload || extra || !config().secret) throw fail('Invalid signed request.', 403);
-  const expected = crypto.createHmac('sha256', config().secret).update(payload).digest('base64url');
-  if (!equal(signature, expected)) throw fail('Invalid signed request.', 403);
+  const secrets = [config().secret, config().instagramSecret].filter(Boolean);
+  if (!signature || !payload || extra || !secrets.length) throw fail('Invalid signed request.', 403);
+  if (!secrets.some(secret => equal(signature, crypto.createHmac('sha256', secret).update(payload).digest('base64url')))) throw fail('Invalid signed request.', 403);
   const data = JSON.parse(Buffer.from(payload, 'base64url').toString());
   if (data.algorithm !== 'HMAC-SHA256' || !data.user_id) throw fail('Invalid signed request.', 403);
   return data;
@@ -34,12 +39,14 @@ function apiError(response, data, write) {
 }
 async function request(path, { token, method = 'GET', params = {}, host = 'graph.facebook.com' } = {}) {
   // Callers supply IDs/edges only. Never follow provider paging URLs containing tokens.
-  if (!/^[a-zA-Z0-9_./-]+$/.test(path) || path.includes('..') || !['graph.facebook.com', 'rupload.facebook.com'].includes(host)) throw fail('Invalid Meta request.');
-  const url = new URL(`https://${host}/${host === 'graph.facebook.com' ? config().version + '/' : ''}${path}`);
+  if (!/^[a-zA-Z0-9_./-]+$/.test(path) || path.includes('..') || !['graph.facebook.com', 'graph.instagram.com', 'rupload.facebook.com'].includes(host)) throw fail('Invalid Meta request.');
+  const versioned = ['graph.facebook.com', 'graph.instagram.com'].includes(host);
+  const url = new URL(`https://${host}/${versioned ? config().version + '/' : ''}${path}`);
   const headers = { Accept: 'application/json' };
   if (token) headers.Authorization = `Bearer ${token}`;
   const values = { ...params };
-  if (token && config().secret && host === 'graph.facebook.com') values.appsecret_proof = crypto.createHmac('sha256', config().secret).update(token).digest('hex');
+  const proofSecret = host === 'graph.instagram.com' ? config().instagramSecret : config().secret;
+  if (token && proofSecret && host !== 'rupload.facebook.com') values.appsecret_proof = crypto.createHmac('sha256', proofSecret).update(token).digest('hex');
   const body = new URLSearchParams();
   Object.entries(values).forEach(([key, value]) => { if (value !== undefined && value !== '') body.set(key, typeof value === 'object' ? JSON.stringify(value) : String(value)); });
   if (method === 'GET') url.search = body.toString();
@@ -66,13 +73,18 @@ async function uploadReel(videoId, videoUrl, token) {
 }
 function capabilities(connection) {
   const has = permission => connection.permissions?.includes(permission);
+  const direct = connection.authMethod === 'instagram';
   return {
-    inbox: has(connection.provider === 'instagram' ? 'instagram_manage_messages' : 'pages_messaging'),
-    publish: has(connection.provider === 'instagram' ? 'instagram_content_publish' : 'pages_manage_posts'),
+    inbox: has(connection.provider === 'instagram' ? (direct ? 'instagram_business_manage_messages' : 'instagram_manage_messages') : 'pages_messaging'),
+    publish: has(connection.provider === 'instagram' ? (direct ? 'instagram_business_content_publish' : 'instagram_content_publish') : 'pages_manage_posts'),
+    comments: connection.provider === 'instagram' ? has(direct ? 'instagram_business_manage_comments' : 'instagram_manage_comments') : has('pages_read_engagement'),
   };
 }
 function replyAllowed(thread, now = Date.now()) {
+  // Comment events are useful context, but this module does not pretend that a
+  // Messenger text send is a comment reply. Continue those threads on Meta.
+  if (thread.contextType === 'comment') return false;
   const date = new Date(thread.lastInboundAt || 0).getTime();
   return date > 0 && date <= now && now - date < 24 * 60 * 60 * 1000;
 }
-module.exports = { SCOPES, config, fail, hash, equal, verifySignature, signedRequest, request, uploadReel, capabilities, replyAllowed };
+module.exports = { SCOPES, INSTAGRAM_SCOPES, config, fail, hash, equal, verifySignature, signedRequest, request, uploadReel, capabilities, replyAllowed };

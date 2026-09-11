@@ -13,6 +13,7 @@
  */
 const fs = require('node:fs');
 const path = require('node:path');
+const crypto = require('node:crypto');
 const mongoose = require('mongoose');
 
 // Tests may deliberately override these after importing the harness. Never
@@ -112,6 +113,10 @@ async function resetDatabase() {
 }
 
 async function request(path, { method = 'GET', body, token, headers = {} } = {}) {
+  const checkoutPath = method === 'POST' && (path === '/api/orders' || path === '/api/orders/cod' || path === '/api/payments/create-order');
+  const requestBody = checkoutPath && body && !body.checkoutAttemptId
+    ? { ...body, checkoutAttemptId: `test_${crypto.randomUUID()}` }
+    : body;
   const response = await fetch(`${baseUrl}${path}`, {
     method,
     headers: {
@@ -119,7 +124,7 @@ async function request(path, { method = 'GET', body, token, headers = {} } = {})
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...headers,
     },
-    body: body === undefined ? undefined : JSON.stringify(body),
+    body: requestBody === undefined ? undefined : JSON.stringify(requestBody),
   });
 
   const text = await response.text();

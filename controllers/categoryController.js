@@ -10,6 +10,7 @@ const { asyncHandler } = require('../middleware/validate');
 const { ApiError } = require('../utils/apiError');
 const { logAudit } = require('../services/auditService');
 const { auditSnapshot } = require('../utils/auditData');
+const { isMasterOwner } = require('../config/masterOwner');
 
 const CATEGORY_AUDIT_FIELDS = ['name', 'slug', 'parent', 'level', 'definitionKey', 'description', 'image', 'socialImage', 'metaTitle', 'metaDescription', 'displayOrder', 'isActive', 'isArchived', 'archivedAt'];
 const EDITABLE_FIELDS = ['name', 'slug', 'parent', 'definitionKey', 'description', 'image', 'socialImage', 'metaTitle', 'metaDescription', 'displayOrder', 'isActive'];
@@ -189,6 +190,11 @@ async function updateDescendantLevels(category, req) {
 }
 
 exports.getCategories = asyncHandler(async (req, res) => {
+  const requestedStoreId = String(req.query.storeId || '').trim();
+  if (requestedStoreId && isMasterOwner(req.user)) {
+    if (!mongoose.isValidObjectId(requestedStoreId)) throw new ApiError('VALIDATION_ERROR', 'Choose a valid store');
+    req.tenantFilter = { storeId: requestedStoreId };
+  }
   const privateRequest = isPrivateRequest(req);
   const archiveMode = String(req.query.archive || '').toLowerCase();
   const visibility = privateRequest

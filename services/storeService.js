@@ -172,11 +172,18 @@ async function listMemberships(userId) {
  */
 async function ensureTenantIndexes() {
   const models = [
+    { model: require('../models/CheckoutAttempt'), legacy: [] },
+    { model: require('../models/Order'), legacy: [] },
+    { model: require('../models/ReturnExchange'), legacy: [] },
     { model: require('../models/Category'), legacy: ['slug_1'] },
     { model: require('../models/Product'), legacy: ['slug_1', 'sku_1'] },
     { model: require('../models/VariantGroup'), legacy: ['slug_1'] },
     { model: require('../models/Cart'), legacy: ['user_1', 'sessionId_1'] },
     { model: require('../models/Subscriber'), legacy: ['email_1'] },
+    { model: require('../models/CouponCustomerUsage'), legacy: [] },
+    { model: require('../models/BannerEngagement'), legacy: [] },
+    { model: require('../models/InventoryTransaction'), legacy: [] },
+    { model: require('../models/InventoryPurchaseOrder'), legacy: [] },
   ];
   for (const { model, legacy } of models) {
     let indexes = [];
@@ -186,6 +193,21 @@ async function ensureTenantIndexes() {
       if (error?.code !== 26 && error?.codeName !== 'NamespaceNotFound') throw error;
     }
     const names = new Set(indexes.map((index) => index.name));
+    for (const [keys, options = {}] of model.schema.indexes()) {
+      const expectedName = options.name || Object.entries(keys).map(([key, value]) => `${key}_${value}`).join('_');
+      const current = indexes.find((index) => index.name === expectedName)
+        || indexes.find((index) => JSON.stringify(index.key) === JSON.stringify(keys));
+      if (!current) continue;
+      const optionMismatch = Boolean(current.unique) !== Boolean(options.unique)
+        || Boolean(current.sparse) !== Boolean(options.sparse)
+        || JSON.stringify(current.partialFilterExpression || null) !== JSON.stringify(options.partialFilterExpression || null)
+        || Number(current.expireAfterSeconds ?? -1) !== Number(options.expireAfterSeconds ?? -1);
+      const keyMismatch = JSON.stringify(current.key) !== JSON.stringify(keys);
+      if (keyMismatch || optionMismatch || current.name !== expectedName) {
+        await model.collection.dropIndex(current.name);
+        names.delete(current.name);
+      }
+    }
     for (const name of legacy) {
       if (names.has(name)) await model.collection.dropIndex(name);
     }

@@ -43,6 +43,10 @@ function snapshotOrderItems(items = []) {
       tax: Number(item.tax || 0),
       category: item.category,
       shippingWeightKg: Number(item.shippingWeightKg || 0),
+      returnable: item.returnable !== false,
+      exchangeable: item.exchangeable !== false,
+      returnWindowDays: item.returnWindowDays !== null && item.returnWindowDays !== undefined && Number.isFinite(Number(item.returnWindowDays)) ? Number(item.returnWindowDays) : undefined,
+      returnPolicy: String(item.returnPolicy || '').trim(),
     };
   });
 }
@@ -60,6 +64,17 @@ function buildPersistedOrderFields({ userId, draft, shippingAddress, billingAddr
     invoiceNumber: invoiceNumberForId(id, draft.settings),
     invoiceDate: extra.invoiceDate || new Date(),
     invoiceSeller: Object.fromEntries(['storeName', 'legalBusinessName', 'gstin', 'contactEmail', 'contactPhone', 'whatsappNumber', 'address', 'billingAddress', 'returnPolicy', 'logoUrl', 'invoiceNote'].map((key) => [key, String(draft.settings?.[key] || '').trim()])),
+    returnPolicySnapshot: {
+      capturedAt: new Date(),
+      returnsEnabled: draft.settings?.returnsEnabled !== false,
+      returnWindowDays: draft.settings?.returnWindowDays === null ? null : Math.max(0, Number(draft.settings?.returnWindowDays ?? 7)),
+      refundDeliveryChargeOnFullReturn: draft.settings?.refundDeliveryChargeOnFullReturn === true,
+      refundPlatformFeeOnFullReturn: draft.settings?.refundPlatformFeeOnFullReturn === true,
+      refundCodChargeOnFullReturn: draft.settings?.refundCodChargeOnFullReturn === true,
+      customerReturnShippingCharge: Math.max(0, Number(draft.settings?.customerReturnShippingCharge || 0)),
+      customerRestockingFeePercent: Math.min(100, Math.max(0, Number(draft.settings?.customerRestockingFeePercent || 0))),
+      rtoRefundDeduction: Math.max(0, Number(draft.settings?.rtoRefundDeduction || 0)),
+    },
     paymentMethod: draft.paymentMethod,
     ...draft.totals,
     ...extra,

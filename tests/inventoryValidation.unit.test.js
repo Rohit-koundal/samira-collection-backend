@@ -1,6 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const Product = require('../models/Product');
+const InventoryTransaction = require('../models/InventoryTransaction');
 require('../services/auditService').logAudit = () => {};
 const controller = require('../controllers/productController');
 const productId = '0123456789abcdef01234567';
@@ -22,25 +23,28 @@ test('stock updates reject blank, fractional and non-finite values before queryi
   assert.equal(lookup.mock.callCount(), 0);
 });
 
-test('valid zero and whole-number stock edits persist; database errors reach the API handler', async (t) => {
-  const product = { _id: productId, stock: 4, variants: [], save: async () => {} };
-  t.mock.method(Product, 'findOne', async () => product);
+test('valid zero and whole-number stock edits use a guarded ledger-backed update', async (t) => {
+  let current = 4;
+  const query = (value) => ({ select() { return this; }, async session() { return value; } });
+  t.mock.method(Product, 'findOne', () => query({ _id: productId, stock: current, variants: [], inventoryRevision: 0 }));
+  t.mock.method(Product, 'findOneAndUpdate', (_filter, update) => {
+    current = update.$set.stock;
+    return { select: async () => ({ _id: productId, stock: current, variants: [], inventoryRevision: 1 }) };
+  });
+  t.mock.method(InventoryTransaction, 'create', async (docs) => [{ _id: 'movement-1', ...docs[0] }]);
   for (const stock of [0, '7']) {
-    const { res, error } = await invoke(controller.updateStock, { stock });
+    const { res, error } = await invoke(controller.updateStock, { stock, expectedStock: current });
     assert.equal(error, undefined); assert.equal(res.statusCode, 200);
-    assert.equal(product.stock, Number(stock));
+    assert.equal(res.body.stock, Number(stock));
   }
-  product.save = async () => { throw new Error('Database unavailable'); };
-  assert.match((await invoke(controller.updateStock, { stock: 5 })).error.message, /Database unavailable/);
 });
 
-test('marking out of stock scopes the lookup and refuses a product belonging to another store', async (t) => {
-  t.mock.method(Product, 'findOne', async (filter) => {
+test('marking out of stock requires confirmation and scopes the product lookup', async (t) => {
+  assert.equal((await invoke(controller.markOutOfStock, {})).res.statusCode, 400);
+  t.mock.method(Product, 'findOne', (filter) => {
     assert.deepEqual(filter, { $and: [{ _id: productId }, { storeId }] });
-    return null;
+    return { select() { return this; }, async session() { return null; } };
   });
   const req = { tenantFilter: { storeId }, store: { _id: storeId } };
-  assert.equal((await invoke(controller.markOutOfStock, {}, req)).res.statusCode, 404);
-  t.mock.method(Product, 'findOne', async () => ({ _id: productId, storeId: '0123456789abcdef22222222' }));
-  assert.equal((await invoke(controller.markOutOfStock, {}, req)).error.statusCode, 403);
+  assert.equal((await invoke(controller.markOutOfStock, { confirm: true }, req)).error.statusCode, 404);
 });

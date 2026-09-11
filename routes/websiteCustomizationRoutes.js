@@ -9,6 +9,7 @@ router.get('/themes', customization.listThemes);
 router.post('/themes', customization.createTheme);
 router.get('/themes/:id', customization.getTheme);
 router.put('/themes/:id/draft', customization.updateDraft);
+router.post('/themes/:id/preflight', customization.preflightTheme);
 router.post('/themes/:id/discard', customization.discardDraft);
 router.post('/themes/:id/duplicate', customization.duplicateTheme);
 const { readConfiguration } = require('../services/masterConfigurationService');
@@ -19,6 +20,8 @@ const unlocked = asyncHandler(async (_req, _res, next) => {
   next();
 });
 router.post('/themes/:id/publish', unlocked, customization.publishTheme);
+router.post('/themes/:id/schedule', unlocked, customization.scheduleTheme);
+router.delete('/themes/:id/schedule', unlocked, customization.cancelThemeSchedule);
 router.post('/themes/:id/activate', unlocked, customization.activateTheme);
 router.delete('/themes/:id', customization.deleteTheme);
 router.get('/themes/:id/history', customization.getHistory);

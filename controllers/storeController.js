@@ -12,7 +12,6 @@ const { ApiError, forbidden } = require('../utils/apiError');
 const { optionalEmail, optionalIndianMobile, optionalString, requirePincode, requireString } = require('../utils/validators');
 const {
   ensureDefaultStore,
-  grantSellerMode,
   listMemberships,
   onboardingProgress,
   publicStoreView,
@@ -20,6 +19,7 @@ const {
   uniqueSlug,
 } = require('../services/storeService');
 const { logAudit } = require('../services/auditService');
+const { runInTransaction } = require('../utils/transaction');
 const slugify = require('../utils/slugify');
 const { normalizePhone } = require('../utils/phoneUtils');
 
@@ -57,65 +57,58 @@ exports.createStore = asyncHandler(async (req, res) => {
   const slug = await uniqueSlug(req.body?.slug || name);
   const industry = String(req.body?.industry || 'fashion').trim().toLowerCase();
   const builtinPreset = INDUSTRY_IDS.includes(industry) ? getIndustryPreset(industry) : null;
-  const customPreset = builtinPreset ? null : await IndustryPreset.findOne({ key: industry, isActive: { $ne: false } }).lean();
+  const customPreset = builtinPreset ? null : await IndustryPreset.findOne({ key: industry, isActive: { $ne: false }, archivedAt: null }).lean();
   if (!builtinPreset && !customPreset) throw new ApiError('VALIDATION_ERROR', 'Choose an active business type');
   const industryPreset = builtinPreset || { ...customPreset.structure, industry: customPreset.key, id: customPreset.key, name: customPreset.name };
-  const owner = await resolveStoreOwner(req);
   const licenseStatus = String(req.body?.licenseStatus || 'TRIAL').trim().toUpperCase();
   if (!LICENSE_STATUSES.includes(licenseStatus)) throw new ApiError('VALIDATION_ERROR', 'Choose a valid licence status');
   const startedAt = new Date();
   const suppliedEndsAt = readFutureDate(req.body?.licenseEndsAt, 'licence expiry');
-  const licenseEndsAt = suppliedEndsAt || (licenseStatus === 'TRIAL' ? nextPeriodEnd('TRIAL', startedAt) : null);
-  const store = await Store.create({
-    name,
-    slug,
-    legalName: optionalString(req.body?.legalName, 'legalName', { max: 120 }) || name,
-    logo: optionalString(req.body?.logo, 'logo', { max: 500 }) || undefined,
-    bio: optionalString(req.body?.bio, 'bio', { max: 1000 }) || undefined,
-    instagramHandle: optionalString(req.body?.instagramHandle, 'instagramHandle', { max: 80 }) || undefined,
-    instagramUrl: optionalString(req.body?.instagramUrl, 'instagramUrl', { max: 300 }) || undefined,
-    whatsappNumber: optionalIndianMobile(req.body?.whatsappNumber, 'whatsappNumber') || undefined,
-    supportEmail: optionalEmail(req.body?.supportEmail, 'supportEmail') || undefined,
-    supportPhone: optionalIndianMobile(req.body?.supportPhone, 'supportPhone') || undefined,
-    pickupAddress: readAddress(req.body?.pickupAddress),
-    returnAddress: readAddress(req.body?.returnAddress),
-    paymentReady: Boolean(req.body?.paymentReady),
-    shippingReady: Boolean(req.body?.shippingReady),
-    customDomain: req.body?.customDomain ? parseCustomDomain(req.body.customDomain) : undefined,
-    status: 'ONBOARDING',
-    owner: owner._id,
-    industry,
-    catalogStructure: { ...clone(industryPreset), clientPermissions: { content: true, payments: true } },
-    industryLocked: true,
-    plan: normalizePlan(req.body?.plan, 'PROFESSIONAL'),
-    license: {
-      status: licenseStatus,
-      startsAt: startedAt,
-      billingCycle: licenseStatus === 'TRIAL' ? 'TRIAL' : 'MANUAL',
-      ...(licenseStatus === 'TRIAL' ? { trialEndsAt: licenseEndsAt } : {}),
-      ...(licenseEndsAt ? { endsAt: licenseEndsAt } : {}),
-      renewalMessage: optionalString(req.body?.renewalMessage, 'renewalMessage', { max: 300 }) || '',
-    },
-  });
-  await StoreMember.create({ store: store._id, user: owner._id, role: 'OWNER', status: 'ACTIVE' });
-  if (String(owner._id) !== String(req.user._id)) {
-    await StoreMember.create({ store: store._id, user: req.user._id, role: 'MANAGER', status: 'ACTIVE' });
+  if (licenseStatus === 'ACTIVE' && !suppliedEndsAt) {
+    throw new ApiError('VALIDATION_ERROR', 'Choose a future access expiry when creating an active store');
   }
-  const sellerUsers = [...new Set([String(owner._id), String(req.user._id)])];
-  for (const userId of sellerUsers) await grantSellerMode(userId);
-  await Category.insertMany(industryPreset.defaultCategories.map((categoryName, index) => {
-    const definition = (industryPreset.categoryDefinitions || []).find((item) => item.name.toLowerCase() === String(categoryName).toLowerCase());
-    return {
-      name: categoryName,
-      slug: `${slug}-${slugify(categoryName)}`,
-      description: `Starter ${industryPreset.name.toLowerCase()} category`,
-      displayOrder: index,
-      storeId: store._id,
-      definitionKey: definition?.key || '', parentDefinitionKey: definition?.parentKey || '',
-      attributeOverrides: definition?.attributes || [], variantAttributes: definition?.variantAttributes || [], configuredFilters: definition?.filters || [],
-    };
-  }), { ordered: false }).catch(() => null);
-  logAudit({ req, action: 'STORE_CREATE', entityType: 'Store', entityId: store._id, after: { name, slug, industry, plan: store.plan, owner: owner._id }, storeId: store._id });
+  const licenseEndsAt = suppliedEndsAt || (licenseStatus === 'TRIAL' ? nextPeriodEnd('TRIAL', startedAt) : null);
+  let store; let owner; let createdOwnerId; let usedTransaction = false;
+  try {
+    await runInTransaction(async (session) => {
+      usedTransaction = Boolean(session);
+      const resolved = await resolveStoreOwner(req, session); owner = resolved.user; createdOwnerId = resolved.created ? owner._id : null;
+      [store] = await Store.create([{
+        name, slug,
+        legalName: optionalString(req.body?.legalName, 'legalName', { max: 120 }) || name,
+        logo: optionalString(req.body?.logo, 'logo', { max: 500 }) || undefined,
+        bio: optionalString(req.body?.bio, 'bio', { max: 1000 }) || undefined,
+        instagramHandle: optionalString(req.body?.instagramHandle, 'instagramHandle', { max: 80 }) || undefined,
+        instagramUrl: optionalString(req.body?.instagramUrl, 'instagramUrl', { max: 300 }) || undefined,
+        whatsappNumber: optionalIndianMobile(req.body?.whatsappNumber, 'whatsappNumber') || undefined,
+        supportEmail: optionalEmail(req.body?.supportEmail, 'supportEmail') || undefined,
+        supportPhone: optionalIndianMobile(req.body?.supportPhone, 'supportPhone') || undefined,
+        pickupAddress: readAddress(req.body?.pickupAddress), returnAddress: readAddress(req.body?.returnAddress),
+        paymentReady: Boolean(req.body?.paymentReady), shippingReady: Boolean(req.body?.shippingReady), checkoutEnabled: true,
+        customDomain: req.body?.customDomain ? parseCustomDomain(req.body.customDomain) : undefined,
+        status: 'ONBOARDING', owner: owner._id, industry,
+        catalogStructure: { ...clone(industryPreset), clientPermissions: { content: true, payments: true } }, industryLocked: true,
+        plan: normalizePlan(req.body?.plan, 'PROFESSIONAL'),
+        license: { status: licenseStatus, startsAt: startedAt, billingCycle: licenseStatus === 'TRIAL' ? 'TRIAL' : 'MANUAL', ...(licenseStatus === 'TRIAL' ? { trialEndsAt: licenseEndsAt } : {}), ...(licenseEndsAt ? { endsAt: licenseEndsAt } : {}), renewalMessage: optionalString(req.body?.renewalMessage, 'renewalMessage', { max: 300 }) || '' },
+      }], { ordered: true, ...(session ? { session } : {}) });
+      const memberships = [{ store: store._id, user: owner._id, role: 'OWNER', status: 'ACTIVE', activatedAt: new Date() }];
+      if (String(owner._id) !== String(req.user._id)) memberships.push({ store: store._id, user: req.user._id, role: 'MANAGER', status: 'ACTIVE', activatedAt: new Date() });
+      await StoreMember.create(memberships, { ordered: true, ...(session ? { session } : {}) });
+      await User.updateMany({ _id: { $in: [...new Set([owner._id, req.user._id].map(String))] } }, { $addToSet: { availableModes: { $each: ['customer', 'seller'] } } }, { ...(session ? { session } : {}) });
+      const categories = industryPreset.defaultCategories.map((categoryName, index) => {
+        const definition = (industryPreset.categoryDefinitions || []).find((item) => item.name.toLowerCase() === String(categoryName).toLowerCase());
+        return { name: categoryName, slug: `${slug}-${slugify(categoryName)}`, description: `Starter ${industryPreset.name.toLowerCase()} category`, displayOrder: index, storeId: store._id, definitionKey: definition?.key || '', parentDefinitionKey: definition?.parentKey || '', attributeOverrides: definition?.attributes || [], variantAttributes: definition?.variantAttributes || [], configuredFilters: definition?.filters || [] };
+      });
+      if (categories.length) await Category.create(categories, { ordered: true, ...(session ? { session } : {}) });
+    });
+  } catch (error) {
+    if (!usedTransaction) {
+      if (store?._id) { await Promise.allSettled([Category.deleteMany({ storeId: store._id }), StoreMember.deleteMany({ store: store._id }), Store.deleteOne({ _id: store._id })]); }
+      if (createdOwnerId) await User.deleteOne({ _id: createdOwnerId, isPhoneVerified: false }).catch(() => null);
+    }
+    throw error;
+  }
+  await logAudit({ req, action: 'STORE_CREATE', entityType: 'Store', entityId: store._id, after: { name, slug, industry, plan: store.plan, owner: owner._id }, storeId: store._id });
   res.status(201).json(await serializeOnboarding(store));
 });
 
@@ -219,24 +212,26 @@ async function serializeOnboarding(store, membership) {
   };
 }
 
-async function resolveStoreOwner(req) {
+async function resolveStoreOwner(req, session) {
   if (req.body?.ownerPhone !== undefined && !normalizePhone(req.body.ownerPhone)) {
     throw new ApiError('VALIDATION_ERROR', 'Enter a valid 10-digit Indian mobile number for the store owner');
   }
   const phone = normalizePhone(req.body?.ownerPhone);
-  if (!phone) return req.user;
-  let user = await User.findOne({ phone });
+  if (!phone) return { user: req.user, created: false };
+  let user = await User.findOne({ phone }).session(session || null);
   if (user?.isBlocked) throw forbidden('Unblock the store owner account before assigning it');
   if (!user) {
     const ownerName = requireString(req.body?.ownerName, 'ownerName', { min: 2, max: 80 });
-    user = await User.create({ name: ownerName, phone, role: 'customer', isPhoneVerified: false, availableModes: ['customer', 'seller'], activeMode: 'customer' });
+    [user] = await User.create([{ name: ownerName, phone, role: 'customer', isPhoneVerified: false, availableModes: ['customer', 'seller'], activeMode: 'customer' }], { ordered: true, ...(session ? { session } : {}) });
+    return { user, created: true };
   }
-  return user;
+  return { user, created: false };
 }
 
 function readFutureDate(value, label) {
   if (!value) return undefined;
   const date = new Date(value);
   if (!Number.isFinite(date.getTime())) throw new ApiError('VALIDATION_ERROR', `Choose a valid ${label}`);
+  if (date <= new Date()) throw new ApiError('VALIDATION_ERROR', `${label} must be in the future`);
   return date;
 }

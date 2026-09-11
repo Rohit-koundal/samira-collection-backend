@@ -97,7 +97,7 @@ test('coupon update records discount changes, not just the coupon code', async (
 test('only the winning cancellation claim produces an audit event, after commit', async (t) => {
   const events = capture(t);
   t.mock.method(inventory, 'claimInventoryRestore', async () => null);
-  const pending = { _id: ID, storeId: STORE, orderStatus: 'Pending' };
+  const pending = { _id: ID, storeId: STORE, orderStatus: 'Pending', paymentMethod: 'COD', paymentStatus: 'Pending', finalAmount: 450 };
   const cancelled = { ...pending, orderStatus: 'Cancelled' };
   bypassCourier(t, pending);
   let alreadyClaimed = false;
@@ -121,7 +121,7 @@ test('failed cancellation does not claim a completed audit event', async (t) => 
 });
 test('payment finalization retry keeps exactly one capture audit event', async (t) => {
   const events = capture(t); let alreadyPaid = false;
-  const paid = { _id: ID, storeId: STORE, user: USER, paymentStatus: 'Paid', orderStatus: 'Confirmed', finalAmount: 450 };
+  const paid = { _id: ID, storeId: STORE, user: USER, paymentStatus: 'Paid', orderStatus: 'Confirmed', finalAmount: 450, cartCleanupStatus: 'COMPLETE' };
   t.mock.method(inventory, 'claimInventoryDeduction', async () => null);
   t.mock.method(Order, 'findOneAndUpdate', async (filter) => {
     if (!filter.paymentStatus) return null;

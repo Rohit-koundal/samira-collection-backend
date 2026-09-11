@@ -54,7 +54,8 @@ function allowedActions(order, shipment, { hasOpenReturn = false, canRecordRefun
   };
   for (const status of transitions) actions.push(statusAction[status]);
   if (order?.paymentMethod === 'COD' && order.paymentStatus === 'Pending' && order.orderStatus === 'Delivered') actions.push('COLLECT_COD');
-  if (order?.paymentMethod === 'COD' && order.paymentStatus === 'Paid' && canRecordRefund && Number(order.refundedAmount || 0) < Number(order.finalAmount || 0)) actions.push('RECORD_COD_REFUND');
+  const collectedAmount = order?.paymentMethod === 'COD' ? Number(order.adjustedFinalAmount ?? order.finalAmount ?? 0) : Number(order?.finalAmount || 0);
+  if (order?.paymentMethod === 'COD' && order.paymentStatus === 'Paid' && canRecordRefund && Number(order.refundedAmount || 0) < collectedAmount) actions.push('RECORD_COD_REFUND');
   if (['EXCEPTION', 'FAILED'].includes(shipmentOf(order, shipment)?.status)) actions.push('RESOLVE_DELIVERY_EXCEPTION');
   if (hasOpenReturn || RETURN_STATUSES.includes(order?.orderStatus)) actions.push('REVIEW_RETURN');
   return actions.filter(Boolean);

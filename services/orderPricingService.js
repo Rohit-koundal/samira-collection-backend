@@ -88,8 +88,7 @@ async function loadOrderItems(orderItems, { tenantFilter = {} } = {}) {
 
     items.push({
       product: product._id,
-      category: product.category || undefined,
-      categoryName: '',
+      categoryName: typeof product.category === 'object' ? String(product.category?.name || '') : '',
       name: product.name,
       productName: product.name,
       sku: variant ? variantSku(product, variant) : product.sku,
@@ -100,20 +99,27 @@ async function loadOrderItems(orderItems, { tenantFilter = {} } = {}) {
       quantity,
       price: unitPrice,
       originalPrice: unitMRP,
+      costPrice: Number(product.costPrice || 0),
       discount: round(unitMRP - unitPrice),
       tax: 0,
       lineTotal: round(unitPrice * quantity),
-      category: product.category,
+      category: product.category?._id || product.category || undefined,
       storeId: product.storeId || null,
       shippingWeightKg: Number(product.shippingWeightKg || 0),
+      returnable: product.returnable !== false,
+      exchangeable: product.exchangeable !== false,
+      returnWindowDays: Number.isFinite(Number(product.returnWindowDays)) ? Number(product.returnWindowDays) : undefined,
+      returnPolicy: String(product.returnPolicy || '').trim(),
     });
   }
 
-  const categoryIds = [...new Set(items.map((item) => String(item.category || '')).filter(Boolean))];
+  const categoryIds = [...new Set(items.filter((item) => !item.categoryName).map((item) => String(item.category || '')).filter(Boolean))];
   if (categoryIds.length) {
     const categories = await Category.find(andFilter({ _id: { $in: categoryIds } }, tenantFilter)).select('name').lean();
     const names = new Map(categories.map((category) => [String(category._id), category.name]));
-    for (const item of items) item.categoryName = names.get(String(item.category || '')) || '';
+    for (const item of items) {
+      if (!item.categoryName) item.categoryName = names.get(String(item.category || '')) || '';
+    }
   }
 
   const storeKeys = new Set(items.map((item) => String(item.storeId || '')));
@@ -138,22 +144,29 @@ async function buildOrderDraft({ orderItems, couponCode, paymentMethod, settings
   let coupon = null;
   let couponDiscount = 0;
   const couponTenantFilter = tenantFilter || (items[0]?.storeId ? defaultStoreFilter(items[0].storeId) : {});
+  const shippingQuote = await require('./deliveryService').checkoutShipping({ items, settings: storeSettings, address: shippingAddress, paymentMethod: method, amount: sellingTotal });
+  const couponContext = {
+    cartTotal: sellingTotal,
+    paymentMethod: method,
+    items,
+    userId,
+    tenantFilter: couponTenantFilter,
+    deliveryCharge: Number(shippingQuote.deliveryCharge || 0),
+    pincode: shippingAddress?.pincode,
+    salesChannel: 'STOREFRONT',
+  };
   if (couponCode) {
     // A checkout can originate from the main storefront or a seller domain.
     // When no request tenant was resolved, derive it from the authoritative
     // product rows while continuing to support legacy coupons without storeId.
     const priced = await couponService.validateAndPrice({
       code: couponCode,
-      cartTotal: sellingTotal,
-      paymentMethod: method,
-      items,
-      userId,
-      tenantFilter: couponTenantFilter,
+      ...couponContext,
     });
     coupon = priced.coupon;
     couponDiscount = priced.discountAmount;
   } else {
-    const automatic = await couponService.findBestAutomatic({ cartTotal: sellingTotal, paymentMethod: method, items, userId, tenantFilter: couponTenantFilter });
+    const automatic = await couponService.findBestAutomatic(couponContext);
     if (automatic) {
       coupon = automatic.coupon;
       couponDiscount = automatic.discountAmount;
@@ -161,8 +174,13 @@ async function buildOrderDraft({ orderItems, couponCode, paymentMethod, settings
   }
 
   const productDiscount = round(Math.max(0, totalMRP - sellingTotal));
-  const shippingQuote = await require('./deliveryService').checkoutShipping({ items, settings: storeSettings, address: shippingAddress, paymentMethod: method, amount: sellingTotal });
-  const deliveryCharge = coupon?.benefitType === 'FREE_SHIPPING' ? 0 : shippingQuote.deliveryCharge;
+  const quotedDelivery = Number(shippingQuote.deliveryCharge || 0);
+  const shippingBenefitCap = Number(coupon?.maxDiscountAmount || 0);
+  const deliveryDiscount = coupon?.benefitType === 'FREE_SHIPPING'
+    ? Math.min(quotedDelivery, shippingBenefitCap > 0 ? shippingBenefitCap : quotedDelivery)
+    : 0;
+  const deliveryCharge = round(Math.max(0, quotedDelivery - deliveryDiscount));
+  const couponSaving = round(couponDiscount + deliveryDiscount);
   const prepaidDiscount = resolvePrepaidDiscount(method, sellingTotal - couponDiscount, storeSettings);
   const platformFee = items.length ? Math.max(0, Number(storeSettings.platformFee ?? 23)) : 0;
   const taxRate = Math.max(0, Number(storeSettings.gstRate ?? 5));
@@ -213,7 +231,21 @@ async function buildOrderDraft({ orderItems, couponCode, paymentMethod, settings
       taxAmount,
       taxRate,
       finalAmount,
-      coupon: coupon ? { code: coupon.code, discountAmount: couponDiscount, activationMode: coupon.activationMode || 'CODE', benefitType: coupon.benefitType || 'DISCOUNT' } : undefined,
+      coupon: coupon ? {
+        couponId: coupon._id,
+        revision: Number(coupon.revision || 0),
+        code: coupon.code,
+        title: coupon.title || '',
+        type: coupon.type,
+        discountValue: Number(coupon.discountValue || 0),
+        maxDiscountAmount: Number(coupon.maxDiscountAmount || 0),
+        discountAmount: couponDiscount,
+        savingAmount: couponSaving,
+        activationMode: coupon.activationMode || 'CODE',
+        benefitType: coupon.benefitType || 'DISCOUNT',
+        stackingMode: coupon.stackingMode || 'ALLOW_PRODUCT_OFFERS',
+        restoreOnFullRefund: Boolean(coupon.restoreOnFullRefund),
+      } : undefined,
     },
   };
 }

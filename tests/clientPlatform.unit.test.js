@@ -57,12 +57,18 @@ test('managed project package contains only its one-time client identity and exc
   assert.equal(credentials.CLIENT_INSTALLATION_ID, 'client_test_123');
   assert.equal(credentials.CLIENT_LICENSE_KEY, 'one-time-private-key');
   assert.equal(entries.get(`${prefix}project-manifest.json`).toString('utf8').includes('"managedInstallation": true'), true);
-  for (const name of ['backend/models/ClientInstallation.js', 'backend/models/PlatformRelease.js', 'backend/models/InstallationPayment.js', 'backend/services/clientPlatformService.js', 'backend/routes/platformControlRoutes.js', 'src/pages/admin/ClientInstallations.jsx']) assert.equal(entries.has(prefix + name), false, name);
+  for (const name of ['backend/models/ClientInstallation.js', 'backend/models/ClientInstallationOperation.js', 'backend/models/PlatformRelease.js', 'backend/models/InstallationPayment.js', 'backend/services/clientPlatformService.js', 'backend/routes/platformControlRoutes.js', 'src/pages/admin/ClientInstallations.jsx']) assert.equal(entries.has(prefix + name), false, name);
+  for (const name of ['backend/models/StorePortfolioOperation.js', 'backend/models/SubscriptionPricing.js', 'backend/services/storePortfolioService.js', 'backend/services/storeDataExportService.js', 'backend/services/subscriptionPricingService.js']) assert.equal(entries.has(prefix + name), false, name);
   for (const name of [
     'backend/models/RuntimeLicense.js', 'backend/services/controlPlaneClient.js', 'backend/middleware/externalLicenseMiddleware.js',
     'backend/routes/clientSystemRoutes.js', 'src/pages/admin/SystemStatus.jsx',
     'backend/controllers/businessController.js', 'backend/routes/businessRoutes.js',
     'backend/services/businessOperationsService.js', 'src/pages/seller/BusinessCenter.jsx',
+    'backend/models/Campaign.js', 'backend/controllers/campaignController.js',
+    'backend/routes/campaignRoutes.js', 'src/pages/admin/CampaignBuilder.jsx',
+    'backend/models/StoreContentVersion.js', 'backend/services/storeContentService.js',
+    'backend/controllers/storeContentController.js', 'src/pages/admin/StoreContent.jsx',
+    'src/pages/admin/StoreContent.css',
   ]) assert.equal(entries.has(prefix + name), true, name);
   assert.equal(entries.get(`${prefix}src/App.jsx`).toString('utf8').includes('ClientInstallations'), false);
   assert.match(entries.get(`${prefix}backend/services/controlPlaneClient.js`).toString('utf8'), /const MANAGED_CLIENT_BUILD = true/);

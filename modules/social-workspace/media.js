@@ -120,4 +120,22 @@ async function prepare(post, video = false) {
     await fs.rm(directory, { recursive: true, force: true });
   }
 }
-module.exports = { trustedUrl, publicIPv4, photoFile, run, persist, prepare };
+async function removeAssets(values = []) {
+  const provider = storage.getStorageProvider();
+  for (const value of [...new Set(values.filter(Boolean))]) {
+    let url; try { url = trustedUrl(value); } catch { continue; }
+    try {
+      if (provider === 'r2' && process.env.R2_PUBLIC_URL) {
+        const root = new URL(process.env.R2_PUBLIC_URL), prefix = root.pathname.replace(/\/$/, '');
+        if (url.origin === root.origin && url.pathname.startsWith(prefix + '/')) await storage.deleteObject({ provider: 'r2', storageKey: decodeURIComponent(url.pathname.slice(prefix.length + 1)) });
+      } else if (provider === 'cloudinary' && process.env.CLOUDINARY_CLOUD_NAME) {
+        const match = url.pathname.match(/\/(?:image|video)\/upload\/(?:v\d+\/)?(.+)\.[a-z0-9]+$/i);
+        if (match) await require('../../services/cloudinaryUpload').deleteFile(decodeURIComponent(match[1]), /\.(?:mp4|mov|webm)$/i.test(url.pathname) ? 'video' : 'image');
+      } else if (url.pathname.startsWith('/uploads/social-')) {
+        const name = path.basename(decodeURIComponent(url.pathname));
+        if (/^social-[a-f0-9-]+\.(?:jpg|mp4)$/i.test(name)) await fs.unlink(path.join(uploads, name)).catch(() => {});
+      }
+    } catch { /* Retention cleanup retries later; original catalogue media is never passed here. */ }
+  }
+}
+module.exports = { trustedUrl, publicIPv4, photoFile, run, persist, prepare, removeAssets };

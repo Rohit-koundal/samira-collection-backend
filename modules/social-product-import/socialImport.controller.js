@@ -151,7 +151,7 @@ async function saveReviewedImport(req, res, publish) {
   }
   await SocialImport.updateOne({ _id: job._id }, { $set: { draftId: draft._id } });
   let product;
-  if (publish) product = await publishPreparedDraft(draft, prepared);
+  if (publish) product = await publishPreparedDraft(draft, prepared, { userId: req.user?._id });
   await logAudit({ req, action: publish ? 'SOCIAL_IMPORT_PUBLISH' : 'SOCIAL_IMPORT_REVIEW_SAVE', entityType: publish ? 'Product' : 'ProductDraft', entityId: product?._id || draft._id, storeId: job.storeId, summary: publish ? 'Product published from import review' : 'Imported product review saved' });
   res.json({ success: true, draftId: String(draft._id), ...(product ? { productId: String(product._id) } : {}), data: await reviewView(job, draft) });
 }

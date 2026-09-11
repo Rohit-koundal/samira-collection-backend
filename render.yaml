@@ -10,10 +10,14 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
+      - key: STRICT_PRODUCTION_CONFIG
+        value: "true"
       - key: ENABLE_REEL_PRODUCT_IMPORT
         value: "true"
       - key: REQUIRE_DATABASE
-        value: "false"
+        value: "true"
+      - key: REQUIRE_MEDIA_STORAGE
+        value: "true"
       - key: MONGO_URI
         sync: false
       - key: JWT_SECRET
@@ -24,6 +28,14 @@ services:
         value: 15m
       - key: JWT_REFRESH_EXPIRES_IN
         value: 30d
+      - key: ALLOW_REFRESH_TOKEN_BODY
+        value: "false"
+      - key: RETURN_REFRESH_TOKEN_IN_BODY
+        value: "false"
+      - key: AUTH_COOKIE_SAME_SITE
+        value: none
+      - key: AUTH_COOKIE_SECURE
+        value: "true"
       - key: PUBLIC_API_URL
         value: https://samira-collection-backend-1.onrender.com
       - key: CLIENT_ORIGINS
@@ -32,11 +44,13 @@ services:
         sync: false
       - key: ADMIN_PHONE_NUMBERS
         sync: false
-      # The owner always uses real SMS; customer accounts use the demo OTP.
+      # Temporary team-demo login. Disable the owner switch before live use.
       - key: OTP_MODE
         value: demo
       - key: DEMO_OTP
         value: "123456"
+      - key: ALLOW_HOSTED_OWNER_DEMO
+        value: "true"
       - key: OTP_EXPIRY_MINUTES
         value: "5"
       - key: OTP_MAX_ATTEMPTS
@@ -62,11 +76,11 @@ services:
       - key: R2_SECRET_ACCESS_KEY
         sync: false
       - key: R2_BUCKET_NAME
-        value: samira-products
+        sync: false
       - key: R2_PUBLIC_URL
         sync: false
       - key: R2_FOLDER
-        value: products
+        sync: false
       - key: CLOUDINARY_CLOUD_NAME
         sync: false
       - key: CLOUDINARY_API_KEY

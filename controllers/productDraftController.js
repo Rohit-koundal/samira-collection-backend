@@ -17,6 +17,7 @@ const { validateVariantPayload } = require('../services/variantService');
 const { andFilter } = require('../services/storeService');
 const { logAudit } = require('../services/auditService');
 const { auditSnapshot } = require('../utils/auditData');
+const { recordOpeningInventory } = require('../services/inventoryService');
 
 const DRAFT_AUDIT_FIELDS = [
   'name', 'sku', 'category', 'sellingPrice', 'originalPrice', 'stock', 'status',
@@ -344,7 +345,7 @@ exports.publishSelected = asyncHandler(async (req, res) => {
       continue;
     }
     try {
-      const product = await publishPreparedDraft(draft, prepared);
+      const product = await publishPreparedDraft(draft, prepared, { userId: req.user?._id });
       if (product) published.push(product);
       results.push({ id, name: draft.name || '', status: 'published', productId: product?._id });
       await logAudit({ req, action: 'PRODUCT_DRAFT_PUBLISHED', entityType: 'ProductDraft', entityId: draft._id, before: { status: 'draft' }, after: { status: 'published', publishedProductId: product?._id }, summary: `Published product draft ${draft.name || draft._id}` });
@@ -365,7 +366,7 @@ exports.publishSelected = asyncHandler(async (req, res) => {
   });
 });
 
-async function publishPreparedDraft(draft, prepared) {
+async function publishPreparedDraft(draft, prepared, { userId } = {}) {
     if (draft.status === 'published' && draft.publishedProductId) {
       return Product.findById(draft.publishedProductId);
     }
@@ -377,9 +378,15 @@ async function publishPreparedDraft(draft, prepared) {
     // converge on one product for ordinary uploads as well as imported drafts.
     let product = await Product.findOne({ sourceDraftId: draft._id });
     if (!product) {
-      try { product = await Product.create({ ...normalizeProductPayload(productPayload), sourceDraftId: draft._id }); }
+      const productData = { ...normalizeProductPayload(productPayload), sourceDraftId: draft._id };
+      if (Number(productData.stock || 0) > 0) {
+        productData.lastInventoryChangeAt = new Date();
+        productData.lastInventoryChangedBy = userId;
+      }
+      try { product = await Product.create(productData); }
       catch (error) { if (error.code !== 11000) throw error; product = await Product.findOne({ sourceDraftId: draft._id }); if (!product) throw error; }
     }
+    await recordOpeningInventory(product, { userId, reference: `Draft ${draft._id}`, reason: 'Draft opening inventory' });
     draft.status = 'published';
     draft.publishedProductId = product._id;
     draft.archivedAt = null;
@@ -497,6 +504,8 @@ function normalizeDraftPayload(body = {}) {
   if (payload.sellingPrice !== undefined) payload.sellingPrice = Number(payload.sellingPrice);
   if (payload.stock !== undefined) payload.stock = Number(payload.stock);
   for (const key of ['costPrice', 'gstRate', 'lowStockAlert', 'reorderQuantity', 'shippingWeightKg']) if (payload[key] !== undefined) payload[key] = Number(payload[key]);
+  if (payload.returnWindowDays === '' || payload.returnWindowDays === null) delete payload.returnWindowDays;
+  else if (payload.returnWindowDays !== undefined) payload.returnWindowDays = Number(payload.returnWindowDays);
   if (payload.packageDimensions && typeof payload.packageDimensions === 'object') payload.packageDimensions = {
     lengthCm: Number(payload.packageDimensions.lengthCm || 0),
     widthCm: Number(payload.packageDimensions.widthCm || 0),
@@ -525,6 +534,7 @@ function validateDraftPayload(payload) {
   }
   if (payload.gstRate !== undefined && (!Number.isFinite(payload.gstRate) || payload.gstRate < 0 || payload.gstRate > 100)) return 'GST rate must be between 0 and 100';
   if (payload.shippingWeightKg !== undefined && (!Number.isFinite(payload.shippingWeightKg) || payload.shippingWeightKg < 0 || payload.shippingWeightKg > 1000)) return 'Packed unit weight must be between 0 and 1000 kg';
+  if (payload.returnWindowDays !== undefined && (!Number.isSafeInteger(payload.returnWindowDays) || payload.returnWindowDays < 0 || payload.returnWindowDays > 365)) return 'Product return window must be a whole number between 0 and 365 days';
   if (payload.packageDimensions && ['lengthCm', 'widthCm', 'heightCm'].some((field) => !Number.isFinite(payload.packageDimensions[field]) || payload.packageDimensions[field] < 0 || payload.packageDimensions[field] > 1000)) return 'Package dimensions must be between 0 and 1000 cm';
   for (const key of ['restockAt', 'publishAt', 'saleStartAt', 'saleEndAt']) if (payload[key] && Number.isNaN(new Date(payload[key]).getTime())) return 'Choose valid product schedule dates';
   if (payload.saleStartAt && payload.saleEndAt && new Date(payload.saleStartAt) >= new Date(payload.saleEndAt)) return 'Sale end must be after sale start';
@@ -597,6 +607,9 @@ function buildProductPayloadFromDraft(draft) {
     highlights: data.highlights || [],
     careInstructions: data.careInstructions || '',
     returnPolicy: data.returnPolicy || '',
+    returnable: data.returnable !== false,
+    exchangeable: data.exchangeable !== false,
+    returnWindowDays: data.returnWindowDays === '' || data.returnWindowDays === null || data.returnWindowDays === undefined ? undefined : Number(data.returnWindowDays),
     metaTitle: data.metaTitle || '',
     metaDescription: data.metaDescription || '',
     metaKeywords: data.metaKeywords || '',

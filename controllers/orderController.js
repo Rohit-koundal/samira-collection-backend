@@ -1,4 +1,5 @@
 const Order = require('../models/Order');
+const crypto = require('node:crypto');
 const Settings = require('../models/Settings');
 const InventoryTransaction = require('../models/InventoryTransaction');
 const couponService = require('../services/couponService');
@@ -23,6 +24,9 @@ const { adminOrderFilter } = require('../services/dashboardAnalytics');
 const { assertMonthlyOrderCapacity, assertStoreCanAcceptOrders } = require('../middleware/storeMiddleware');
 const { assertOrderTransition, canCancelOrder, publicWorkflow } = require('../services/orderWorkflowService');
 const { applyCustomerRestrictionsToPaymentOptions, assertCustomerCanCheckout, getCustomerRestrictions } = require('../services/customerAccessService');
+const { checkoutAttemptId, checkoutFingerprint, checkoutCartItems, consumePurchasedCart, findCheckoutReplay, isDuplicateKey } = require('../services/checkoutSafetyService');
+const { processCancellationRefund, processItemCancellationRefund, processRtoRefund, recordProviderRefund } = require('../services/paymentRefundService');
+const { refundEstimate, returnPolicySettings } = require('../services/returnWorkflowService');
 
 const ORDER_STATUSES = ['Pending', 'Confirmed', 'Packed', 'Shipped', 'Out for Delivery', 'Delivered', 'Cancelled', 'Return Requested', 'Exchange Requested', 'Returned', 'Refunded'];
 const PAYMENT_STATUSES = ['Pending', 'Paid', 'Failed', 'Refunded'];
@@ -47,7 +51,7 @@ function managerRequest(req) {
 }
 
 function actorSnapshot(req) {
-  return { id: String(req.user?._id || ''), name: String(req.user?.name || req.user?.phone || 'Staff').slice(0, 100) };
+  return { id: String(req.user?._id || ''), name: String(req.user?.name || req.user?.phone || 'Staff').slice(0, 100), role: String(req.storeMember?.role || req.user?.role || 'SYSTEM') };
 }
 
 function decorateOrder(order, options = {}) {
@@ -138,7 +142,16 @@ exports.quoteOrder = asyncHandler(async (req, res) => {
  */
 exports.createOrder = asyncHandler(async (req, res) => {
   assertCheckoutReady(req);
-  await assertCustomerCanCheckout({ storeId: req.store?._id, userId: req.user?._id, paymentMethod: req.body?.paymentMethod || 'COD' });
+  const requestedMethod = String(req.body?.paymentMethod || 'COD').toUpperCase();
+  if (requestedMethod !== 'COD') throw new ApiError('PAYMENT_METHOD_UNAVAILABLE', 'Online orders must be created through the secure payment checkout.');
+  const attemptId = checkoutAttemptId(req);
+  const fingerprint = checkoutFingerprint(req.body, 'COD');
+  const existing = await findCheckoutReplay({ userId: req.user._id, attemptId, fingerprint });
+  if (existing) {
+    await consumePurchasedCart(existing).catch(() => null);
+    return res.status(200).json(existing);
+  }
+  await assertCustomerCanCheckout({ storeId: req.store?._id, userId: req.user?._id, paymentMethod: 'COD' });
   await assertMonthlyOrderCapacity(req.store);
 
   const shippingAddress = assertShippingAddress(req.body?.shippingAddress);
@@ -152,8 +165,12 @@ exports.createOrder = asyncHandler(async (req, res) => {
   });
 
   require('../services/shippingRules').assertQuotedTotal(draft, req.body?.expectedTotal);
-  const order = await runInTransaction(async (session) => {
-    const [created] = await Order.create([{
+  const cartItems = checkoutCartItems(req.body);
+  let order;
+  let replayed = false;
+  try {
+    order = await runInTransaction(async (session) => {
+      const [created] = await Order.create([{
       ...buildPersistedOrderFields({
         userId: req.user._id,
         draft,
@@ -161,6 +178,10 @@ exports.createOrder = asyncHandler(async (req, res) => {
         billingAddress: req.body?.billingAddress,
         extra: {
           storeId: draft.storeId || undefined,
+          checkoutAttemptId: attemptId,
+          checkoutFingerprint: fingerprint,
+          checkoutCartItems: cartItems,
+          cartCleanupStatus: cartItems.length ? 'PENDING' : 'NOT_REQUIRED',
           attribution: readAttribution(req.body?.attribution || req.body),
           prepaidDiscount: draft.totals.prepaidDiscount || 0,
           codConfirmationStatus: draft.paymentMethod === 'COD' && draft.settings?.codConfirmationRequired ? 'PENDING' : 'NOT_REQUIRED',
@@ -188,7 +209,7 @@ exports.createOrder = asyncHandler(async (req, res) => {
       stockTaken = true;
 
       if (draft.totals.coupon?.code) {
-        await couponService.consumeCoupon(draft.totals.coupon.code, { session });
+        await couponService.consumeCoupon(draft.totals.coupon.code, { session, userId: req.user._id, discountAmount: draft.totals.coupon.savingAmount, couponId: draft.totals.coupon.couponId });
       }
     } catch (error) {
       // A transaction rolls all of this back on its own. Without one, undo the
@@ -209,8 +230,17 @@ exports.createOrder = asyncHandler(async (req, res) => {
       throw error;
     }
 
-    return created;
-  });
+      return created;
+    });
+  } catch (error) {
+    if (!isDuplicateKey(error)) throw error;
+    order = await findCheckoutReplay({ userId: req.user._id, attemptId, fingerprint });
+    if (!order) throw error;
+    replayed = true;
+  }
+
+  await consumePurchasedCart(order).catch(() => null);
+  if (replayed) return res.status(200).json(order);
 
   logAudit({ req, action: 'ORDER_CREATE', entityType: 'Order', entityId: order._id, storeId: order.storeId, after: { orderStatus: order.orderStatus, paymentStatus: order.paymentStatus, paymentMethod: order.paymentMethod, finalAmount: order.finalAmount } });
 
@@ -312,20 +342,22 @@ exports.orderWorkspaceSummary = asyncHandler(async (req, res) => {
   const scope = filter => andFilter(filter, req.tenantFilter);
   const booked = { orderStatus: { $nin: ['Cancelled', 'Returned', 'Refunded'] }, $or: [{ paymentMethod: 'COD' }, { paymentStatus: 'Paid' }] };
   const today = periodFilter(dashboardRange({ range: 'today' }));
-  const [pending, packing, todayPacking, dispatch, transit, exceptions, returns, codRows] = await Promise.all([
+  const [pending, packing, todayPacking, dispatch, transit, exceptions, returns, resolution, rto, codRows] = await Promise.all([
     Order.countDocuments(scope({ ...booked, orderStatus: 'Pending' })),
     Order.countDocuments(scope({ ...booked, orderStatus: 'Confirmed' })),
     Order.countDocuments(scope(andFilter({ ...booked, orderStatus: 'Confirmed' }, today))),
     Order.countDocuments(scope({ ...booked, orderStatus: 'Packed' })),
     Order.countDocuments(scope({ orderStatus: { $in: ['Shipped', 'Out for Delivery'] } })),
     Shipment.countDocuments(scope({ status: { $in: ['EXCEPTION', 'FAILED'] } })),
-    ReturnExchange.countDocuments(scope({ status: { $in: ['Requested', 'Approved', 'Pickup Scheduled', 'Received'] } })),
+    ReturnExchange.countDocuments(scope({ status: { $in: ['Requested', 'Approved', 'Pickup Scheduled', 'Picked Up', 'In Transit', 'Received', 'QC Passed', 'Refund Initiated', 'Exchange Allocated', 'Replacement Shipped', 'Replacement Delivered'] } })),
+    Order.countDocuments(scope({ $or: [{ 'cancellationRefund.status': { $in: ['FAILED', 'MANUAL_REQUIRED'] } }, { itemCancellationRefunds: { $elemMatch: { status: { $in: ['FAILED', 'MANUAL_REQUIRED'] } } } }, { 'rto.refundStatus': { $in: ['FAILED', 'MANUAL_REQUIRED'] } }] })),
+    Order.countDocuments(scope({ 'rto.status': { $in: ['IN_TRANSIT', 'RECEIVED', 'QC_PENDING', 'RESTOCKED', 'QUARANTINED', 'DAMAGED', 'MISSING', 'REFUND_PENDING'] } })),
     Order.aggregate([
       { $match: scope({ orderStatus: 'Delivered', paymentMethod: 'COD', paymentStatus: 'Pending' }) },
-      { $group: { _id: null, count: { $sum: 1 }, amount: { $sum: '$finalAmount' } } },
+      { $group: { _id: null, count: { $sum: 1 }, amount: { $sum: { $ifNull: ['$adjustedFinalAmount', '$finalAmount'] } } } },
     ]),
   ]);
-  res.json({ pending, packing, todayPacking, dispatch, transit, exceptions, returns, codCollection: codRows[0]?.count || 0, codCollectionAmount: codRows[0]?.amount || 0 });
+  res.json({ pending, packing, todayPacking, dispatch, transit, exceptions, returns, resolution, rto, codCollection: codRows[0]?.count || 0, codCollectionAmount: codRows[0]?.amount || 0 });
 });
 
 exports.addStaffNote = asyncHandler(async (req, res) => {
@@ -381,7 +413,7 @@ exports.updateOrderStatus = asyncHandler(async (req, res) => {
 
   if (orderStatus === 'Cancelled') {
     if (!canCancelOrder(order, shipment)) throw new ApiError('ORDER_NOT_CANCELLABLE', 'This order is already with the courier or completed. Use the return/RTO workflow instead of restoring stock through cancellation.');
-    return res.json(decorateOrder(await cancelOrderInternal(order, { req, actor: req.user, note: note || 'Cancelled by staff', expectedRevision })));
+    return res.json(decorateOrder(await cancelOrderInternal(order, { req, actor: req.user, note: note || 'Cancelled by staff', reasonCode: optionalString(req.body?.reasonCode, 'reasonCode', { max: 80 }) || 'ADMIN_CANCELLATION', comment: note, expectedRevision })));
   }
   const transition = assertOrderTransition(order, orderStatus, shipment);
   if (!transition.changed) return res.json(decorateOrder(order));
@@ -416,6 +448,16 @@ exports.updateOrderStatus = asyncHandler(async (req, res) => {
       message: 'Your order has been delivered. You can now rate products or request a return.',
       metadata: { orderId: String(updated._id) },
     });
+    const firstProductId = (updated.orderItems || []).map((item) => item.product).find(Boolean);
+    notifyLater({
+      userId: updated.user,
+      storeId: updated.storeId,
+      event: 'REVIEW_REQUEST',
+      title: 'How was your order?',
+      message: 'Your feedback helps other shoppers choose with confidence. Rate the products you received.',
+      metadata: { orderId: String(updated._id), productId: firstProductId ? String(firstProductId) : undefined },
+      deliverAfter: new Date(now.getTime() + 3 * 24 * 60 * 60 * 1000),
+    });
   }
 
   const populated = await Order.findById(updated._id).populate('shipment', 'provider courierName status awb trackingNumber bookingState expectedDeliveryAt');
@@ -429,12 +471,18 @@ exports.updatePaymentStatus = asyncHandler(async (req, res) => {
   const reference = optionalString(req.body?.reference, 'reference', { max: 120 });
   const order = await Order.findOne(andFilter({ _id: req.params.id }, req.tenantFilter)).select('+paymentEvents');
   if (!order) throw notFound('Order not found');
+  if (order.paymentStatus === paymentStatus) {
+    if (paymentStatus === 'Refunded' && order.couponConsumed && order.coupon?.restoreOnFullRefund && !order.couponReleased) {
+      await couponService.releaseCouponForFullyRefundedOrder(order._id);
+    }
+    return res.json(decorateOrder(await Order.findById(order._id).select('+paymentEvents')));
+  }
   const expectedRevision = assertCurrentRevision(order, req.body?.revision);
-  if (order.paymentStatus === paymentStatus) return res.json(decorateOrder(order));
   if (order.paymentMethod !== 'COD') throw new ApiError('PAYMENT_MANAGED_BY_PROVIDER', 'Online payment status is controlled by the payment provider. Reconcile it from Razorpay instead of changing it manually.', { statusCode: 409 });
   if (!MANUAL_PAYMENT_TRANSITIONS[order.paymentStatus]?.includes(paymentStatus)) throw new ApiError('PAYMENT_TRANSITION_INVALID', `A COD payment cannot move from ${order.paymentStatus} to ${paymentStatus}.`, { statusCode: 409 });
   if (!note) throw new ApiError('VALIDATION_ERROR', 'Add a payment note so this financial change has a clear audit record.');
   if (paymentStatus === 'Paid' && order.orderStatus !== 'Delivered') throw new ApiError('PAYMENT_TRANSITION_INVALID', 'Record COD collection after the order is delivered.', { statusCode: 409 });
+  const settlementAmount = order.paymentMethod === 'COD' ? Number(order.adjustedFinalAmount ?? order.finalAmount ?? 0) : Number(order.finalAmount || 0);
 
   let refundAmount = 0;
   let paymentState = paymentStatus === 'Paid' ? 'PAID' : 'REFUNDED';
@@ -443,7 +491,8 @@ exports.updatePaymentStatus = asyncHandler(async (req, res) => {
     const ReturnExchange = require('../models/ReturnExchange');
     const completedReturn = await ReturnExchange.exists(andFilter({ order: order._id, $or: [{ status: 'Refunded' }, { resolutionStatus: 'Refunded' }] }, req.tenantFilter));
     if (!completedReturn) throw new ApiError('PAYMENT_TRANSITION_INVALID', 'Complete the approved return refund step before recording money returned to the customer.', { statusCode: 409 });
-    const remaining = Math.round(Math.max(0, Number(order.finalAmount || 0) - Number(order.refundedAmount || 0)) * 100) / 100;
+    if (reference && (order.refunds || []).some(refund => String(refund.providerRefundId || '') === reference)) throw new ApiError('DUPLICATE_REQUEST', 'This refund reference has already been recorded.', { statusCode: 409 });
+    const remaining = Math.round(Math.max(0, settlementAmount - Number(order.refundedAmount || 0)) * 100) / 100;
     refundAmount = Math.round(Number(req.body?.amount) * 100) / 100;
     if (!Number.isFinite(refundAmount) || refundAmount < 0.01 || refundAmount > remaining) throw new ApiError('VALIDATION_ERROR', `Enter a refund amount between Rs. 0.01 and Rs. ${remaining.toFixed(2)}.`);
     const completesRefund = refundAmount >= remaining;
@@ -456,12 +505,12 @@ exports.updatePaymentStatus = asyncHandler(async (req, res) => {
     $inc: { revision: 1 },
     $push: {
       paymentEvents: {
-        state: paymentState, status: paymentStatus, amount: paymentStatus === 'Refunded' ? refundAmount : Number(order.finalAmount || 0), reference,
+        state: paymentState, status: paymentStatus, amount: paymentStatus === 'Refunded' ? refundAmount : settlementAmount, reference,
         note, source: 'MANUAL', actor: actorSnapshot(req), date: now,
       },
     },
   };
-  if (paymentStatus === 'Refunded') mutation.$push.refunds = { providerRefundId: reference || `manual-${order._id}-${expectedRevision + 1}`, provider: 'manual', amount: refundAmount, currency: 'INR', status: 'PROCESSED', note, processedAt: now };
+  if (paymentStatus === 'Refunded') mutation.$push.refunds = { providerRefundId: reference || `manual-${order._id}-${expectedRevision + 1}`, provider: 'manual', amount: refundAmount, currency: 'INR', status: 'PROCESSED', sourceType: 'MANUAL', note, processedAt: now };
   const paymentFilter = paymentStatus === 'Refunded'
     ? { $and: [
       { _id: order._id, paymentStatus: order.paymentStatus },
@@ -471,6 +520,7 @@ exports.updatePaymentStatus = asyncHandler(async (req, res) => {
     : { _id: order._id, paymentStatus: order.paymentStatus, ...revisionFilter(expectedRevision) };
   const updated = await Order.findOneAndUpdate(andFilter(paymentFilter, req.tenantFilter), mutation, { new: true }).select('+paymentEvents');
   if (!updated) throw new ApiError('ORDER_CHANGED', 'This order changed in another session. Reload it before continuing.', { statusCode: 409 });
+  if (resultingPaymentStatus === 'Refunded') await couponService.releaseCouponForFullyRefundedOrder(updated._id);
   logAudit({ req, action: paymentStatus === 'Paid' ? 'COD_PAYMENT_COLLECTED' : 'COD_REFUND_RECORDED', entityType: 'Order', entityId: updated._id, storeId: updated.storeId, before: { paymentStatus: order.paymentStatus, paymentState: order.paymentState, refundedAmount: order.refundedAmount || 0 }, after: { paymentStatus: resultingPaymentStatus, paymentState, refundedAmount: updated.refundedAmount || 0, refundAmount, reference }, summary: note });
   res.json(decorateOrder(updated, { canRecordRefund: paymentStatus === 'Refunded' && resultingPaymentStatus === 'Paid' }));
 });
@@ -499,8 +549,223 @@ exports.cancelOrder = asyncHandler(async (req, res) => {
   if (!isOwnerOrAdmin(order, req.user, req)) throw forbidden('Not allowed');
 
   const reason = optionalString(req.body?.reason, 'reason', { max: 300 });
+  const comment = optionalString(req.body?.comment, 'comment', { max: 500 });
   const note = `${req.user.role === 'admin' ? 'Cancelled by admin' : 'Cancelled by customer'}${reason ? `: ${reason}` : ''}`;
-  res.json(await cancelOrderInternal(order, { req, actor: req.user, note }));
+  res.json(await cancelOrderInternal(order, { req, actor: req.user, note: comment ? `${note}. ${comment}` : note, reasonCode: reason || 'OTHER', comment }));
+});
+
+async function completeItemCancellationInventory(order, operationId, req) {
+  const refund = (order.itemCancellationRefunds || []).find(entry => entry.operationId === operationId);
+  if (!refund || ['PROCESSED', 'NOT_REQUIRED'].includes(refund.inventoryStatus)) return order;
+  const item = (order.orderItems || []).id?.(refund.orderItemId) || (order.orderItems || []).find(entry => String(entry._id) === String(refund.orderItemId));
+  const cancellation = item?.cancellations?.find(entry => entry.operationId === operationId);
+  if (!item || !cancellation) throw new ApiError('ORDER_CHANGED', 'The cancelled item record could not be reconciled.', { statusCode: 409 });
+  try {
+    await inventoryService.applyInventoryAdjustment({
+      productId: item.product, variantId: item.variantId, mode: 'ADD', bucket: 'SELLABLE', quantity: cancellation.quantity,
+      reasonCode: 'CUSTOMER_RETURN', reason: 'Order item cancelled before dispatch', note: cancellation.comment || cancellation.reasonCode,
+      reference: `Order ${order._id}`, idempotencyKey: `item-cancel:${operationId}`,
+      tenantFilter: req.tenantFilter, userId: req.user._id,
+    });
+    await Order.updateOne({ _id: order._id }, { $set: { 'itemCancellationRefunds.$[refund].inventoryStatus': 'PROCESSED' } }, { arrayFilters: [{ 'refund.operationId': operationId }] });
+  } catch (error) {
+    await Order.updateOne({ _id: order._id }, { $set: { 'itemCancellationRefunds.$[refund].inventoryStatus': 'FAILED', 'itemCancellationRefunds.$[refund].lastError': `Inventory: ${String(error.message || 'restore failed').slice(0, 450)}` } }, { arrayFilters: [{ 'refund.operationId': operationId }] });
+    throw error;
+  }
+  return Order.findById(order._id);
+}
+
+exports.cancelOrderItem = asyncHandler(async (req, res) => {
+  requireObjectId(req.params.id, 'order id');
+  requireObjectId(req.params.itemId, 'order item id');
+  let order = await Order.findOne(andFilter({ _id: req.params.id }, req.tenantFilter));
+  if (!order) throw notFound('Order not found');
+  if (!isOwnerOrAdmin(order, req.user, req)) throw forbidden('Not allowed');
+  const shipment = await require('../models/Shipment').findOne({ order: order._id });
+  if (!canCancelOrder(order, shipment)) throw new ApiError('ORDER_NOT_CANCELLABLE', 'Items cannot be cancelled after courier handover. Use the return workflow after delivery.', { statusCode: 409 });
+  const item = order.orderItems.id?.(req.params.itemId) || order.orderItems.find(entry => String(entry._id) === String(req.params.itemId));
+  if (!item) throw notFound('Order item not found');
+  const available = Math.max(0, Number(item.quantity || 0) - Number(item.cancelledQuantity || 0));
+  const quantity = Number(req.body?.quantity ?? available);
+  if (!Number.isInteger(quantity) || quantity < 1 || quantity > available) throw new ApiError('VALIDATION_ERROR', `Choose a cancellation quantity between 1 and ${available}.`);
+  const reasonCode = requireString(req.body?.reasonCode || req.body?.reason, 'cancellation reason', { max: 80 });
+  const comment = optionalString(req.body?.comment, 'comment', { max: 500 });
+  const operationId = String(req.body?.operationId || crypto.randomUUID()).trim();
+  if (!/^[A-Za-z0-9_-]{10,100}$/.test(operationId)) throw new ApiError('VALIDATION_ERROR', 'A valid cancellation operation ID is required.');
+  const totalActive = order.orderItems.reduce((sum, entry) => sum + Math.max(0, Number(entry.quantity || 0) - Number(entry.cancelledQuantity || 0)), 0);
+  if (quantity === totalActive) {
+    const note = `${req.user.role === 'admin' ? 'Cancelled by admin' : 'Cancelled by customer'}: ${reasonCode}${comment ? `. ${comment}` : ''}`;
+    return res.json(await cancelOrderInternal(order, { req, actor: req.user, note, reasonCode, comment }));
+  }
+  if (order.paymentMethod !== 'COD' && order.paymentStatus !== 'Paid' && !['PAID', 'PARTIALLY_REFUNDED'].includes(order.paymentState)) {
+    throw new ApiError('ORDER_ITEM_CANCELLATION_UNAVAILABLE', 'A pending online payment amount cannot be changed. Cancel the complete order and place it again with the required items.', { statusCode: 409 });
+  }
+
+  const existing = (order.itemCancellationRefunds || []).find(entry => entry.operationId === operationId);
+  if (!existing) {
+    const delivery = require('../services/deliveryService');
+    order = await delivery.withOrderLock(order._id, async fresh => {
+      const freshShipment = await require('../models/Shipment').findOne({ order: fresh._id });
+      if (!canCancelOrder(fresh, freshShipment)) throw new ApiError('ORDER_NOT_CANCELLABLE', 'This parcel is already with the courier.', { statusCode: 409 });
+      if (freshShipment?.awb) await delivery.cancelBooking(fresh);
+      const freshItem = fresh.orderItems.id?.(req.params.itemId) || fresh.orderItems.find(entry => String(entry._id) === String(req.params.itemId));
+      const alreadyCancelled = Number(freshItem?.cancelledQuantity || 0);
+      if (!freshItem || quantity > Number(freshItem.quantity || 0) - alreadyCancelled) throw new ApiError('ORDER_CHANGED', 'The available item quantity changed. Reload before cancelling.', { statusCode: 409 });
+      const settings = returnPolicySettings(fresh, await getStoreSettings(req.tenantFilter || (fresh.storeId ? { storeId: fresh.storeId } : {})));
+      const estimate = refundEstimate(fresh, freshItem, quantity, settings, { isCancellation: true });
+      const amount = Number(estimate.estimatedRefundAmount || 0);
+      const paymentCollected = fresh.paymentMethod !== 'COD' && (fresh.paymentStatus === 'Paid' || ['PAID', 'PARTIALLY_REFUNDED'].includes(fresh.paymentState));
+      const inventoryStatus = fresh.inventoryDeducted ? 'PENDING' : 'NOT_REQUIRED';
+      const refundStatus = paymentCollected && amount > 0 ? 'PENDING' : 'NOT_REQUIRED';
+      const elemMatch = alreadyCancelled === 0 ? { _id: freshItem._id, $or: [{ cancelledQuantity: 0 }, { cancelledQuantity: { $exists: false } }] } : { _id: freshItem._id, cancelledQuantity: alreadyCancelled };
+      const adjustedFinalAmount = Math.max(0, Number(fresh.adjustedFinalAmount ?? fresh.finalAmount ?? 0) - amount);
+      const updated = await Order.findOneAndUpdate(andFilter({ _id: fresh._id, revision: Number(fresh.revision || 0), orderItems: { $elemMatch: elemMatch }, 'itemCancellationRefunds.operationId': { $ne: operationId } }, req.tenantFilter), {
+        $inc: { 'orderItems.$.cancelledQuantity': quantity, cancellationAdjustment: amount, revision: 1 },
+        $set: { adjustedFinalAmount },
+        $push: {
+          'orderItems.$.cancellations': { operationId, quantity, reasonCode, comment, amount, actor: actorSnapshot(req), date: new Date() },
+          itemCancellationRefunds: { operationId, orderItemId: String(freshItem._id), amount, status: refundStatus, inventoryStatus },
+          statusTimeline: { status: 'Item cancelled', date: new Date(), note: `${quantity} × ${freshItem.name || freshItem.productName || 'item'} cancelled: ${reasonCode}` },
+        },
+      }, { new: true });
+      if (!updated) throw new ApiError('ORDER_CHANGED', 'This order changed while the item was being cancelled. Reload and try again.', { statusCode: 409 });
+      return updated;
+    });
+  }
+  if (order.inventoryDeducted) order = await completeItemCancellationInventory(order, operationId, req);
+  order = await processItemCancellationRefund(order._id, operationId);
+  await logAudit({ req, action: 'ORDER_ITEM_CANCEL', entityType: 'Order', entityId: order._id, storeId: order.storeId, after: { orderItemId: req.params.itemId, quantity, reasonCode, operationId, adjustedFinalAmount: order.adjustedFinalAmount } });
+  notifyLater({ userId: order.user, storeId: order.storeId, event: 'ORDER_ITEM_CANCELLED', title: 'Order item cancelled', message: `${quantity} unit(s) were cancelled. Refund status is available in order details.`, metadata: { orderId: String(order._id), orderItemId: String(req.params.itemId), operationId } });
+  res.json(decorateOrder(order));
+});
+
+async function recordManualResolutionRefund(order, { amount, reference, note, sourceType, sourceId }) {
+  const safeReference = requireString(reference, 'manual refund reference', { max: 120 });
+  const safeNote = requireString(note, 'manual refund note', { max: 500 });
+  const refundAmount = Math.round(Number(amount || 0) * 100) / 100;
+  if (!(refundAmount > 0)) throw new ApiError('VALIDATION_ERROR', 'The pending refund does not have a valid amount.');
+  const existing = (order.refunds || []).find(refund => String(refund.providerRefundId || '') === safeReference);
+  if (existing && !(existing.sourceType === sourceType && String(existing.sourceId || '') === String(sourceId))) {
+    throw new ApiError('DUPLICATE_REQUEST', 'This refund reference is already attached to another resolution.', { statusCode: 409 });
+  }
+  const result = existing ? { order, added: false } : await recordProviderRefund({
+    orderId: order._id, refundId: safeReference, amount: refundAmount, note: safeNote,
+    sourceType, sourceId, source: reqSafeSource(sourceType), provider: 'manual',
+  });
+  if (!existing && !result.added) throw new ApiError('PAYMENT_TRANSITION_INVALID', 'This refund would exceed the amount collected for the order. Reload and review the payment history.', { statusCode: 409 });
+  return { order: result.order || order, reference: safeReference, note: safeNote, amount: refundAmount };
+}
+
+function reqSafeSource(sourceType) {
+  return ['CANCELLATION', 'ITEM_CANCELLATION', 'RTO'].includes(sourceType) ? 'MANUAL' : 'SYSTEM';
+}
+
+exports.retryItemCancellationRefund = asyncHandler(async (req, res) => {
+  requireObjectId(req.params.id, 'order id');
+  const operationId = requireString(req.body?.operationId, 'operationId', { max: 100 });
+  const order = await Order.findOne(andFilter({ _id: req.params.id }, req.tenantFilter));
+  if (!order) throw notFound('Order not found');
+  const entry = (order.itemCancellationRefunds || []).find(item => item.operationId === operationId);
+  if (!entry || !['FAILED', 'PENDING', 'MANUAL_REQUIRED'].includes(entry.status)) throw new ApiError('PAYMENT_TRANSITION_INVALID', 'This item refund is not waiting for retry.', { statusCode: 409 });
+  if (entry.status === 'MANUAL_REQUIRED') {
+    const manual = await recordManualResolutionRefund(order, { amount: entry.amount, reference: req.body?.manualReference, note: req.body?.manualNote, sourceType: 'ITEM_CANCELLATION', sourceId: operationId });
+    const updated = await Order.findOneAndUpdate(andFilter({ _id: order._id, itemCancellationRefunds: { $elemMatch: { operationId, status: 'MANUAL_REQUIRED' } } }, req.tenantFilter), { $set: { 'itemCancellationRefunds.$.status': 'PROCESSED', 'itemCancellationRefunds.$.providerRefundId': manual.reference, 'itemCancellationRefunds.$.processedAt': new Date(), 'itemCancellationRefunds.$.lastError': '' }, $unset: { 'itemCancellationRefunds.$.nextCheckAt': 1 } }, { new: true });
+    await logAudit({ req, action: 'ORDER_ITEM_REFUND_RECORDED_MANUALLY', entityType: 'Order', entityId: order._id, storeId: order.storeId, after: { operationId, amount: manual.amount, reference: manual.reference } });
+    notifyLater({ userId: order.user, storeId: order.storeId, event: 'REFUND_PROCESSED', title: 'Cancelled item refund recorded', message: `Your refund of Rs. ${manual.amount.toLocaleString('en-IN')} has been completed.`, metadata: { orderId: String(order._id), operationId, amount: manual.amount } });
+    return res.json(decorateOrder(updated || await Order.findById(order._id)));
+  }
+  const updated = await processItemCancellationRefund(order._id, operationId);
+  await logAudit({ req, action: 'ORDER_ITEM_REFUND_RETRY', entityType: 'Order', entityId: order._id, storeId: order.storeId, after: { operationId, status: updated.itemCancellationRefunds?.find(item => item.operationId === operationId)?.status } });
+  res.json(decorateOrder(updated));
+});
+
+exports.retryCancellationRefund = asyncHandler(async (req, res) => {
+  requireObjectId(req.params.id, 'order id');
+  const order = await Order.findOne(andFilter({ _id: req.params.id }, req.tenantFilter));
+  if (!order) throw notFound('Order not found');
+  if (order.orderStatus !== 'Cancelled') throw new ApiError('ORDER_NOT_CANCELLABLE', 'Only a cancelled order can retry its cancellation refund.', { statusCode: 409 });
+  if (order.cancellationRefund?.status === 'MANUAL_REQUIRED') {
+    const remaining = Math.max(0, Number(order.finalAmount || 0) - Number(order.refundedAmount || 0));
+    const amount = Math.min(remaining, Number(order.cancellationRefund?.amount || remaining));
+    const manual = await recordManualResolutionRefund(order, { amount, reference: req.body?.manualReference, note: req.body?.manualNote, sourceType: 'CANCELLATION', sourceId: order._id });
+    const updated = await Order.findOneAndUpdate(andFilter({ _id: order._id, 'cancellationRefund.status': 'MANUAL_REQUIRED' }, req.tenantFilter), { $set: { 'cancellationRefund.status': 'PROCESSED', 'cancellationRefund.providerRefundId': manual.reference, 'cancellationRefund.amount': manual.amount, 'cancellationRefund.processedAt': new Date(), 'cancellationRefund.lastError': '' }, $unset: { 'cancellationRefund.operation': 1, 'cancellationRefund.operationUntil': 1, 'cancellationRefund.nextCheckAt': 1 } }, { new: true });
+    await logAudit({ req, action: 'CANCELLATION_REFUND_RECORDED_MANUALLY', entityType: 'Order', entityId: order._id, storeId: order.storeId, after: { amount: manual.amount, reference: manual.reference } });
+    notifyLater({ userId: order.user, storeId: order.storeId, event: 'REFUND_PROCESSED', title: 'Cancellation refund recorded', message: `Your refund of Rs. ${manual.amount.toLocaleString('en-IN')} has been completed.`, metadata: { orderId: String(order._id), amount: manual.amount } });
+    return res.json(decorateOrder(updated || await Order.findById(order._id)));
+  }
+  const updated = await processCancellationRefund(order._id);
+  logAudit({ req, action: 'CANCELLATION_REFUND_RETRY', entityType: 'Order', entityId: order._id, storeId: order.storeId, after: { cancellationRefund: updated?.cancellationRefund, paymentStatus: updated?.paymentStatus, refundedAmount: updated?.refundedAmount } });
+  res.json(decorateOrder(updated));
+});
+
+exports.inspectRto = asyncHandler(async (req, res) => {
+  requireObjectId(req.params.id, 'order id');
+  const disposition = requireEnum(req.body?.disposition, ['RESTOCK', 'QUARANTINE', 'DAMAGED', 'MISSING'], 'inventory disposition');
+  const notes = requireString(req.body?.notes, 'inspection notes', { max: 1000 });
+  let order = await Order.findOne(andFilter({ _id: req.params.id }, req.tenantFilter));
+  if (!order) throw notFound('Order not found');
+  if (!['RECEIVED', 'QC_PENDING'].includes(order.rto?.status)) throw new ApiError('ORDER_TRANSITION_INVALID', 'This order is not waiting for an RTO inspection.', { statusCode: 409 });
+  const expectedRevision = assertCurrentRevision(order, req.body?.revision);
+  const items = (order.orderItems || []).map(item => ({
+    product: item.product,
+    variantId: item.variantId,
+    quantity: Math.max(0, Number(item.quantity || 0) - Number(item.cancelledQuantity || 0)),
+  })).filter(item => item.quantity > 0);
+  const expectedQuantity = items.reduce((sum, item) => sum + item.quantity, 0);
+  const receivedQuantity = Number(req.body?.receivedQuantity ?? (disposition === 'MISSING' ? 0 : expectedQuantity));
+  if (!Number.isInteger(receivedQuantity) || receivedQuantity < 0 || receivedQuantity > expectedQuantity) throw new ApiError('VALIDATION_ERROR', `Received quantity must be between 0 and ${expectedQuantity}.`);
+  if (disposition !== 'MISSING' && receivedQuantity !== expectedQuantity) throw new ApiError('VALIDATION_ERROR', 'Inspect each returned unit before completing RTO. Use Missing only when the parcel or all products are unavailable.');
+  const currentSettings = await getStoreSettings(req.tenantFilter || (order.storeId ? { storeId: order.storeId } : {}));
+  const policy = returnPolicySettings(order, currentSettings);
+  const remainingPaidAmount = Math.max(0, Number(order.finalAmount || 0) - Number(order.refundedAmount || 0));
+  const refundDeduction = req.body?.waiveRefundDeduction === true ? 0 : Math.min(remainingPaidAmount, Math.max(0, Number(policy.rtoRefundDeduction || 0)));
+  const rtoRefundAmount = Math.max(0, Math.round((remainingPaidAmount - refundDeduction) * 100) / 100);
+
+  if (disposition !== 'MISSING') {
+    for (let index = 0; index < items.length; index += 1) {
+      const item = items[index];
+      await inventoryService.applyInventoryAdjustment({
+        productId: item.product, variantId: item.variantId, mode: 'ADD',
+        bucket: disposition === 'RESTOCK' ? 'SELLABLE' : disposition,
+        quantity: item.quantity,
+        reasonCode: disposition === 'DAMAGED' ? 'DAMAGED' : 'CUSTOMER_RETURN',
+        reason: `RTO parcel inspected as ${disposition.toLowerCase()}`,
+        note: notes, reference: `RTO ${order._id}`,
+        idempotencyKey: `rto-disposition:${order._id}:${index}:${disposition}`,
+        tenantFilter: req.tenantFilter, userId: req.user._id,
+      });
+    }
+  }
+  const statusForDisposition = { RESTOCK: 'RESTOCKED', QUARANTINE: 'QUARANTINED', DAMAGED: 'DAMAGED', MISSING: 'MISSING' }[disposition];
+  order = await Order.findOneAndUpdate(andFilter({ _id: order._id, 'rto.inventoryRecorded': { $ne: true }, ...revisionFilter(expectedRevision) }, req.tenantFilter), { $set: { 'rto.status': statusForDisposition, 'rto.disposition': disposition, 'rto.receivedQuantity': receivedQuantity, 'rto.inspectedAt': new Date(), 'rto.inventoryRecorded': true, 'rto.inventoryRecordedAt': new Date(), 'rto.notes': notes, 'rto.lastRefundError': '', 'rto.refundAmount': order.paymentMethod === 'COD' ? 0 : rtoRefundAmount, 'rto.refundDeduction': order.paymentMethod === 'COD' ? 0 : refundDeduction, 'rto.refundStatus': order.paymentMethod === 'COD' ? 'NOT_REQUIRED' : 'PENDING', ...(disposition === 'RESTOCK' ? { inventoryRestored: true, inventoryRestoredAt: new Date() } : {}) }, $inc: { revision: 1 }, $push: { statusTimeline: { status: `RTO ${statusForDisposition.toLowerCase()}`, note: notes, date: new Date() } } }, { new: true });
+  if (!order) {
+    const current = await Order.findById(req.params.id);
+    if (current?.rto?.inventoryRecorded) return res.json(decorateOrder(current));
+    throw new ApiError('ORDER_CHANGED', 'This order changed during inspection. Reload it before continuing.', { statusCode: 409 });
+  }
+  await logAudit({ req, action: 'ORDER_RTO_INSPECTED', entityType: 'Order', entityId: order._id, storeId: order.storeId, after: { disposition, receivedQuantity, refundStatus: order.rto?.refundStatus, refundAmount: order.rto?.refundAmount, refundDeduction: order.rto?.refundDeduction }, summary: notes });
+  const resolved = await processRtoRefund(order._id);
+  notifyLater({ userId: order.user, storeId: order.storeId, event: 'ORDER_RTO_INSPECTED', title: 'Returned parcel inspected', message: order.paymentMethod === 'COD' ? 'The returned parcel has been inspected and this order is closed.' : 'The returned parcel has been inspected and your prepaid refund is being handled.', metadata: { orderId: String(order._id) } });
+  res.json(decorateOrder(resolved));
+});
+
+exports.retryRtoRefund = asyncHandler(async (req, res) => {
+  requireObjectId(req.params.id, 'order id');
+  const order = await Order.findOne(andFilter({ _id: req.params.id }, req.tenantFilter));
+  if (!order) throw notFound('Order not found');
+  if (!['FAILED', 'PENDING', 'MANUAL_REQUIRED'].includes(order.rto?.refundStatus)) throw new ApiError('PAYMENT_TRANSITION_INVALID', 'This RTO refund is not waiting for retry.', { statusCode: 409 });
+  if (order.rto?.refundStatus === 'MANUAL_REQUIRED') {
+    const remaining = Math.max(0, Number(order.finalAmount || 0) - Number(order.refundedAmount || 0));
+    const amount = Math.min(remaining, Number(order.rto?.refundAmount ?? remaining));
+    const manual = await recordManualResolutionRefund(order, { amount, reference: req.body?.manualReference, note: req.body?.manualNote, sourceType: 'RTO', sourceId: order._id });
+    const updated = await Order.findOneAndUpdate(andFilter({ _id: order._id, 'rto.refundStatus': 'MANUAL_REQUIRED' }, req.tenantFilter), { $set: { 'rto.refundStatus': 'PROCESSED', 'rto.refundReference': manual.reference, 'rto.status': 'REFUNDED', 'rto.lastRefundError': '' }, $unset: { 'rto.operation': 1, 'rto.operationUntil': 1, 'rto.nextRefundCheckAt': 1 } }, { new: true });
+    await logAudit({ req, action: 'ORDER_RTO_REFUND_RECORDED_MANUALLY', entityType: 'Order', entityId: order._id, storeId: order.storeId, after: { amount: manual.amount, reference: manual.reference } });
+    notifyLater({ userId: order.user, storeId: order.storeId, event: 'REFUND_PROCESSED', title: 'RTO refund recorded', message: `Your refund of Rs. ${manual.amount.toLocaleString('en-IN')} has been completed.`, metadata: { orderId: String(order._id), amount: manual.amount } });
+    return res.json(decorateOrder(updated || await Order.findById(order._id)));
+  }
+  const updated = await processRtoRefund(order._id);
+  await logAudit({ req, action: 'ORDER_RTO_REFUND_RETRY', entityType: 'Order', entityId: order._id, storeId: order.storeId, after: { refundStatus: updated.rto?.refundStatus, refundReference: updated.rto?.refundReference } });
+  res.json(decorateOrder(updated));
 });
 
 /**
@@ -512,18 +777,19 @@ exports.cancelOrder = asyncHandler(async (req, res) => {
  * A parcel that has left the store is handled through RTO/return workflows;
  * cancellation never restores stock after carrier handoff.
  */
-async function cancelOrderInternal(order, { req, actor, note, source, expectedRevision }) {
+async function cancelOrderInternal(order, { req, actor, note, source, reasonCode = 'OTHER', comment = '', expectedRevision }) {
   const delivery = require('../services/deliveryService');
-  return delivery.withOrderLock(order._id, async freshOrder => {
+  const cancelled = await delivery.withOrderLock(order._id, async freshOrder => {
     if (expectedRevision !== undefined && Number(freshOrder.revision || 0) !== Number(expectedRevision)) {
       throw new ApiError('ORDER_CHANGED', 'This order changed in another session. Reload it before continuing.', { statusCode: 409 });
     }
     await delivery.cancelBooking(freshOrder);
-    return cancelAfterCourier(freshOrder, { req, actor, note, source, expectedRevision });
+    return cancelAfterCourier(freshOrder, { req, actor, note, source, reasonCode, comment, expectedRevision });
   });
+  return processCancellationRefund(cancelled._id);
 }
 
-async function cancelAfterCourier(order, { req, actor, note, source, expectedRevision }) {
+async function cancelAfterCourier(order, { req, actor, note, source, reasonCode, comment, expectedRevision }) {
   if (order.orderStatus === 'Cancelled') return order;
 
   const allowed = CANCELLABLE_STATUSES;
@@ -535,7 +801,11 @@ async function cancelAfterCourier(order, { req, actor, note, source, expectedRev
   return runInTransaction(async (session) => {
     const claimed = await inventoryService.claimInventoryRestore(Order, order._id, session);
     if (claimed) {
-      await inventoryService.restoreStockForOrder(claimed.orderItems, {
+      const activeItems = (claimed.orderItems || []).map(item => ({
+        ...(item.toObject ? item.toObject() : item),
+        quantity: Math.max(0, Number(item.quantity || 0) - Number(item.cancelledQuantity || 0)),
+      })).filter(item => item.quantity > 0);
+      await inventoryService.restoreStockForOrder(activeItems, {
         orderId: claimed._id,
         userId: actor?._id,
         type: 'CANCELLATION',
@@ -550,13 +820,28 @@ async function cancelAfterCourier(order, { req, actor, note, source, expectedRev
       { new: true, session },
     );
     if (releaseTarget?.coupon?.code) {
-      await couponService.releaseCoupon(releaseTarget.coupon.code, { session });
+      await couponService.releaseCoupon(releaseTarget.coupon.code, { session, userId: releaseTarget.user, discountAmount: releaseTarget.coupon.savingAmount ?? releaseTarget.coupon.discountAmount, couponId: releaseTarget.coupon.couponId });
     }
 
     const updated = await Order.findOneAndUpdate(
       { _id: order._id, orderStatus: { $ne: 'Cancelled' }, ...(expectedRevision === undefined ? {} : revisionFilter(expectedRevision)) },
       {
-        $set: { orderStatus: 'Cancelled', ...(order.paymentMethod === 'COD' && order.codConfirmationStatus === 'PENDING' ? { codConfirmationStatus: 'CANCELLED' } : {}) },
+        $set: {
+          orderStatus: 'Cancelled',
+          cancellation: {
+            cancelledAt: new Date(),
+            cancelledBy: { id: String(actor?._id || ''), name: String(actor?.name || actor?.phone || 'System').slice(0, 100), role: String(req?.storeMember?.role || actor?.role || 'SYSTEM') },
+            reasonCode: String(reasonCode || 'OTHER').trim().slice(0, 80),
+            comment: String(comment || '').trim().slice(0, 500),
+            source: req?.storeMember ? 'SELLER' : actor?.role === 'admin' ? 'ADMIN' : actor ? 'CUSTOMER' : 'SYSTEM',
+          },
+          ...(order.paymentMethod === 'COD' && order.codConfirmationStatus === 'PENDING' ? { codConfirmationStatus: 'CANCELLED' } : {}),
+          ...(order.paymentMethod !== 'COD' && ['Paid', 'Refunded'].includes(order.paymentStatus) && Number(order.refundedAmount || 0) < Number(order.finalAmount || 0) ? {
+            'cancellationRefund.status': 'PENDING',
+            'cancellationRefund.amount': Math.max(0, Number(order.finalAmount || 0) - Number(order.refundedAmount || 0)),
+            'cancellationRefund.lastError': '',
+          } : {}),
+        },
         $inc: { revision: 1 },
         $push: { statusTimeline: { status: 'Cancelled', date: new Date(), note } },
       },
@@ -626,6 +911,9 @@ async function buildReceipt(order) {
     paymentFailureReason: order.paymentFailureReason,
     refundedAmount: order.refundedAmount || 0,
     refunds: order.refunds || [],
+    cancellationAdjustment: order.cancellationAdjustment || 0,
+    adjustedFinalAmount: order.adjustedFinalAmount,
+    itemCancellationRefunds: order.itemCancellationRefunds || [],
     invoiceNumber: order.invoiceNumber,
     invoiceDate: order.invoiceDate,
     billingAddress: order.billingAddress,

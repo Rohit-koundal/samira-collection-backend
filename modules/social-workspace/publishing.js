@@ -5,6 +5,7 @@ const { defaultStoreFilter } = require('../../services/storeService');
 const { decryptSecret } = require('../../utils/secretBox');
 const meta = require('./meta');
 const media = require('./media');
+const { notifyLater } = require('../../services/notificationService');
 function catalogFilter(store) { return store.isDefault ? defaultStoreFilter(store._id) : { storeId: store._id }; }
 function productImages(product) { return [...new Set([product.primaryImage, ...(product.images || []).map(i => i.url)].filter(Boolean))].slice(0, 20); }
 function productLink(product, store) {
@@ -23,22 +24,37 @@ async function saveDraft(req, res) {
   if (!images.length || images.length > 6 || images.some(url => !allowed.includes(url))) throw meta.fail('Select 1 to 6 photos belonging to this product.');
   const caption = String(req.body.caption ?? `${product.name}\nRs. ${product.price.toLocaleString('en-IN')}\n\n${productLink(product, req.socialStore)}`).trim();
   if (!caption || caption.length > 2200) throw meta.fail('Add a caption of up to 2,200 characters.');
+  const channelCaptions = {};
+  for (const provider of ['instagram', 'facebook']) {
+    const value = String(req.body.channelCaptions?.[provider] ?? caption).trim();
+    if (!value || value.length > 2200) throw meta.fail(`${provider === 'instagram' ? 'Instagram' : 'Facebook'} caption must be between 1 and 2,200 characters.`);
+    channelCaptions[provider] = value;
+  }
+  const campaign = String(req.body.campaign || '').trim().replace(/\s+/g, ' ').slice(0, 80);
   const kind = req.body.kind === 'reel' ? 'reel' : 'photos';
-  const values = { productId: product._id, productName: product.name, productPrice: product.price, productUrl: productLink(product, req.socialStore), images, caption, kind };
+  const values = { productId: product._id, productName: product.name, productPrice: product.price, productUrl: productLink(product, req.socialStore), images, caption, channelCaptions, campaign, kind };
   let draft;
+  let discardedAssets = [];
   if (req.params.id) {
-    draft = await Post.findOne({ _id: req.params.id, storeId: req.socialStore._id, status: 'draft', videoStatus: { $nin: ['queued', 'processing'] } });
+    const versionFilter = req.body.updatedAt ? { updatedAt: new Date(req.body.updatedAt) } : {};
+    draft = await Post.findOne({ _id: req.params.id, storeId: req.socialStore._id, status: 'draft', videoStatus: { $nin: ['queued', 'processing'] }, ...versionFilter });
     if (!draft) throw meta.fail('This post is processing or has already been submitted. Create a new draft to make changes.', 409);
     if (JSON.stringify(draft.images) !== JSON.stringify(images) || String(draft.productId) !== String(product._id) || draft.productName !== product.name || draft.productPrice !== product.price) {
+      discardedAssets = [...(draft.preparedImages || []), draft.videoUrl].filter(Boolean);
       draft.videoUrl = ''; draft.videoStatus = 'none'; draft.preparedImages = [];
     }
     Object.assign(draft, values); await draft.save();
   } else draft = await Post.create({ ...values, storeId: req.socialStore._id, createdBy: req.user._id });
+  if (discardedAssets.length) setImmediate(() => media.removeAssets(discardedAssets));
   res.json({ post: draft });
 }
 async function list(req, res) {
   const page = Math.max(0, Math.min(1000, parseInt(req.query.page, 10) || 0));
-  const rows = await Post.find({ storeId: req.socialStore._id }).sort({ createdAt: -1 }).skip(page * 20).limit(21).lean();
+  const filter = { storeId: req.socialStore._id };
+  if (['draft', 'scheduled', 'queued', 'processing', 'published', 'partial', 'failed', 'review'].includes(req.query.status)) filter.status = req.query.status;
+  if (['photos', 'reel'].includes(req.query.kind)) filter.kind = req.query.kind;
+  if (req.query.campaign) filter.campaign = String(req.query.campaign).slice(0, 80);
+  const rows = await Post.find(filter).sort({ createdAt: -1 }).skip(page * 20).limit(21).lean();
   res.json({ posts: rows.slice(0, 20), hasMore: rows.length > 20 });
 }
 async function get(req, res) {
@@ -63,14 +79,25 @@ async function publish(req, res) {
   if (!ids.length || ids.length > 20) throw meta.fail('Choose at least one connected destination.');
   const accounts = await Connection.find({ _id: { $in: ids }, storeId: req.socialStore._id, status: 'connected' });
   if (accounts.length !== ids.length || accounts.some(a => !meta.capabilities(a).publish || (a.expiresAt && a.expiresAt <= new Date()))) throw meta.fail('Reconnect the selected accounts with publishing permission.');
-  const updated = await Post.findOneAndUpdate({ _id: post._id, status: 'draft', __v: post.__v }, { $set: { status: 'queued', targets: accounts.map(a => ({ connectionId: a._id, provider: a.provider, name: a.name, status: 'queued' })), attempts: 0 }, $inc: { __v: 1 } }, { new: true });
+  let scheduledFor = null;
+  if (req.body.scheduledFor) {
+    scheduledFor = new Date(req.body.scheduledFor);
+    if (!Number.isFinite(scheduledFor.getTime()) || scheduledFor < new Date(Date.now() + 5 * 60000) || scheduledFor > new Date(Date.now() + 90 * 86400000)) throw meta.fail('Schedule the post between 5 minutes and 90 days from now.');
+  }
+  const updated = await Post.findOneAndUpdate({ _id: post._id, status: 'draft', __v: post.__v }, { $set: { status: scheduledFor ? 'scheduled' : 'queued', scheduledFor, scheduledBy: scheduledFor ? req.user._id : null, submittedAt: new Date(), targets: accounts.map(a => ({ connectionId: a._id, provider: a.provider, name: a.name, status: 'queued', caption: post.channelCaptions?.[a.provider] || post.caption })), attempts: 0 }, $inc: { __v: 1 } }, { new: true });
   if (!updated) throw meta.fail('The draft changed. Reload it before publishing.', 409);
-  res.status(202).json({ post: updated }); kick();
+  res.status(202).json({ post: updated }); if (!scheduledFor) kick();
 }
 async function remove(req, res) {
-  const result = await Post.deleteOne({ _id: req.params.id, storeId: req.socialStore._id, status: 'draft', videoStatus: { $nin: ['queued', 'processing'] } });
-  if (!result.deletedCount) throw meta.fail('Only idle drafts can be deleted.', 409);
+  const post = await Post.findOneAndDelete({ _id: req.params.id, storeId: req.socialStore._id, status: 'draft', videoStatus: { $nin: ['queued', 'processing'] } });
+  if (!post) throw meta.fail('Only idle drafts can be deleted.', 409);
+  setImmediate(() => media.removeAssets([...(post.preparedImages || []), post.videoUrl]));
   res.json({ success: true });
+}
+async function cancelSchedule(req, res) {
+  const post = await Post.findOneAndUpdate({ _id: req.params.id, storeId: req.socialStore._id, status: 'scheduled', scheduledFor: { $gt: new Date() }, $or: [{ leaseUntil: null }, { leaseUntil: { $lt: new Date() } }] }, { $set: { status: 'draft', targets: [] }, $unset: { scheduledFor: 1, scheduledBy: 1, submittedAt: 1 } }, { new: true });
+  if (!post) throw meta.fail('This schedule has already started or no longer exists.', 409);
+  res.json({ post });
 }
 async function retry(req, res) {
   const post = await Post.findOne({ _id: req.params.id, storeId: req.socialStore._id, status: { $in: ['failed', 'partial', 'review'] } });
@@ -86,7 +113,8 @@ async function publishTarget(post, target) {
   const account = await Connection.findOne({ _id: target.connectionId, storeId: post.storeId, status: 'connected' }).select('+token');
   if (!account) { await checkpoint(post, target, { status: 'failed', error: 'Reconnect this account before retrying.' }); return; }
   const token = decryptSecret(account.token);
-  const api = (edge, method = 'GET', params = {}) => meta.request(edge, { token, method, params });
+  const api = (edge, method = 'GET', params = {}) => meta.request(edge, { host: account.apiHost || 'graph.facebook.com', token, method, params });
+  const caption = target.caption || post.channelCaptions?.[target.provider] || post.caption;
   // A worker may have stopped after Meta accepted a write. Do not repeat that write.
   if (target.status === 'publishing') { await checkpoint(post, target, { status: 'unknown', error: 'Publishing was interrupted before confirmation. Check this account on Meta before creating another post.' }); return; }
   let accepted = false;
@@ -96,7 +124,7 @@ async function publishTarget(post, target) {
     if (account.provider === 'instagram') {
       if (!target.containerId) {
         if (post.kind === 'reel') {
-          const result = await api(`${account.accountId}/media`, 'POST', { media_type: 'REELS', video_url: post.videoUrl, caption: post.caption, share_to_feed: true });
+          const result = await api(`${account.accountId}/media`, 'POST', { media_type: 'REELS', video_url: post.videoUrl, caption, share_to_feed: true });
           await checkpoint(post, target, { containerId: result.id, status: 'processing', startedAt: new Date() }); return;
         }
         if (post.preparedImages.length > 1) {
@@ -106,7 +134,7 @@ async function publishTarget(post, target) {
           }
           for (const id of target.childIds) { const state = await api(id, 'GET', { fields: 'status_code' }); if (state.status_code !== 'FINISHED') { if (['ERROR', 'EXPIRED'].includes(state.status_code)) throw meta.fail('Instagram could not prepare a carousel photo.'); return; } }
         }
-        const result = await api(`${account.accountId}/media`, 'POST', post.preparedImages.length > 1 ? { media_type: 'CAROUSEL', children: target.childIds.join(','), caption: post.caption } : { image_url: post.preparedImages[0], caption: post.caption });
+        const result = await api(`${account.accountId}/media`, 'POST', post.preparedImages.length > 1 ? { media_type: 'CAROUSEL', children: target.childIds.join(','), caption } : { image_url: post.preparedImages[0], caption });
         await checkpoint(post, target, { containerId: result.id, status: 'processing', startedAt: new Date() }); return;
       }
       const state = await api(target.containerId, 'GET', { fields: 'status_code,status' });
@@ -136,7 +164,7 @@ async function publishTarget(post, target) {
       if (target.status === 'verifying') return;
       if (state.uploading_phase?.status !== 'complete') return;
       await checkpoint(post, target, { status: 'publishing' });
-      const published = await api(`${account.pageId}/video_reels`, 'POST', { upload_phase: 'finish', video_state: 'PUBLISHED', video_id: target.containerId, description: post.caption });
+      const published = await api(`${account.pageId}/video_reels`, 'POST', { upload_phase: 'finish', video_state: 'PUBLISHED', video_id: target.containerId, description: caption });
       if (!published.success) throw Object.assign(meta.fail('Facebook did not confirm the reel.'), { ambiguous: true });
       accepted = true;
       await checkpoint(post, target, { status: 'verifying' });
@@ -146,7 +174,7 @@ async function publishTarget(post, target) {
         if (!image.id) throw meta.fail('Facebook could not prepare a photo.'); target.childIds.push(image.id); await post.save();
       }
       await checkpoint(post, target, { status: 'publishing' });
-      const result = await api(`${account.pageId}/feed`, 'POST', { message: post.caption, attached_media: target.childIds.map(id => ({ media_fbid: id })) });
+      const result = await api(`${account.pageId}/feed`, 'POST', { message: caption, attached_media: target.childIds.map(id => ({ media_fbid: id })) });
       if (!result.id) throw Object.assign(meta.fail('Facebook did not return a publication ID.'), { ambiguous: true });
       accepted = true;
       await checkpoint(post, target, { status: 'published', externalId: result.id, permalink: `https://www.facebook.com/${result.id}` });
@@ -163,7 +191,7 @@ async function tick() {
   const workerId = crypto.randomUUID();
   try {
     await Message.updateMany({ status: 'sending', createdAt: { $lt: new Date(Date.now() - 120000) } }, { $set: { status: 'unknown', error: 'Sending was interrupted. Sync the conversation and check Meta before sending again.' } });
-    const post = await Post.findOneAndUpdate({ $and: [{ $or: [{ status: { $in: ['queued', 'processing'] } }, { status: 'draft', videoStatus: { $in: ['queued', 'processing'] } }] }, { $or: [{ leaseUntil: null }, { leaseUntil: { $lt: new Date() } }] }] }, { $set: { leaseUntil: new Date(Date.now() + 10 * 60000), workerId }, $inc: { attempts: 1 } }, { new: true, sort: { updatedAt: 1 } });
+    const post = await Post.findOneAndUpdate({ $and: [{ $or: [{ status: { $in: ['queued', 'processing'] } }, { status: 'scheduled', scheduledFor: { $lte: new Date() } }, { status: 'draft', videoStatus: { $in: ['queued', 'processing'] } }] }, { $or: [{ leaseUntil: null }, { leaseUntil: { $lt: new Date() } }] }] }, { $set: { leaseUntil: new Date(Date.now() + 10 * 60000), workerId }, $inc: { attempts: 1 } }, { new: true, sort: { scheduledFor: 1, updatedAt: 1 } });
     if (!post) return;
     const heartbeat = setInterval(() => Post.updateOne({ _id: post._id, workerId }, { $set: { leaseUntil: new Date(Date.now() + 10 * 60000) } }).catch(() => {}), 30000); heartbeat.unref();
     try {
@@ -179,15 +207,17 @@ async function tick() {
         const terminal = post.targets.every(t => ['published', 'failed', 'unknown', 'disconnected'].includes(t.status));
         if (terminal) post.status = post.targets.every(t => t.status === 'published') ? 'published' : post.targets.some(t => t.status === 'unknown') ? 'review' : post.targets.some(t => t.status === 'published') ? 'partial' : 'failed';
         await post.save();
+        if (terminal && ['failed', 'partial', 'review'].includes(post.status)) notifyLater({ event: 'SOCIAL_POST_FAILED', adminEvent: 'SOCIAL_POST_FAILED', channels: ['IN_APP'], storeId: post.storeId, metadata: { socialPostId: post._id } });
       }
     } catch (error) {
       if (post.status === 'draft') { post.videoStatus = 'failed'; post.videoError = error.message; }
       else { post.targets.forEach(t => { if (!['published', 'unknown', 'failed', 'disconnected'].includes(t.status)) { t.status = t.status === 'publishing' ? 'unknown' : 'failed'; t.error = error.message; } }); post.status = post.targets.some(t => t.status === 'unknown') ? 'review' : 'failed'; }
       await post.save().catch(() => {});
+      if (post.status !== 'draft') notifyLater({ event: 'SOCIAL_POST_FAILED', adminEvent: 'SOCIAL_POST_FAILED', channels: ['IN_APP'], storeId: post.storeId, metadata: { socialPostId: post._id } });
     } finally { clearInterval(heartbeat); await Post.updateOne({ _id: post._id, workerId }, { $unset: { workerId: 1, leaseUntil: 1 } }); }
   } finally { running = false; }
 }
 function kick() { setImmediate(() => tick().catch(() => {})); }
 function startWorker() { if (!timer) { timer = setInterval(kick, 30000); timer.unref(); kick(); } }
 function stopWorker() { clearInterval(timer); timer = null; }
-module.exports = { products, saveDraft, list, get, generate, publish, remove, retry, publishTarget, tick, startWorker, stopWorker, productImages, productLink };
+module.exports = { products, saveDraft, list, get, generate, publish, cancelSchedule, remove, retry, publishTarget, tick, startWorker, stopWorker, productImages, productLink };

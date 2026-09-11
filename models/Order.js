@@ -33,9 +33,25 @@ const orderSchema = new mongoose.Schema({
     quantity: Number,
     price: Number,
     originalPrice: Number,
+    costPrice: { type: Number, min: 0 },
     discount: Number,
     tax: { type: Number, default: 0 },
     shippingWeightKg: Number,
+    returnable: { type: Boolean, default: true },
+    exchangeable: { type: Boolean, default: true },
+    returnWindowDays: Number,
+    returnPolicy: String,
+    cancelledQuantity: { type: Number, default: 0, min: 0 },
+    cancellations: [{
+      operationId: { type: String, required: true },
+      quantity: { type: Number, min: 1 },
+      reasonCode: String,
+      comment: String,
+      amount: { type: Number, min: 0 },
+      reference: String,
+      actor: { id: String, name: String, role: String },
+      date: { type: Date, default: Date.now },
+    }],
   }],
   shippingAddress: Object,
   shippingQuote: Object,
@@ -45,6 +61,17 @@ const orderSchema = new mongoose.Schema({
   invoiceNumber: String,
   invoiceDate: Date,
   invoiceSeller: { storeName: String, legalBusinessName: String, gstin: String, contactEmail: String, contactPhone: String, whatsappNumber: String, address: String, billingAddress: String, returnPolicy: String, logoUrl: String, invoiceNote: String },
+  returnPolicySnapshot: {
+    capturedAt: Date,
+    returnsEnabled: Boolean,
+    returnWindowDays: Number,
+    refundDeliveryChargeOnFullReturn: Boolean,
+    refundPlatformFeeOnFullReturn: Boolean,
+    refundCodChargeOnFullReturn: Boolean,
+    customerReturnShippingCharge: { type: Number, min: 0 },
+    customerRestockingFeePercent: { type: Number, min: 0, max: 100 },
+    rtoRefundDeduction: { type: Number, min: 0 },
+  },
   shipment: { type: mongoose.Schema.Types.ObjectId, ref: 'Shipment' },
   deliveredAt: Date,
   paymentMethod: { type: String, enum: ['COD', 'UPI', 'CARD', 'Card', 'NETBANKING', 'WALLET', 'Razorpay'], default: 'COD' },
@@ -66,6 +93,18 @@ const orderSchema = new mongoose.Schema({
   razorpayOrderId: String,
   razorpayPaymentId: String,
   paymentFailureReason: String,
+  checkoutAttemptId: { type: String, trim: true, maxlength: 120 },
+  checkoutFingerprint: { type: String, maxlength: 64, select: false },
+  checkoutCartItems: { type: [{
+    cartItemId: String,
+    product: mongoose.Schema.Types.ObjectId,
+    size: String,
+    color: String,
+    variantId: String,
+    quantity: { type: Number, min: 1 },
+  }], select: false },
+  cartCleanupStatus: { type: String, enum: ['NOT_REQUIRED', 'PENDING', 'COMPLETE'], default: 'NOT_REQUIRED' },
+  cartCleanupAt: Date,
   refundedAmount: { type: Number, default: 0, min: 0 },
   refunds: [{
     providerRefundId: { type: String, maxlength: 120 },
@@ -76,7 +115,21 @@ const orderSchema = new mongoose.Schema({
     status: { type: String, enum: ['PROCESSED', 'FAILED'], default: 'PROCESSED' },
     note: { type: String, maxlength: 500 },
     processedAt: Date,
+    sourceType: { type: String, enum: ['RETURN', 'CANCELLATION', 'ITEM_CANCELLATION', 'EXCHANGE_ADJUSTMENT', 'RTO', 'MANUAL'] },
+    sourceId: String,
   }],
+  cancellationRefund: {
+    status: { type: String, enum: ['NOT_REQUIRED', 'PENDING', 'PROCESSING', 'INITIATED', 'PROCESSED', 'FAILED', 'MANUAL_REQUIRED'], default: 'NOT_REQUIRED' },
+    amount: { type: Number, min: 0, default: 0 },
+    providerRefundId: String,
+    attemptedAt: Date,
+    attemptCount: { type: Number, default: 0, min: 0 },
+    nextCheckAt: Date,
+    processedAt: Date,
+    lastError: String,
+    operation: { type: String, select: false },
+    operationUntil: { type: Date, select: false },
+  },
   paymentEvents: { type: [{
     state: String,
     status: String,
@@ -97,6 +150,60 @@ const orderSchema = new mongoose.Schema({
   couponConsumed: { type: Boolean, default: false },
   couponReleased: { type: Boolean, default: false },
 
+  cancellation: {
+    cancelledAt: Date,
+    cancelledBy: { id: String, name: String, role: String },
+    reasonCode: String,
+    comment: String,
+    source: { type: String, enum: ['CUSTOMER', 'ADMIN', 'SELLER', 'SYSTEM'] },
+  },
+  cancellationAdjustment: { type: Number, default: 0, min: 0 },
+  adjustedFinalAmount: { type: Number, min: 0 },
+  itemCancellationRefunds: [{
+    operationId: { type: String, required: true },
+    orderItemId: String,
+    amount: { type: Number, min: 0 },
+    status: { type: String, enum: ['NOT_REQUIRED', 'PENDING', 'PROCESSING', 'INITIATED', 'PROCESSED', 'FAILED', 'MANUAL_REQUIRED'], default: 'NOT_REQUIRED' },
+    inventoryStatus: { type: String, enum: ['NOT_REQUIRED', 'PENDING', 'PROCESSED', 'FAILED'], default: 'NOT_REQUIRED' },
+    providerRefundId: String,
+    attemptCount: { type: Number, default: 0 },
+    attemptedAt: Date,
+    nextCheckAt: Date,
+    processedAt: Date,
+    lastError: String,
+  }],
+  exchangeAdjustments: [{
+    returnRequest: { type: mongoose.Schema.Types.ObjectId, ref: 'ReturnExchange' },
+    type: { type: String, enum: ['COLLECTED', 'CREDITED'], required: true },
+    amount: { type: Number, min: 0, required: true },
+    reference: { type: String, required: true },
+    provider: { type: String, default: 'manual' },
+    processedAt: { type: Date, default: Date.now },
+  }],
+  exchangeAdjustmentCollected: { type: Number, min: 0, default: 0 },
+  rto: {
+    status: { type: String, enum: ['NONE', 'IN_TRANSIT', 'RECEIVED', 'QC_PENDING', 'RESTOCKED', 'QUARANTINED', 'DAMAGED', 'MISSING', 'REFUND_PENDING', 'REFUNDED', 'CLOSED'], default: 'NONE' },
+    reason: String,
+    triggeredAt: Date,
+    receivedAt: Date,
+    inspectedAt: Date,
+    disposition: { type: String, enum: ['PENDING', 'RESTOCK', 'QUARANTINE', 'DAMAGED', 'MISSING'], default: 'PENDING' },
+    receivedQuantity: { type: Number, min: 0 },
+    inventoryRecorded: { type: Boolean, default: false },
+    inventoryRecordedAt: Date,
+    refundStatus: { type: String, enum: ['NOT_REQUIRED', 'PENDING', 'PROCESSING', 'PROCESSED', 'FAILED', 'MANUAL_REQUIRED'], default: 'NOT_REQUIRED' },
+    refundReference: String,
+    refundAmount: { type: Number, min: 0 },
+    refundDeduction: { type: Number, min: 0, default: 0 },
+    refundAttemptCount: { type: Number, default: 0, min: 0 },
+    refundAttemptedAt: Date,
+    nextRefundCheckAt: Date,
+    lastRefundError: String,
+    notes: String,
+    operation: { type: String, select: false },
+    operationUntil: { type: Date, select: false },
+  },
+
   statusTimeline: [{ status: String, date: Date, note: String }],
   adminNotes: String,
   staffNotes: { type: [{
@@ -108,6 +215,8 @@ const orderSchema = new mongoose.Schema({
     source: String,
     campaign: String,
     reelId: String,
+    capturedAt: Date,
+    expiresAt: Date,
   },
   prepaidDiscount: { type: Number, default: 0 },
   codConfirmationStatus: { type: String, enum: ['NOT_REQUIRED', 'PENDING', 'CONFIRMED', 'CANCELLED'], default: 'NOT_REQUIRED' },
@@ -117,6 +226,7 @@ const orderSchema = new mongoose.Schema({
 orderSchema.plugin(storeIdPlugin);
 
 orderSchema.index({ razorpayOrderId: 1 }, { sparse: true });
+orderSchema.index({ user: 1, checkoutAttemptId: 1 }, { unique: true, partialFilterExpression: { checkoutAttemptId: { $type: 'string' } }, name: 'one_order_per_checkout_attempt' });
 orderSchema.index({ user: 1, paymentStatus: 1, createdAt: -1 });
 orderSchema.index({ orderStatus: 1, createdAt: -1 });
 orderSchema.index({ createdAt: -1 });
@@ -124,6 +234,8 @@ orderSchema.index({ storeId: 1, createdAt: -1 });
 orderSchema.index({ storeId: 1, user: 1, createdAt: -1 });
 orderSchema.index({ storeId: 1, orderStatus: 1, createdAt: -1 });
 orderSchema.index({ storeId: 1, paymentStatus: 1, createdAt: -1 });
+orderSchema.index({ storeId: 1, 'coupon.couponId': 1, createdAt: -1 });
+orderSchema.index({ storeId: 1, 'coupon.code': 1, createdAt: -1 });
 orderSchema.index({ invoiceNumber: 1 }, { sparse: true });
 
 module.exports = mongoose.model('Order', orderSchema);

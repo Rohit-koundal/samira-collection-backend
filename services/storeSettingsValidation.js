@@ -9,9 +9,11 @@ const TEXT_LIMITS = {
   cancellationPolicy: 20000, sizeGuide: 20000, faqs: 20000, ourStory: 20000,
 };
 const NUMBERS = ['deliveryCharge', 'freeShippingMinAmount', 'codCharge', 'codMaxAmount', 'codMinAmount',
-  'returnWindowDays', 'prepaidDiscountValue', 'rtoBlockMinOrders', 'rtoBlockThreshold', 'platformFee', 'gstRate', 'minimumOrderAmount'];
+  'returnWindowDays', 'prepaidDiscountValue', 'rtoBlockMinOrders', 'rtoBlockThreshold', 'platformFee', 'gstRate', 'minimumOrderAmount',
+  'customerReturnShippingCharge', 'customerRestockingFeePercent', 'exchangeReservationHours', 'returnSlaHours', 'rtoRefundDeduction'];
 const BOOLEANS = ['brandIdentityEnabled', 'contactDetailsEnabled', 'announcementEnabled', 'acceptingOrders', 'razorpayEnabled', 'upiEnabled',
-  'cardPaymentEnabled', 'netBankingEnabled', 'walletEnabled', 'codEnabled', 'codConfirmationRequired', 'rtoBlockEnabled', 'searchIndexingEnabled'];
+  'cardPaymentEnabled', 'netBankingEnabled', 'walletEnabled', 'codEnabled', 'codConfirmationRequired', 'rtoBlockEnabled', 'searchIndexingEnabled',
+  'returnsEnabled', 'refundDeliveryChargeOnFullReturn', 'refundPlatformFeeOnFullReturn', 'refundCodChargeOnFullReturn'];
 function invalid(message) { throw new ApiError('VALIDATION_ERROR', message); }
 function safeUrl(value, label, image = false) {
   if (!value) return '';
@@ -48,11 +50,15 @@ function normalizeSettingsUpdates(input, current = {}) {
   for (const key of NUMBERS) {
     if (updates[key] === undefined) continue;
     const value = updates[key];
+    if (key === 'returnWindowDays' && value === null) continue;
     if (!['number', 'string'].includes(typeof value) || String(value).trim() === '' || !Number.isFinite(Number(value)) || Number(value) < 0 || Number(value) > 100000000) invalid(`${key} must be zero or a positive number.`);
     updates[key] = Number(value);
   }
-  for (const key of ['returnWindowDays', 'rtoBlockMinOrders']) if (updates[key] !== undefined && !Number.isInteger(updates[key])) invalid(`${key} must be a whole number.`);
-  if (updates.returnWindowDays > 365) invalid('Return window must be between 0 and 365 days.');
+  for (const key of ['returnWindowDays', 'rtoBlockMinOrders', 'exchangeReservationHours', 'returnSlaHours']) if (updates[key] !== undefined && updates[key] !== null && !Number.isInteger(updates[key])) invalid(`${key} must be a whole number.`);
+  if (updates.returnWindowDays !== null && updates.returnWindowDays > 365) invalid('Return window must be between 0 and 365 days.');
+  if (updates.customerRestockingFeePercent > 100) invalid('Restocking fee must be between 0 and 100 percent.');
+  if (updates.exchangeReservationHours !== undefined && (updates.exchangeReservationHours < 1 || updates.exchangeReservationHours > 720)) invalid('Exchange reservation must be between 1 and 720 hours.');
+  if (updates.returnSlaHours !== undefined && (updates.returnSlaHours < 1 || updates.returnSlaHours > 720)) invalid('Return SLA must be between 1 and 720 hours.');
   if (updates.rtoBlockThreshold > 1) invalid('RTO block rate must be between 0 and 1.');
   if (updates.gstRate > 100) invalid('GST rate must be between 0 and 100.');
   if (updates.gstin) {

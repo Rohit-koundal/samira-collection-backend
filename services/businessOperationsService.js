@@ -2,6 +2,7 @@ const mongoose = require('mongoose');
 const AnalyticsEvent = require('../models/AnalyticsEvent');
 const AuditLog = require('../models/AuditLog');
 const Cart = require('../models/Cart');
+const Campaign = require('../models/Campaign');
 const Coupon = require('../models/Coupon');
 const CustomerCrm = require('../models/CustomerCrm');
 const InstagramConnection = require('../models/InstagramConnection');
@@ -21,6 +22,19 @@ const DAY = 24 * 60 * 60 * 1000;
 function scopeFor(store, extra = {}) {
   const tenant = store?.isDefault ? defaultStoreFilter(store._id) : { storeId: store._id };
   return andFilter(extra, tenant);
+}
+
+function activeCouponFilter(now = new Date(), extra = {}) {
+  return andFilter(extra, {
+    isActive: true,
+    isArchived: { $ne: true },
+    $and: [
+      { $or: [{ expiryDate: { $exists: false } }, { expiryDate: null }, { expiryDate: { $gt: now } }] },
+      { $or: [{ validFrom: { $exists: false } }, { validFrom: null }, { validFrom: { $lte: now } }] },
+      { $or: [{ usageLimit: { $exists: false } }, { usageLimit: null }, { usageLimit: 0 }, { $expr: { $lt: [{ $ifNull: ['$usedCount', 0] }, '$usageLimit'] } }] },
+      { $or: [{ totalBudget: { $exists: false } }, { totalBudget: null }, { totalBudget: 0 }, { $expr: { $lt: [{ $ifNull: ['$spentAmount', 0] }, '$totalBudget'] } }] },
+    ],
+  });
 }
 
 function round(value) {
@@ -148,12 +162,7 @@ async function createRecoveryReminder(store, cartId, { channel = 'IN_APP', coupo
   let coupon = null;
   const normalizedCoupon = String(couponCode || '').trim().toUpperCase();
   if (normalizedCoupon) {
-    coupon = await Coupon.findOne(scopeFor(store, {
-      code: normalizedCoupon,
-      isActive: true,
-      expiryDate: { $gt: new Date() },
-      $or: [{ validFrom: { $exists: false } }, { validFrom: null }, { validFrom: { $lte: new Date() } }],
-    })).select('code').lean();
+    coupon = await Coupon.findOne(scopeFor(store, activeCouponFilter(new Date(), { code: normalizedCoupon }))).select('code').lean();
     if (!coupon) throw new ApiError('INVALID_COUPON', 'Choose an active coupon from this store');
   }
 
@@ -236,10 +245,7 @@ async function createCustomerOffer(store, payload = {}) {
   const couponCode = String(payload.couponCode || '').trim().toUpperCase();
   let coupon = null;
   if (couponCode) {
-    coupon = await Coupon.findOne(scopeFor(store, {
-      code: couponCode, isActive: true, expiryDate: { $gt: new Date() },
-      $or: [{ validFrom: { $exists: false } }, { validFrom: null }, { validFrom: { $lte: new Date() } }],
-    })).select('code').lean();
+    coupon = await Coupon.findOne(scopeFor(store, activeCouponFilter(new Date(), { code: couponCode }))).select('code').lean();
     if (!coupon) throw new ApiError('INVALID_COUPON', 'Choose an active coupon from this store');
   }
 
@@ -349,19 +355,33 @@ function emptyOrderPeriod() {
   return { orders: 0, paidRevenue: 0, bookedRevenue: 0, delivered: 0, cancelled: 0, averageOrderValue: 0 };
 }
 
+function orderPayable(order) {
+  return Number(order?.adjustedFinalAmount ?? order?.finalAmount ?? 0);
+}
+
+function orderNetRevenue(order) {
+  const base = String(order?.paymentMethod || '').toUpperCase() === 'COD'
+    ? orderPayable(order)
+    : Number(order?.finalAmount || 0);
+  return Math.max(0, base - Number(order?.refundedAmount || 0));
+}
+
 async function orderPerformance(store, range) {
   const rows = await Order.aggregate([
     { $match: scopeFor(store, { createdAt: { $gte: range.previousStart, $lte: range.end } }) },
     { $project: {
       period: { $cond: [{ $gte: ['$createdAt', range.start] }, 'current', 'previous'] },
-      finalAmount: { $ifNull: ['$finalAmount', 0] }, paymentStatus: 1, orderStatus: 1,
+      finalAmount: { $ifNull: ['$finalAmount', 0] },
+      payableAmount: { $ifNull: ['$adjustedFinalAmount', { $ifNull: ['$finalAmount', 0] }] },
+      collectedBase: { $cond: [{ $eq: ['$paymentMethod', 'COD'] }, { $ifNull: ['$adjustedFinalAmount', { $ifNull: ['$finalAmount', 0] }] }, { $ifNull: ['$finalAmount', 0] }] },
+      refundedAmount: { $ifNull: ['$refundedAmount', 0] }, paymentStatus: 1, orderStatus: 1,
     } },
     { $group: {
       _id: '$period',
       total: { $sum: 1 },
       orders: { $sum: { $cond: [{ $not: [{ $in: ['$orderStatus', ['Cancelled', 'Returned', 'Refunded']] }] }, 1, 0] } },
-      paidRevenue: { $sum: { $cond: [{ $and: [{ $eq: ['$paymentStatus', 'Paid'] }, { $not: [{ $in: ['$orderStatus', ['Cancelled', 'Returned', 'Refunded']] }] }] }, '$finalAmount', 0] } },
-      bookedRevenue: { $sum: { $cond: [{ $not: [{ $in: ['$orderStatus', ['Cancelled', 'Returned', 'Refunded']] }] }, '$finalAmount', 0] } },
+      paidRevenue: { $sum: { $cond: [{ $and: [{ $eq: ['$paymentStatus', 'Paid'] }, { $not: [{ $in: ['$orderStatus', ['Cancelled', 'Returned', 'Refunded']] }] }] }, { $max: [0, { $subtract: ['$collectedBase', '$refundedAmount'] }] }, 0] } },
+      bookedRevenue: { $sum: { $cond: [{ $not: [{ $in: ['$orderStatus', ['Cancelled', 'Returned', 'Refunded']] }] }, '$payableAmount', 0] } },
       delivered: { $sum: { $cond: [{ $eq: ['$orderStatus', 'Delivered'] }, 1, 0] } },
       cancelled: { $sum: { $cond: [{ $eq: ['$orderStatus', 'Cancelled'] }, 1, 0] } },
     } },
@@ -418,7 +438,7 @@ async function recoveryPerformance(store, range) {
   const orders = await Order.find(scopeFor(store, {
     user: { $in: users }, createdAt: { $gte: range.start, $lte: new Date(range.end.getTime() + 7 * DAY) },
     orderStatus: { $nin: ['Cancelled', 'Returned', 'Refunded'] },
-  })).select('user finalAmount createdAt').lean();
+  })).select('user finalAmount adjustedFinalAmount createdAt').lean();
   const recovered = orders.filter((order) => {
     const reminderAt = firstReminder.get(String(order.user || ''));
     const orderedAt = new Date(order.createdAt).getTime();
@@ -428,28 +448,50 @@ async function recoveryPerformance(store, range) {
     remindersSent: reminders.length,
     customersContacted: users.length,
     recoveredOrders: recovered.length,
-    recoveredRevenue: round(recovered.reduce((sum, order) => sum + Number(order.finalAmount || 0), 0)),
+    recoveredRevenue: round(recovered.reduce((sum, order) => sum + orderPayable(order), 0)),
   };
 }
 
 async function campaignPerformance(store, range) {
-  const campaign = store.festivalCampaign || {};
-  const couponCode = String(campaign.couponCode || '').toUpperCase();
-  const campaignKey = String(campaign.campaignKey || campaign.preset || '').toLowerCase();
-  if (!couponCode && !campaignKey) return { orders: 0, revenue: 0, couponUses: 0 };
+  const unified = await Campaign.find(scopeFor(store, { state: { $ne: 'ARCHIVED' } })).select('key offer.code state startsAt endsAt').limit(2000).lean();
+  const legacy = store.festivalCampaign || {};
+  const campaignKeys = new Set(unified.map((campaign) => String(campaign.key || '').toLowerCase()).filter(Boolean));
+  const couponCodes = new Set(unified.map((campaign) => String(campaign.offer?.code || '').toUpperCase()).filter(Boolean));
+  if (!unified.length) {
+    const legacyCode = String(legacy.couponCode || '').toUpperCase();
+    const legacyKey = String(legacy.campaignKey || legacy.preset || '').toLowerCase();
+    if (legacyCode) couponCodes.add(legacyCode);
+    if (legacyKey) campaignKeys.add(legacyKey);
+  }
+  if (!couponCodes.size && !campaignKeys.size) return { campaigns: unified.length, liveCampaigns: 0, orders: 0, revenue: 0, couponUses: 0 };
   const orders = await Order.find(scopeFor(store, {
     createdAt: { $gte: range.start, $lte: range.end },
     orderStatus: { $nin: ['Cancelled', 'Returned', 'Refunded'] },
-  })).select('finalAmount coupon attribution').lean();
+  })).select('finalAmount adjustedFinalAmount refundedAmount paymentMethod paymentStatus orderStatus coupon attribution createdAt').lean();
+  const byKey = new Map(unified.map((campaign) => [String(campaign.key || '').toLowerCase(), campaign]));
+  const byCode = new Map(unified.map((campaign) => [String(campaign.offer?.code || '').toUpperCase(), campaign]).filter(([code]) => code));
   const matched = orders.filter((order) => {
     const orderCoupon = String(order.coupon?.code || '').toUpperCase();
     const attribution = String(order.attribution?.campaign || '').toLowerCase();
-    return (couponCode && orderCoupon === couponCode) || (campaignKey && attribution === campaignKey);
+    if (!unified.length) return couponCodes.has(orderCoupon) || campaignKeys.has(attribution);
+    const campaign = byKey.get(attribution) || byCode.get(orderCoupon);
+    if (!campaign) return false;
+    const orderedAt = new Date(order.createdAt).getTime();
+    const startsAt = campaign.startsAt ? new Date(campaign.startsAt).getTime() : -Infinity;
+    const attributionEndsAt = campaign.endsAt ? new Date(campaign.endsAt).getTime() + (7 * DAY) : Infinity;
+    return orderedAt >= startsAt && orderedAt <= attributionEndsAt;
   });
+  const now = Date.now();
+  const paid = matched.filter((order) => order.paymentStatus === 'Paid'
+    || (String(order.paymentMethod || '').toUpperCase() === 'COD' && order.orderStatus === 'Delivered'));
   return {
+    campaigns: unified.length,
+    liveCampaigns: unified.filter((campaign) => campaign.state === 'PUBLISHED'
+      && (!campaign.startsAt || new Date(campaign.startsAt).getTime() <= now)
+      && (!campaign.endsAt || new Date(campaign.endsAt).getTime() > now)).length,
     orders: matched.length,
-    revenue: round(matched.reduce((sum, order) => sum + Number(order.finalAmount || 0), 0)),
-    couponUses: couponCode ? matched.filter((order) => String(order.coupon?.code || '').toUpperCase() === couponCode).length : 0,
+    revenue: round(paid.reduce((sum, order) => sum + orderNetRevenue(order), 0)),
+    couponUses: matched.filter((order) => couponCodes.has(String(order.coupon?.code || '').toUpperCase())).length,
   };
 }
 
@@ -473,8 +515,8 @@ async function buildBusinessHealth(store, query = {}) {
     ReturnExchange.countDocuments(scopeFor(store, { status: { $in: ['Requested', 'Approved'] } })),
     InstagramConnection.findOne({ storeId: store._id }).select('status username').lean(),
     listAbandonedCarts(store, { page: 1, limit: 1 }),
-    Coupon.find(scopeFor(store, { isActive: true, expiryDate: { $gte: now }, $or: [{ validFrom: { $exists: false } }, { validFrom: null }, { validFrom: { $lte: now } }] })).select('code title type discountValue benefitType expiryDate').sort('expiryDate').limit(50).lean(),
-    Order.find(scopeFor(store, { orderStatus: { $in: ['Pending', 'Confirmed', 'Packed'] } })).select('finalAmount orderStatus').limit(500).lean(),
+    Coupon.find(scopeFor(store, activeCouponFilter(now))).select('code title type discountValue benefitType expiryDate').sort('expiryDate').limit(50).lean(),
+    Order.find(scopeFor(store, { orderStatus: { $in: ['Pending', 'Confirmed', 'Packed'] } })).select('finalAmount adjustedFinalAmount orderStatus').limit(500).lean(),
     funnelPerformance(store, range),
     recoveryPerformance(store, range),
     assistantHistory(store),
@@ -547,7 +589,7 @@ async function answerBusinessQuestion(store, rawQuestion) {
   const now = Date.now();
   const [products, orders, customers, abandoned] = await Promise.all([
     Product.find(scopeFor(store, { isArchived: { $ne: true } })).select('name stock lowStockAlert price isActive').lean(),
-    Order.find(scopeFor(store, { createdAt: { $gte: new Date(now - 60 * DAY) }, orderStatus: { $ne: 'Cancelled' } })).select('orderItems finalAmount paymentStatus createdAt').lean(),
+    Order.find(scopeFor(store, { createdAt: { $gte: new Date(now - 60 * DAY) }, orderStatus: { $ne: 'Cancelled' } })).select('orderItems finalAmount adjustedFinalAmount refundedAmount paymentMethod paymentStatus createdAt').lean(),
     buildCustomerRows(store._id),
     listAbandonedCarts(store, { page: 1, limit: 5 }),
   ]);
@@ -556,11 +598,11 @@ async function answerBusinessQuestion(store, rawQuestion) {
     const time = new Date(order.createdAt).getTime();
     return time < now - 30 * DAY && time >= now - 60 * DAY;
   });
-  const paid = (items) => round(items.filter((order) => order.paymentStatus === 'Paid').reduce((sum, order) => sum + Number(order.finalAmount || 0), 0));
+  const paid = (items) => round(items.filter((order) => order.paymentStatus === 'Paid').reduce((sum, order) => sum + orderNetRevenue(order), 0));
   const sold = new Map();
   last30.forEach((order) => (order.orderItems || []).forEach((line) => {
     const name = line.name || line.productName || 'Product';
-    sold.set(name, (sold.get(name) || 0) + Number(line.quantity || 1));
+    sold.set(name, (sold.get(name) || 0) + Math.max(0, Number(line.quantity || 1) - Number(line.cancelledQuantity || 0)));
   }));
   const ranked = [...sold.entries()].sort((a, b) => b[1] - a[1]);
   const facts = {
@@ -643,10 +685,7 @@ async function updateFestivalCampaign(store, payload = {}) {
   }
   if (startsAt && countdownEndsAt && startsAt >= countdownEndsAt) throw new ApiError('VALIDATION_ERROR', 'Campaign end time must be after its start time');
   if (couponCode) {
-    const coupon = await Coupon.findOne(scopeFor(store, {
-      code: couponCode, isActive: true, expiryDate: { $gt: now },
-      $or: [{ validFrom: { $exists: false } }, { validFrom: null }, { validFrom: { $lte: now } }],
-    })).select('_id').lean();
+    const coupon = await Coupon.findOne(scopeFor(store, activeCouponFilter(now, { code: couponCode }))).select('_id').lean();
     if (!coupon) throw new ApiError('INVALID_COUPON', 'Choose an active coupon from this store');
   }
   store.festivalCampaign = {

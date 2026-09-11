@@ -33,6 +33,20 @@ test('health reports redis without exposing the URL', async () => {
   assert.equal(health.headers.get('x-content-type-options'), 'nosniff');
   assert.equal(health.headers.get('x-frame-options'), 'SAMEORIGIN');
   assert.match(health.headers.get('content-security-policy'), /default-src 'none'/);
+  assert.equal(health.data.checks.tenantIndexes.ready, true);
+});
+
+test('readiness fails while a required tenant index migration is incomplete', async () => {
+  const app = require('../app');
+  app.locals.tenantIndexesReady = false;
+  try {
+    const health = await request('/health');
+    assert.equal(health.status, 503);
+    assert.equal(health.data.ready, false);
+    assert.equal(health.data.checks.tenantIndexes.ready, false);
+  } finally {
+    app.locals.tenantIndexesReady = true;
+  }
 });
 
 test('private APIs are not cached and unconfigured Render origins are not trusted', async () => {

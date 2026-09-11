@@ -5,6 +5,9 @@ const { request, resetDatabase, startTestEnvironment, stopTestEnvironment } = re
 const { createAdmin, createCustomer, createProduct, setSettings, validAddress } = require('./factories');
 const Product = require('../models/Product');
 const Order = require('../models/Order');
+const Review = require('../models/Review');
+const StoreMember = require('../models/StoreMember');
+const { createProvisionedSeller } = require('./accessFixtures');
 
 test.before(startTestEnvironment);
 test.after(stopTestEnvironment);
@@ -217,4 +220,184 @@ test('customers can mark another visible review helpful and toggle it off', asyn
   assert.equal(unmarked.status, 200);
   assert.equal(unmarked.data.helpful, false);
   assert.equal(unmarked.data.helpfulCount, 0);
+});
+
+test('unsafe review content is held for moderation and management responses protect customer data', async () => {
+  const customer = await createCustomer({ name: 'Asha Customer' });
+  const product = await createProduct({ stock: 5 });
+  await deliverProduct(customer.token, product);
+
+  const created = await request(`/api/reviews/${product._id}`, {
+    method: 'POST', token: customer.token,
+    body: {
+      rating: 4,
+      title: 'Lovely fabric',
+      comment: 'The fabric is lovely. Call me on 9876543210.',
+      photos: ['https://media.example.test/review.webp'],
+      aspects: { quality: 5, fit: 4, colorAccuracy: 4 },
+      recommend: true,
+    },
+  });
+  assert.equal(created.status, 201);
+  assert.equal(created.data.moderationStatus, 'PENDING');
+  assert.equal(created.data.isVisible, false);
+  assert.equal(created.data.riskSignals, undefined);
+  assert.deepEqual(created.data.aspects, { quality: 5, fit: 4, colorAccuracy: 4 });
+
+  const publicList = await request(`/api/reviews/${product._id}`);
+  assert.equal(publicList.status, 200);
+  assert.equal(publicList.data.length, 0);
+
+  const admin = await createAdmin();
+  const managed = await request('/api/admin/reviews?page=1&limit=20', { token: admin.token });
+  assert.equal(managed.status, 200);
+  assert.equal(managed.data.items.length, 1);
+  assert.equal(managed.data.items[0].user.name, 'Asha Customer');
+  assert.match(managed.data.items[0].user.phoneMasked, /^X{6}\d{4}$/);
+  assert.equal(managed.data.items[0].user.phone, undefined);
+  assert.equal(managed.data.items[0].user.password, undefined);
+
+  const published = await request(`/api/admin/reviews/management/${created.data._id}/moderation`, {
+    method: 'PATCH', token: admin.token, body: { status: 'PUBLISHED' },
+  });
+  assert.equal(published.status, 200);
+  assert.equal(published.data.isVisible, true);
+
+  const replied = await request(`/api/admin/reviews/management/${created.data._id}/reply`, {
+    method: 'PUT', token: admin.token, body: { body: 'Thank you for sharing your experience.' },
+  });
+  assert.equal(replied.status, 200);
+
+  const updatedReply = await request(`/api/admin/reviews/management/${created.data._id}/reply`, {
+    method: 'PUT', token: admin.token, body: { body: 'Thank you. Our support team can also help with your order.' },
+  });
+  assert.equal(updatedReply.status, 200);
+  const detail = await request(`/api/admin/reviews/management/${created.data._id}`, { token: admin.token });
+  assert.deepEqual(detail.data.merchantReplyHistory.map((item) => item.action), ['PUBLISHED', 'UPDATED']);
+  assert.equal(detail.data.merchantReplyHistory[1].body, 'Thank you. Our support team can also help with your order.');
+
+  const options = await request('/api/admin/reviews/management/options', { token: admin.token });
+  assert.equal(options.status, 200);
+  assert.equal(options.data.some((item) => String(item.id) === String(product._id) && item.reviewCount === 1), true);
+  const filtered = await request(`/api/admin/reviews?verified=true&productId=${product._id}&page=1`, { token: admin.token });
+  assert.equal(filtered.status, 200);
+  assert.deepEqual(filtered.data.items.map((item) => String(item._id)), [String(created.data._id)]);
+  const exported = await request(`/api/admin/reviews/management/export?verified=true&productId=${product._id}`, { token: admin.token });
+  assert.equal(exported.status, 200);
+  assert.deepEqual(exported.data.items.map((item) => String(item._id)), [String(created.data._id)]);
+  const stats = await request('/api/admin/reviews/management/stats', { token: admin.token });
+  assert.equal(stats.status, 200);
+  assert.equal(stats.data.productHealth.some((item) => String(item.productId) === String(product._id) && item.count === 1), true);
+
+  const visible = await request(`/api/reviews/${product._id}`);
+  assert.equal(visible.data.length, 1);
+  assert.equal(visible.data[0].merchantReply.body, 'Thank you. Our support team can also help with your order.');
+  assert.equal(visible.data[0].merchantReply.repliedBy, undefined);
+  assert.equal(visible.data[0].merchantReplyHistory, undefined);
+});
+
+test('customer reports are deduplicated and repeated reports remove a review from the storefront', async () => {
+  const reviewer = await createCustomer();
+  const product = await createProduct({ stock: 5 });
+  await deliverProduct(reviewer.token, product);
+  const created = await request(`/api/reviews/${product._id}`, {
+    method: 'POST', token: reviewer.token, body: { rating: 5, comment: 'Excellent fabric and finish.' },
+  });
+  const reporters = await Promise.all([createCustomer(), createCustomer(), createCustomer()]);
+
+  const first = await request(`/api/reviews/${created.data._id}/report`, {
+    method: 'POST', token: reporters[0].token, body: { reason: 'IRRELEVANT', details: 'This does not describe the product.' },
+  });
+  assert.equal(first.status, 201);
+  const duplicate = await request(`/api/reviews/${created.data._id}/report`, {
+    method: 'POST', token: reporters[0].token, body: { reason: 'SPAM' },
+  });
+  assert.equal(duplicate.status, 409);
+  for (const reporter of reporters.slice(1)) {
+    const result = await request(`/api/reviews/${created.data._id}/report`, {
+      method: 'POST', token: reporter.token, body: { reason: 'SPAM' },
+    });
+    assert.equal(result.status, 201);
+  }
+
+  const hidden = await Review.findById(created.data._id);
+  assert.equal(hidden.reportCount, 3);
+  assert.equal(hidden.moderationStatus, 'PENDING');
+  assert.equal(hidden.isVisible, false);
+  const publicList = await request(`/api/reviews/${product._id}`);
+  assert.equal(publicList.data.length, 0);
+
+  const admin = await createAdmin();
+  const detail = await request(`/api/admin/reviews/management/${created.data._id}`, { token: admin.token });
+  assert.equal(detail.status, 200);
+  assert.equal(detail.data.reports.length, 3);
+  assert.equal(detail.data.reports.some((report) => report.details === 'This does not describe the product.'), true);
+  const reported = await request('/api/admin/reviews?reported=true&page=1', { token: admin.token });
+  assert.deepEqual(reported.data.items.map((item) => String(item._id)), [String(created.data._id)]);
+});
+
+test('review deletion requires archival and an explicit permanent-delete confirmation', async () => {
+  const customer = await createCustomer();
+  const product = await createProduct({ stock: 5 });
+  await deliverProduct(customer.token, product);
+  const created = await request(`/api/reviews/${product._id}`, {
+    method: 'POST', token: customer.token, body: { rating: 3, comment: 'Average fit.' },
+  });
+  const admin = await createAdmin();
+
+  const refused = await request(`/api/admin/reviews/management/${created.data._id}`, { method: 'DELETE', token: admin.token });
+  assert.equal(refused.status, 400);
+  const archived = await request(`/api/admin/reviews/management/${created.data._id}/archive`, {
+    method: 'PATCH', token: admin.token, body: { reason: 'Archived during moderation' },
+  });
+  assert.equal(archived.status, 200);
+  assert.equal(archived.data.moderationStatus, 'ARCHIVED');
+  const removed = await request(`/api/admin/reviews/management/${created.data._id}?confirm=PERMANENTLY_DELETE`, { method: 'DELETE', token: admin.token });
+  assert.equal(removed.status, 200);
+  assert.equal(await Review.exists({ _id: created.data._id }), null);
+});
+
+test('seller review management is isolated to the selected store', async () => {
+  const firstSeller = await createProvisionedSeller('First Review Store');
+  const secondSeller = await createProvisionedSeller('Second Review Store');
+  const customer = await createCustomer({ name: 'Store A Customer' });
+  const product = await createProduct({ storeId: firstSeller.store.id });
+  const review = await Review.create({
+    storeId: firstSeller.store.id,
+    user: customer.user._id,
+    product: product._id,
+    rating: 5,
+    title: 'Store A review',
+    comment: 'Excellent quality.',
+    verifiedPurchase: true,
+    isVisible: true,
+    moderationStatus: 'PUBLISHED',
+  });
+
+  const first = await request('/api/seller/reviews?page=1&limit=20', {
+    token: firstSeller.token, headers: { 'x-store-id': firstSeller.store.id },
+  });
+  assert.equal(first.status, 200);
+  assert.deepEqual(first.data.items.map((item) => String(item._id)), [String(review._id)]);
+  assert.equal(first.data.items[0].user.phone, undefined);
+  const ownerExport = await request('/api/seller/reviews/management/export', {
+    token: firstSeller.token, headers: { 'x-store-id': firstSeller.store.id },
+  });
+  assert.equal(ownerExport.status, 200);
+  assert.deepEqual(ownerExport.data.items.map((item) => String(item._id)), [String(review._id)]);
+
+  await StoreMember.updateOne({ store: secondSeller.store.id, user: secondSeller.user._id }, { $set: { role: 'CATALOG_MANAGER' } });
+  const second = await request('/api/seller/reviews?page=1&limit=20', {
+    token: secondSeller.token, headers: { 'x-store-id': secondSeller.store.id },
+  });
+  assert.equal(second.status, 200);
+  assert.equal(second.data.items.length, 0);
+  const restrictedExport = await request('/api/seller/reviews/management/export', {
+    token: secondSeller.token, headers: { 'x-store-id': secondSeller.store.id },
+  });
+  assert.equal(restrictedExport.status, 403);
+  const blockedDetail = await request(`/api/seller/reviews/management/${review._id}`, {
+    token: secondSeller.token, headers: { 'x-store-id': secondSeller.store.id },
+  });
+  assert.equal(blockedDetail.status, 404);
 });

@@ -4,6 +4,8 @@ const assert = require('node:assert/strict');
 const { request, resetDatabase, startTestEnvironment, stopTestEnvironment } = require('./helpers');
 const { createAdmin, createCoupon, createCustomer, createProduct, setSettings, validAddress } = require('./factories');
 const Coupon = require('../models/Coupon');
+const CouponCustomerUsage = require('../models/CouponCustomerUsage');
+const Order = require('../models/Order');
 const couponService = require('../services/couponService');
 
 test.before(startTestEnvironment);
@@ -397,4 +399,151 @@ test('a per-customer coupon limit is enforced', async () => {
   });
   assert.equal(second.status, 400);
   assert.equal(second.data.code, 'INVALID_COUPON');
+});
+
+test('an automatic free-shipping coupon wins when it saves more than a price coupon', async () => {
+  const { token } = await createCustomer();
+  const product = await createProduct({ price: 500, originalPrice: 500, stock: 5 });
+  await createCoupon({ code: 'AUTO50', activationMode: 'AUTOMATIC', type: 'Flat', discountValue: 50, priority: 1 });
+  await createCoupon({ code: 'SHIPFREE', activationMode: 'AUTOMATIC', benefitType: 'FREE_SHIPPING', type: 'Flat', discountValue: 0 });
+
+  const { status, data } = await request('/api/orders/quote', {
+    method: 'POST', token,
+    body: { orderItems: [{ product: String(product._id), quantity: 1 }], shippingAddress: validAddress(), paymentMethod: 'COD' },
+  });
+  assert.equal(status, 200);
+  assert.equal(data.totals.coupon.code, 'SHIPFREE');
+  assert.equal(data.totals.deliveryCharge, 0);
+  assert.equal(data.totals.coupon.savingAmount, 99);
+});
+
+test('a free-shipping coupon respects its maximum delivery benefit', async () => {
+  const { token } = await createCustomer();
+  const product = await createProduct({ price: 500, originalPrice: 500, stock: 5 });
+  await createCoupon({
+    code: 'SHIPCAP40', activationMode: 'AUTOMATIC', benefitType: 'FREE_SHIPPING',
+    type: 'Flat', discountValue: 0, maxDiscountAmount: 40,
+  });
+
+  const { status, data } = await request('/api/orders/quote', {
+    method: 'POST', token,
+    body: { orderItems: [{ product: String(product._id), quantity: 1 }], shippingAddress: validAddress(), paymentMethod: 'COD' },
+  });
+  assert.equal(status, 200);
+  assert.equal(data.totals.coupon.code, 'SHIPCAP40');
+  assert.equal(data.totals.deliveryCharge, 59);
+  assert.equal(data.totals.coupon.savingAmount, 40);
+});
+
+test('coupon budget and per-customer limits remain atomic during concurrent checkout reservations', async () => {
+  const { user } = await createCustomer();
+  await CouponCustomerUsage.init();
+  const customerCoupon = await createCoupon({ code: 'ONCEONLY', customerLimit: 1 });
+  const customerAttempts = await Promise.allSettled([
+    couponService.consumeCoupon(customerCoupon.code, { userId: user._id }),
+    couponService.consumeCoupon(customerCoupon.code, { userId: user._id }),
+    couponService.consumeCoupon(customerCoupon.code, { userId: user._id }),
+  ]);
+  assert.equal(customerAttempts.filter((entry) => entry.status === 'fulfilled').length, 1);
+  assert.equal((await Coupon.findById(customerCoupon._id)).usedCount, 1);
+
+  const budgetCoupon = await createCoupon({ code: 'BUDGET100', totalBudget: 100 });
+  const budgetAttempts = await Promise.allSettled([
+    couponService.consumeCoupon(budgetCoupon.code, { discountAmount: 70 }),
+    couponService.consumeCoupon(budgetCoupon.code, { discountAmount: 70 }),
+  ]);
+  assert.equal(budgetAttempts.filter((entry) => entry.status === 'fulfilled').length, 1);
+  const stored = await Coupon.findById(budgetCoupon._id);
+  assert.equal(stored.usedCount, 1);
+  assert.equal(stored.spentAmount, 70);
+});
+
+test('a redeemed coupon keeps an immutable code and releases by permanent coupon id', async () => {
+  const { token } = await createAdmin();
+  const coupon = await createCoupon({ code: 'PERMANENT10', usedCount: 1 });
+  const edit = await request(`/api/admin/coupons/${coupon._id}`, {
+    method: 'PUT', token, body: { code: 'RENAMED10' },
+  });
+  assert.equal(edit.status, 400);
+  assert.equal((await Coupon.findById(coupon._id)).code, 'PERMANENT10');
+
+  coupon.code = 'INTERNALCHANGE';
+  await coupon.save();
+  await couponService.releaseCoupon('PERMANENT10', { couponId: coupon._id });
+  assert.equal((await Coupon.findById(coupon._id)).usedCount, 0);
+});
+
+test('exclusive coupons skip discounted product lines while stackable coupons include them', () => {
+  const items = [{ product: 'one', price: 800, originalPrice: 1000, quantity: 1, lineTotal: 800 }];
+  assert.throws(() => couponService.calculateDiscount({ benefitType: 'DISCOUNT', type: 'Percentage', discountValue: 10, stackingMode: 'EXCLUSIVE' }, 800, items), /cannot be combined/i);
+  assert.equal(couponService.calculateDiscount({ benefitType: 'DISCOUNT', type: 'Percentage', discountValue: 10, stackingMode: 'ALLOW_PRODUCT_OFFERS' }, 800, items), 80);
+});
+
+test('product and category targeting supports explicit any or all matching', () => {
+  const items = [{ product: 'product-a', category: 'category-b', price: 500, originalPrice: 500, quantity: 1, lineTotal: 500 }];
+  const base = { benefitType: 'DISCOUNT', type: 'Flat', discountValue: 100, applicableProducts: ['product-a'], applicableCategories: ['category-a'], stackingMode: 'ALLOW_PRODUCT_OFFERS' };
+  assert.equal(couponService.calculateDiscount({ ...base, scopeMatchMode: 'ANY' }, 500, items), 100);
+  assert.throws(() => couponService.calculateDiscount({ ...base, scopeMatchMode: 'ALL' }, 500, items), /does not apply/i);
+});
+
+test('coupon preview refuses a saving larger than the remaining campaign budget', async () => {
+  const coupon = await createCoupon({ code: 'NEARLIMIT', type: 'Flat', discountValue: 100, totalBudget: 500, spentAmount: 450 });
+  const { status, data } = await request('/api/coupons/apply', { method: 'POST', body: { code: coupon.code, cartTotal: 1000 } });
+  assert.equal(status, 400);
+  assert.match(data.message, /enough campaign budget/i);
+});
+
+test('coupon administration paginates the full catalogue and returns global statistics', async () => {
+  const { token } = await createAdmin();
+  const expiryDate = new Date(Date.now() + 7 * 86400000);
+  await Coupon.insertMany(Array.from({ length: 105 }, (_, index) => ({ code: `PAGE${String(index).padStart(3, '0')}`, type: 'Flat', discountValue: 10, expiryDate, isActive: true })));
+  const list = await request('/api/admin/coupons?admin=true&page=1&limit=24', { token });
+  assert.equal(list.status, 200);
+  assert.equal(list.data.items.length, 24);
+  assert.equal(list.data.total, 105);
+  assert.equal(list.data.totalPages, 5);
+  const stats = await request('/api/admin/coupons/stats', { token });
+  assert.equal(stats.status, 200);
+  assert.equal(stats.data.total, 105);
+  assert.equal(stats.data.live, 105);
+});
+
+test('full refunds restore coupon capacity only when the coupon policy allows it', async () => {
+  const { user } = await createCustomer();
+  const coupon = await createCoupon({ code: 'REFUNDABLE', restoreOnFullRefund: true });
+  await couponService.consumeCoupon(coupon.code, { couponId: coupon._id, userId: user._id, discountAmount: 100 });
+  const order = await Order.create({
+    user: user._id, orderItems: [], shippingAddress: validAddress(), paymentStatus: 'Refunded', paymentState: 'REFUNDED', orderStatus: 'Refunded',
+    coupon: { couponId: coupon._id, code: coupon.code, savingAmount: 100, restoreOnFullRefund: true }, couponConsumed: true, finalAmount: 900,
+  });
+  assert.equal(await couponService.releaseCouponForFullyRefundedOrder(order._id), true);
+  assert.equal((await Coupon.findById(coupon._id)).usedCount, 0);
+  assert.equal((await Coupon.findById(coupon._id)).spentAmount, 0);
+  assert.equal((await Order.findById(order._id)).couponReleased, true);
+  assert.equal(await couponService.releaseCouponForFullyRefundedOrder(order._id), false, 'retries do not release twice');
+});
+
+test('coupon details expose performance, simulation and code availability to admins', async () => {
+  const { token } = await createAdmin();
+  const { user } = await createCustomer();
+  const coupon = await createCoupon({ code: 'INSIGHT10' });
+  await Order.create({
+    user: user._id, orderItems: [], shippingAddress: validAddress(), paymentStatus: 'Paid', paymentState: 'PAID', orderStatus: 'Delivered',
+    coupon: { couponId: coupon._id, code: coupon.code, savingAmount: 100 }, couponDiscount: 100, couponConsumed: true, finalAmount: 900,
+  });
+  const insights = await request(`/api/admin/coupons/${coupon._id}/insights?days=30`, { token });
+  assert.equal(insights.status, 200);
+  assert.equal(insights.data.summary.orders, 1);
+  assert.equal(insights.data.summary.paidRevenue, 900);
+  assert.equal(insights.data.recentOrders[0].customer.name, user.name);
+
+  const simulation = await request(`/api/admin/coupons/${coupon._id}/simulate`, { method: 'POST', token, body: { cartTotal: 1000 } });
+  assert.equal(simulation.status, 200);
+  assert.equal(simulation.data.eligible, true);
+  assert.equal(simulation.data.effectiveSaving, 100);
+
+  const unavailable = await request('/api/admin/coupons/code-availability?code=INSIGHT10', { token });
+  const available = await request('/api/admin/coupons/code-availability?code=NEWCODE10', { token });
+  assert.equal(unavailable.data.available, false);
+  assert.equal(available.data.available, true);
 });

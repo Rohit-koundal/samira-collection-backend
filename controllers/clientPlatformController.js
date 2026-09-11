@@ -10,7 +10,7 @@ function credentials(req) {
 
 exports.validate = asyncHandler(async (req, res) => {
   res.setHeader('Cache-Control', 'no-store');
-  res.json(await service.validateInstallation({ ...credentials(req), appVersion: req.body?.appVersion, telemetry: req.body?.telemetry, ip: req.ip }));
+  res.json(await service.validateInstallation({ ...credentials(req), appVersion: req.body?.appVersion, protocolVersion: req.body?.protocolVersion, telemetry: req.body?.telemetry, ip: req.ip }));
 });
 
 exports.checkout = asyncHandler(async (req, res) => {

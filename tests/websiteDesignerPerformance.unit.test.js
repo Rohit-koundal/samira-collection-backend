@@ -11,6 +11,7 @@ test('designer catalog options project only labels and IDs while keeping tenant 
   const query = {
     select(fields) { projection = fields; return this; },
     sort() { return this; },
+    limit(value) { assert.equal(value, 250); return this; },
     lean: async () => items,
   };
   t.mock.method(Product, 'find', (input) => { filter = input; return query; });

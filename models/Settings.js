@@ -61,6 +61,14 @@ const settingsSchema = new mongoose.Schema({
   invoicePrefix: { type: String, default: 'SC' },
   billingAddress: String,
   returnWindowDays: { type: Number, default: 7 },
+  returnsEnabled: { type: Boolean, default: true },
+  refundDeliveryChargeOnFullReturn: { type: Boolean, default: false },
+  refundPlatformFeeOnFullReturn: { type: Boolean, default: false },
+  refundCodChargeOnFullReturn: { type: Boolean, default: false },
+  customerReturnShippingCharge: { type: Number, default: 0, min: 0 },
+  customerRestockingFeePercent: { type: Number, default: 0, min: 0, max: 100 },
+  exchangeReservationHours: { type: Number, default: 168, min: 1, max: 720 },
+  returnSlaHours: { type: Number, default: 24, min: 1, max: 720 },
   appLinks: Object,
   storeId: { type: mongoose.Schema.Types.ObjectId, ref: 'Store', index: true },
   codMinAmount: { type: Number, default: 0 },
@@ -71,6 +79,7 @@ const settingsSchema = new mongoose.Schema({
   rtoBlockEnabled: { type: Boolean, default: false },
   rtoBlockMinOrders: { type: Number, default: 0 },
   rtoBlockThreshold: { type: Number, default: 0 },
+  rtoRefundDeduction: { type: Number, default: 0, min: 0 },
 }, { timestamps: true });
 
 module.exports = mongoose.model('Settings', settingsSchema);

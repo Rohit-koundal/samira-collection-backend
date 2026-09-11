@@ -19,6 +19,11 @@ router.put('/:id/shipping-address', protect, adminOnly, order.updateShippingAddr
 router.put('/:id/shipment', protect, adminOnly, order.updateShipment);
 router.delete('/:id', protect, adminOnly, order.deleteOrder);
 router.post('/:id/cancel', protect, order.cancelOrder);
+router.post('/:id/items/:itemId/cancel', protect, order.cancelOrderItem);
+router.post('/:id/cancellation-refund', protect, adminOnly, order.retryCancellationRefund);
+router.post('/:id/item-cancellation-refund', protect, adminOnly, order.retryItemCancellationRefund);
+router.post('/:id/rto/inspect', protect, adminOnly, order.inspectRto);
+router.post('/:id/rto/refund', protect, adminOnly, order.retryRtoRefund);
 router.get('/my-orders', protect, order.myOrders);
 router.get('/admin/all', protect, adminOnly, order.adminOrders);
 router.get('/admin/workspace-summary', protect, adminOnly, order.orderWorkspaceSummary);

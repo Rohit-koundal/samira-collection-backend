@@ -3,10 +3,12 @@ const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
 
 const { request, resetDatabase, startTestEnvironment, stopTestEnvironment, getBaseUrl } = require('./helpers');
-const { createCustomer, createProduct, setSettings, validAddress } = require('./factories');
+const { createAdmin, createCustomer, createProduct, setSettings, validAddress } = require('./factories');
 const Order = require('../models/Order');
 const Product = require('../models/Product');
 const InventoryTransaction = require('../models/InventoryTransaction');
+const ReturnExchange = require('../models/ReturnExchange');
+const AnalyticsEvent = require('../models/AnalyticsEvent');
 const { verifyRazorpaySignature } = require('../utils/paymentUtils');
 
 const KEY_SECRET = 'test_razorpay_secret';
@@ -253,6 +255,27 @@ test('a redelivered webhook is idempotent', async () => {
   assert.equal((await InventoryTransaction.find({ order: pending._id, type: 'SALE' })).length, 1);
 });
 
+test('a fast refund webhook completes its return even before the refund reference was saved', async () => {
+  const { user } = await createCustomer();
+  const product = await createProduct({ stock: 5, price: 1000 });
+  const order = await seedPendingOrder(user, product, { paymentStatus: 'Paid', paymentState: 'PAID', orderStatus: 'Return Requested', razorpayPaymentId: 'pay_fast_refund' });
+  const requestRow = await ReturnExchange.create({
+    order: order._id, product: product._id, user: user._id, orderItemId: String(order.orderItems[0]._id),
+    quantity: 1, type: 'return', reason: 'Changed mind', status: 'Refund Initiated',
+    financial: { estimatedRefundAmount: 1000, approvedRefundAmount: 1000, refundStatus: 'INITIATED' },
+  });
+  const response = await postWebhook({ event: 'refund.processed', payload: { refund: { entity: {
+    id: 'rfnd_fast_return', payment_id: 'pay_fast_refund', amount: 100000, currency: 'INR',
+    notes: { orderId: String(order._id), returnId: String(requestRow._id) },
+  } } } });
+  assert.equal(response.status, 200);
+  const completed = await ReturnExchange.findById(requestRow._id);
+  assert.equal(completed.status, 'Refunded');
+  assert.equal(completed.financial.refundReference, 'rfnd_fast_return');
+  assert.equal(completed.financial.refundStatus, 'PROCESSED');
+  assert.equal((await Order.findById(order._id)).refundedAmount, 1000);
+});
+
 test('a webhook for an unknown order is acknowledged without creating anything', async () => {
   const { status } = await postWebhook({
     event: 'payment.captured',
@@ -367,6 +390,122 @@ test('creating a Razorpay order reserves stock immediately', async () => {
     assert.equal(data.totals.finalAmount, 1000);
     assert.equal((await Product.findById(product._id)).stock, 4);
     assert.equal((await Order.findById(data.orderId)).paymentStatus, 'Pending');
+  });
+});
+
+test('a repeated online checkout attempt reuses one order and one stock reservation', async () => {
+  await withMockRazorpay(async () => {
+    const { token } = await createCustomer();
+    const product = await createProduct({ stock: 5, price: 1000 });
+    const body = onlineOrderBody(product, { checkoutAttemptId: 'checkout_same_online_001' });
+    const [first, second] = await Promise.all([
+      request('/api/payments/create-order', { method: 'POST', token, body }),
+      request('/api/payments/create-order', { method: 'POST', token, body }),
+    ]);
+    assert.equal(first.status, 200, JSON.stringify(first.data));
+    assert.equal(second.status, 200, JSON.stringify(second.data));
+    assert.equal(String(first.data.orderId), String(second.data.orderId));
+    assert.equal(first.data.razorpayOrderId, second.data.razorpayOrderId);
+    assert.equal(await Order.countDocuments(), 1);
+    assert.equal((await Product.findById(product._id)).stock, 4);
+  });
+});
+
+test('cancelling a paid Razorpay order automatically records its refund once', async () => {
+  await withMockRazorpay(async () => {
+    const { token } = await createCustomer();
+    const product = await createProduct({ stock: 5, price: 1000 });
+    const created = await request('/api/payments/create-order', { method: 'POST', token, body: onlineOrderBody(product) });
+    const paymentId = 'pay_cancel_refund';
+    await request('/api/payments/verify', { method: 'POST', token, body: {
+      razorpay_order_id: created.data.razorpayOrderId, razorpay_payment_id: paymentId,
+      razorpay_signature: sign(created.data.razorpayOrderId, paymentId),
+    } });
+    const cancelled = await request(`/api/orders/${created.data.orderId}/cancel`, { method: 'POST', token, body: { reason: 'Changed my mind' } });
+    assert.equal(cancelled.status, 200, JSON.stringify(cancelled.data));
+    assert.equal(cancelled.data.orderStatus, 'Cancelled');
+    assert.equal(cancelled.data.paymentStatus, 'Refunded');
+    assert.equal(cancelled.data.cancellationRefund.status, 'PROCESSED');
+    assert.equal(cancelled.data.refundedAmount, cancelled.data.finalAmount);
+    assert.equal(cancelled.data.refunds.filter(refund => refund.sourceType === 'CANCELLATION').length, 1);
+    await request(`/api/orders/${created.data.orderId}/cancel`, { method: 'POST', token, body: { reason: 'Retry' } });
+    assert.equal((await Order.findById(created.data.orderId)).refunds.length, 1);
+  });
+});
+
+test('a cancellation refund from an unavailable legacy gateway can be recorded manually once', async () => {
+  let created;
+  const { token } = await createCustomer();
+  const product = await createProduct({ stock: 5, price: 1000 });
+  await withMockRazorpay(async () => {
+    created = await request('/api/payments/create-order', { method: 'POST', token, body: onlineOrderBody(product) });
+    const paymentId = 'pay_manual_cancel_refund';
+    const verified = await request('/api/payments/verify', { method: 'POST', token, body: {
+      razorpay_order_id: created.data.razorpayOrderId, razorpay_payment_id: paymentId,
+      razorpay_signature: sign(created.data.razorpayOrderId, paymentId),
+    } });
+    assert.equal(verified.status, 200, JSON.stringify(verified.data));
+  });
+  await Order.updateOne({ _id: created.data.orderId }, { $set: { paymentProvider: 'legacy_gateway' } });
+  const cancelled = await request(`/api/orders/${created.data.orderId}/cancel`, { method: 'POST', token, body: { reason: 'Changed my mind' } });
+  assert.equal(cancelled.status, 200, JSON.stringify(cancelled.data));
+  assert.equal(cancelled.data.cancellationRefund.status, 'MANUAL_REQUIRED');
+  const { token: adminToken } = await createAdmin();
+  const recorded = await request(`/api/admin/orders/${created.data.orderId}/cancellation-refund`, { method: 'POST', token: adminToken, body: { manualReference: 'upi-cancel-001', manualNote: 'Refunded through the store UPI account.' } });
+  assert.equal(recorded.status, 200, JSON.stringify(recorded.data));
+  assert.equal(recorded.data.cancellationRefund.status, 'PROCESSED');
+  assert.equal(recorded.data.refunds.filter(refund => refund.providerRefundId === 'upi-cancel-001').length, 1);
+  assert.equal(recorded.data.refunds.find(refund => refund.providerRefundId === 'upi-cancel-001').provider, 'manual');
+  const repeated = await request(`/api/admin/orders/${created.data.orderId}/cancellation-refund`, { method: 'POST', token: adminToken, body: { manualReference: 'upi-cancel-001', manualNote: 'Repeated callback.' } });
+  assert.equal(repeated.status, 200);
+  assert.equal((await Order.findById(created.data.orderId)).refunds.filter(refund => refund.providerRefundId === 'upi-cancel-001').length, 1);
+});
+
+test('a payment captured after customer cancellation stays cancelled and is refunded once', async () => {
+  await withMockRazorpay(async () => {
+    const { token } = await createCustomer();
+    const product = await createProduct({ stock: 5, price: 1000 });
+    const created = await request('/api/payments/create-order', { method: 'POST', token, body: onlineOrderBody(product) });
+    assert.equal((await Product.findById(product._id)).stock, 4);
+
+    const cancelled = await request(`/api/orders/${created.data.orderId}/cancel`, { method: 'POST', token, body: { reason: 'Changed my mind' } });
+    assert.equal(cancelled.status, 200, JSON.stringify(cancelled.data));
+    assert.equal(cancelled.data.orderStatus, 'Cancelled');
+    assert.equal(cancelled.data.paymentStatus, 'Pending');
+    assert.equal((await Product.findById(product._id)).stock, 5);
+
+    const paymentId = 'pay_captured_after_cancel';
+    const verification = await request('/api/payments/verify', { method: 'POST', token, body: {
+      razorpay_order_id: created.data.razorpayOrderId,
+      razorpay_payment_id: paymentId,
+      razorpay_signature: sign(created.data.razorpayOrderId, paymentId),
+    } });
+    assert.equal(verification.status, 200, JSON.stringify(verification.data));
+    assert.equal(verification.data.order.orderStatus, 'Cancelled');
+    assert.equal(verification.data.order.paymentStatus, 'Refunded');
+    assert.equal(verification.data.order.cancellationRefund.status, 'PROCESSED');
+    assert.equal(verification.data.order.refunds.filter(refund => refund.sourceType === 'CANCELLATION').length, 1);
+    assert.equal((await Product.findById(product._id)).stock, 5, 'late payment must not reserve restored stock again');
+
+    const repeated = await request('/api/payments/verify', { method: 'POST', token, body: {
+      razorpay_order_id: created.data.razorpayOrderId,
+      razorpay_payment_id: paymentId,
+      razorpay_signature: sign(created.data.razorpayOrderId, paymentId),
+    } });
+    assert.equal(repeated.status, 200);
+    assert.equal((await Order.findById(created.data.orderId)).refunds.length, 1);
+    assert.equal((await Product.findById(product._id)).stock, 5);
+
+    const delayedFailure = await request('/api/payments/failure', {
+      method: 'POST', token, body: { razorpayOrderId: created.data.razorpayOrderId, reason: 'Delayed provider failure callback' },
+    });
+    assert.equal(delayedFailure.status, 409);
+    assert.equal((await Order.findById(created.data.orderId)).paymentStatus, 'Refunded', 'a delayed failure must not overwrite a completed refund');
+    await new Promise(setImmediate);
+    assert.equal(await AnalyticsEvent.countDocuments({
+      orderId: created.data.orderId,
+      name: { $in: ['PAYMENT_SUCCESS', 'PURCHASE'] },
+    }), 0, 'a cancelled and refunded payment must not count as a successful conversion');
   });
 });
 

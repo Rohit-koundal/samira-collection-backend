@@ -9,6 +9,8 @@ const Coupon = require('../models/Coupon');
 const InventoryTransaction = require('../models/InventoryTransaction');
 const ReturnExchange = require('../models/ReturnExchange');
 const Shipment = require('../models/Shipment');
+const Cart = require('../models/Cart');
+const { retryPendingCartCleanup } = require('../services/checkoutSafetyService');
 
 test.before(startTestEnvironment);
 test.after(stopTestEnvironment);
@@ -65,6 +67,72 @@ test('placing a COD order deducts stock exactly once and writes a ledger entry',
   assert.equal(ledger[0].type, 'SALE');
   assert.equal(ledger[0].quantity, -1);
   assert.equal(ledger[0].stockAfter, 4);
+});
+
+test('a repeated COD checkout attempt creates one order and deducts stock once', async () => {
+  const { token } = await createCustomer();
+  const product = await createProduct({ stock: 5 });
+  const body = codOrderBody(product, { checkoutAttemptId: 'checkout_same_cod_001' });
+  const results = await Promise.all([
+    request('/api/orders/cod', { method: 'POST', token, body }),
+    request('/api/orders/cod', { method: 'POST', token, body }),
+  ]);
+  assert.ok(results.every(result => [200, 201].includes(result.status)), JSON.stringify(results));
+  assert.equal(String(results[0].data._id), String(results[1].data._id));
+  assert.equal(await Order.countDocuments(), 1);
+  assert.equal((await Product.findById(product._id)).stock, 4);
+});
+
+test('the generic order endpoint cannot bypass online payment creation', async () => {
+  const { token } = await createCustomer();
+  const product = await createProduct({ stock: 5 });
+  const result = await request('/api/orders', { method: 'POST', token, body: codOrderBody(product, { paymentMethod: 'UPI' }) });
+  assert.equal(result.status, 400);
+  assert.equal(result.data.code, 'PAYMENT_METHOD_UNAVAILABLE');
+  assert.equal(await Order.countDocuments(), 0);
+  assert.equal((await Product.findById(product._id)).stock, 5);
+});
+
+test('successful COD checkout consumes only the purchased server cart line', async () => {
+  const { token } = await createCustomer();
+  const purchased = await createProduct({ stock: 5 });
+  const saved = await createProduct({ stock: 5 });
+  const first = await request('/api/cart', { method: 'POST', token, body: { product: String(purchased._id), quantity: 1, size: 'M', color: 'Red' } });
+  await request('/api/cart', { method: 'POST', token, body: { product: String(saved._id), quantity: 1, size: 'M', color: 'Red' } });
+  const line = first.data.items.find(item => String(item.productId) === String(purchased._id));
+  const placed = await request('/api/orders/cod', { method: 'POST', token, body: codOrderBody(purchased, {
+    checkoutAttemptId: 'checkout_cart_cleanup_001',
+    cartItems: [{ cartItemId: line._id, product: String(purchased._id), size: 'M', color: 'Red', quantity: 1 }],
+  }) });
+  assert.equal(placed.status, 201, JSON.stringify(placed.data));
+  const cart = await request('/api/cart', { token });
+  assert.equal(cart.data.items.length, 1);
+  assert.equal(String(cart.data.items[0].productId), String(saved._id));
+});
+
+test('pending server cart cleanup is retried without consuming the same checkout twice', async () => {
+  const { token } = await createCustomer();
+  const product = await createProduct({ stock: 5 });
+  const initial = await request('/api/cart', { method: 'POST', token, body: { product: String(product._id), quantity: 2, size: 'M', color: 'Red' } });
+  const line = initial.data.items.find(item => String(item.productId) === String(product._id));
+  const placed = await request('/api/orders/cod', { method: 'POST', token, body: codOrderBody(product, {
+    checkoutAttemptId: 'checkout_cart_retry_001',
+    cartItems: [{ cartItemId: line._id, product: String(product._id), size: 'M', color: 'Red', quantity: 1 }],
+  }) });
+  assert.equal(placed.status, 201, JSON.stringify(placed.data));
+
+  const storedOrder = await Order.findById(placed.data._id).select('+checkoutCartItems');
+  const storedCart = await Cart.findOne({ user: storedOrder.user });
+  storedCart.items[0].quantity = 2;
+  storedCart.checkoutConsumptions = [];
+  await storedCart.save();
+  await Order.updateOne({ _id: storedOrder._id }, { $set: { cartCleanupStatus: 'PENDING' } });
+
+  assert.deepEqual(await retryPendingCartCleanup(), { scanned: 1, completed: 1, failed: 0 });
+  assert.deepEqual(await retryPendingCartCleanup(), { scanned: 0, completed: 0, failed: 0 });
+  const cleaned = await Cart.findById(storedCart._id);
+  assert.equal(cleaned.items[0].quantity, 1);
+  assert.deepEqual(cleaned.checkoutConsumptions, ['checkout_cart_retry_001']);
 });
 
 test('an order for more than the available stock is rejected', async () => {

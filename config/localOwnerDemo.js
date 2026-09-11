@@ -4,6 +4,10 @@ function isLocalOwnerDemoEnabled() {
   return process.env.LOCAL_OWNER_DEMO === 'true' && isDemoOtpMode();
 }
 
+function isHostedOwnerDemoEnabled() {
+  return process.env.ALLOW_HOSTED_OWNER_DEMO === 'true' && isDemoOtpMode();
+}
+
 function isLoopback(address) {
   return ['127.0.0.1', '::1', '[::1]', '::ffff:127.0.0.1'].includes(String(address || '').toLowerCase());
 }
@@ -33,12 +37,13 @@ function isLocalOwnerDemoRequest(req) {
 }
 
 function allowsOwnerDemoSession(claims, req) {
-  if (claims?.hostedOwnerDemo) return false;
+  if (claims?.hostedOwnerDemo) return isHostedOwnerDemoEnabled();
   return !claims?.localOwnerDemo || isLocalOwnerDemoRequest(req);
 }
 
 function getOwnerDemoProvider(req) {
-  return isLocalOwnerDemoRequest(req) ? 'local-demo' : '';
+  if (isLocalOwnerDemoRequest(req)) return 'local-demo';
+  return isHostedOwnerDemoEnabled() ? 'hosted-demo' : '';
 }
 
-module.exports = { isLocalOwnerDemoEnabled, isLocalOwnerDemoRequest, getOwnerDemoProvider, allowsOwnerDemoSession };
+module.exports = { isHostedOwnerDemoEnabled, isLocalOwnerDemoEnabled, isLocalOwnerDemoRequest, getOwnerDemoProvider, allowsOwnerDemoSession };
