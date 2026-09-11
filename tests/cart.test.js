@@ -31,6 +31,26 @@ test('an authenticated cart validates stock and variant availability', async () 
   });
   assert.equal(oversold.status, 409);
   assert.equal(oversold.data.code, 'OUT_OF_STOCK');
+
+  const missingSize = await request('/api/cart', {
+    method: 'POST',
+    token,
+    body: { product: String(product._id), quantity: 1, color: 'Red' },
+  });
+  assert.equal(missingSize.status, 409);
+  assert.equal(missingSize.data.code, 'VARIANT_UNAVAILABLE');
+});
+
+test('a free-size product can be added without inventing a clothing size', async () => {
+  const { token } = await createCustomer();
+  const product = await createProduct({ name: 'Ivory silk saree', sizingMode: 'free-size', sizes: [], colors: [] });
+  const added = await request('/api/cart', {
+    method: 'POST',
+    token,
+    body: { product: String(product._id), quantity: 1 },
+  });
+  assert.equal(added.status, 201);
+  assert.equal(added.data.items[0].size, '');
 });
 
 test('cart refuses an inactive product', async () => {
