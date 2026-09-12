@@ -2,7 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const { request, resetDatabase, startTestEnvironment, stopTestEnvironment } = require('./helpers');
-const { createAdmin, createCustomer } = require('./factories');
+const { createAdmin, createCustomer, createProduct, setSettings } = require('./factories');
 const { createMasterOwner } = require('./accessFixtures');
 
 test.before(startTestEnvironment);
@@ -75,6 +75,43 @@ test('website customization is master-only and publishing controls the public th
   assert.equal(live.data.config.colors.primary, '#123456');
   assert.equal(live.data.config.branding.websiteName, 'Samira Autumn');
   assert.equal(live.data.config.homepage.sections.find((section) => section.id === 'hero').heading, 'Autumn Celebration');
+});
+
+test('mobile storefront feed returns bounded card data and live customer policies', async () => {
+  await setSettings({ freeShippingMinAmount: 1499, shippingFreeAboveEnabled: true, returnsEnabled: false, codEnabled: true });
+  const product = await createProduct({
+    name: 'Mobile Home Saree',
+    slug: 'mobile-home-saree',
+    isFeatured: true,
+    showOnHomepage: true,
+    images: [{ url: '/uploads/one.jpg' }, { url: '/uploads/two.jpg' }],
+    rating: 4.7,
+    numReviews: 12,
+  });
+  const response = await request(`/api/storefront/home?recent=${product._id}`);
+  assert.equal(response.status, 200);
+  assert.equal(response.data.settings.freeShippingMinAmount, 1499);
+  assert.equal(response.data.settings.returnsEnabled, false);
+  assert.ok(response.data.collections.featured.some((item) => item.slug === 'mobile-home-saree'));
+  assert.equal(response.data.collections.featured.find((item) => item.slug === 'mobile-home-saree').images.length, 1);
+  assert.equal(response.data.collections.featured.find((item) => item.slug === 'mobile-home-saree').images[0].publicId, undefined);
+  assert.equal(response.data.collections.recentlyViewed[0].slug, 'mobile-home-saree');
+  assert.equal(response.data.collections.featured[0].description, undefined);
+  assert.match(response.headers.get('cache-control'), /stale-while-revalidate/);
+});
+
+test('mobile storefront feed does not truncate active categories needed by the home rail', async () => {
+  const Category = require('../models/Category');
+  await Category.insertMany(Array.from({ length: 14 }, (_, index) => ({
+    name: index === 13 ? 'Sarees' : `Visible Category ${index + 1}`,
+    slug: index === 13 ? 'sarees' : `visible-category-${index + 1}`,
+    isActive: true,
+    displayOrder: index,
+  })));
+  const response = await request('/api/storefront/home');
+  assert.equal(response.status, 200);
+  assert.ok(response.data.categories.length >= 14);
+  assert.ok(response.data.categories.some((category) => category.name === 'Sarees'));
 });
 
 test('theme history can restore a version to draft without silently changing the live store', async () => {

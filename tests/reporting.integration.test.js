@@ -7,6 +7,7 @@ const Category = require('../models/Category');
 const Order = require('../models/Order');
 const Product = require('../models/Product');
 const Store = require('../models/Store');
+const AnalyticsEvent = require('../models/AnalyticsEvent');
 const { buildReportCsv, generateBundle } = require('../services/reportExportService');
 const { nextRun } = require('../services/reportScheduleService');
 const { createReportContext, generateSection, reportRange } = require('../services/reportingService');
@@ -85,6 +86,22 @@ test('custom dates use the store timezone boundary and reject invalid periods', 
   assert.equal(summary.range.toDate, '2024-01-15');
   assert.throws(() => reportRange({ from: '2024-01-16', to: '2024-01-15' }, 'Asia/Kolkata'), /end date/i);
   assert.throws(() => reportRange({ range: 'unsupported' }, 'Asia/Kolkata'), /Choose today/i);
+});
+
+test('marketing reports expose mobile home section and category engagement per store', async () => {
+  const store = await createStore('Mobile Analytics', 'mobile-analytics');
+  const other = await createStore('Other Analytics', 'other-analytics');
+  const createdAt = new Date('2024-01-15T06:30:00.000Z');
+  await AnalyticsEvent.create([
+    { storeId: store._id, name: 'HOME_SECTION_VIEW', sessionId: 'a', metadata: { sectionId: 'featured' }, createdAt },
+    { storeId: store._id, name: 'HOME_CATEGORY_CLICK', sessionId: 'a', metadata: { categoryId: 'cat-1', categoryName: 'Sarees' }, createdAt },
+    { storeId: other._id, name: 'HOME_SECTION_VIEW', sessionId: 'b', metadata: { sectionId: 'private-other-store' }, createdAt },
+  ]);
+  const context = await createReportContext({ query: { from: '2024-01-15', to: '2024-01-15' }, tenantFilter: { storeId: store._id }, store });
+  const marketing = await generateSection('marketing', context);
+  assert.ok(marketing.data.homeEngagement.some((row) => row.event === 'HOME_SECTION_VIEW' && row.section === 'featured' && row.value === 1));
+  assert.ok(marketing.data.homeEngagement.some((row) => row.event === 'HOME_CATEGORY_CLICK' && row.category === 'Sarees' && row.value === 1));
+  assert.equal(marketing.data.homeEngagement.some((row) => row.section === 'private-other-store'), false);
 });
 
 test('CSV export contains report sections and neutralizes spreadsheet formulas', async () => {

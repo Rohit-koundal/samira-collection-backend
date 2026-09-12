@@ -2,6 +2,11 @@ const mongoose = require('mongoose');
 
 const EVENT_NAMES = [
   'STORE_VIEW',
+  'HOME_SECTION_VIEW',
+  'HOME_PRODUCT_CLICK',
+  'HOME_CATEGORY_CLICK',
+  'HOME_VIEW_ALL',
+  'HOME_SCROLL',
   'PRODUCT_VIEW',
   'SEARCH',
   'FILTER_USED',

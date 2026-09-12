@@ -59,7 +59,7 @@ test('mobile sections are bounded, known-only, independently ordered and normali
   assert.equal(config.tablet.columns, 3);
   assert.equal(config.tablet.gridGap, 32);
   assert.equal(config.layout.productsPerRow.desktop, 3);
-  assert.equal(config.mobile.sections.length, 9);
+  assert.equal(config.mobile.sections.length, 14);
   assert.deepEqual(config.mobile.sections[0], { id: 'hero', order: 0, visible: false, heading: '' });
   assert.equal(config.homepage.sections[0].visible, true);
 });

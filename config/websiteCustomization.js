@@ -147,7 +147,7 @@ const DEFAULT_WEBSITE_CONFIG = {
     pageBackground: '#fcfaf7', gridGap: 12, cardRadius: 14, imageRatio: 'original',
     columns: 2, useDesktopCatalog: false,
     showTitle: true, showPrice: true, showDiscount: true, showRating: true, showWishlist: true, showAddToCart: true,
-    sections: ['hero', 'services', 'categories', 'sale', 'promotional', 'trending', 'newArrivals', 'ethnicSets', 'accessories']
+    sections: ['hero', 'services', 'categories', 'sale', 'promotional', 'featured', 'trending', 'newArrivals', 'bestSellers', 'ethnicSets', 'accessories', 'recentlyViewed', 'recommended', 'instagram']
       .map((id, index) => ({ id, visible: true, order: index * 10, heading: '' })),
   },
   tablet: { enabled: false, columns: 3, gridGap: 16 },

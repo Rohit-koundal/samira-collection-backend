@@ -411,12 +411,18 @@ async function marketingReport(context) {
   if (query.product) eventFilters.push({ productId: objectId(query.product, 'product') });
   const eventsMatch = eventFilters.length > 1 ? { $and: eventFilters } : eventFilters[0];
   const validOrders = valid(dated(orderFilter, range.from, range.to));
-  const [eventRows, sourceRows, attributedRows, couponRows, bannerRows] = await Promise.all([
+  const [eventRows, sourceRows, attributedRows, couponRows, bannerRows, homeRows] = await Promise.all([
     AnalyticsEvent.aggregate([{ $match: eventsMatch }, { $group: { _id: '$name', value: { $sum: 1 }, sessions: { $addToSet: '$sessionId' } } }]),
     AnalyticsEvent.aggregate([{ $match: andFilter(eventsMatch, { source: { $exists: true, $nin: ['', null] } }) }, { $group: { _id: '$source', events: { $sum: 1 }, sessions: { $addToSet: '$sessionId' } } }, { $sort: { events: -1 } }, { $limit: 20 }]),
     Order.aggregate([{ $match: andFilter(validOrders, { 'attribution.source': { $exists: true, $nin: ['', null] } }) }, { $group: { _id: { source: '$attribution.source', campaign: '$attribution.campaign', reelId: '$attribution.reelId' }, orders: { $sum: 1 }, revenue: { $sum: netRevenueExpression() }, customers: { $addToSet: '$user' } } }, { $sort: { revenue: -1 } }, { $limit: 40 }]),
     Order.aggregate([{ $match: andFilter(validOrders, { 'coupon.code': { $exists: true, $nin: ['', null] } }) }, { $group: { _id: '$coupon.code', orders: { $sum: 1 }, customers: { $addToSet: '$user' }, discount: { $sum: { $ifNull: ['$couponDiscount', 0] } }, revenue: { $sum: netRevenueExpression() } } }, { $sort: { revenue: -1 } }, { $limit: 30 }]),
     AnalyticsEvent.aggregate([{ $match: andFilter(eventsMatch, { name: { $in: ['BANNER_IMPRESSION', 'BANNER_CLICK'] } }) }, { $group: { _id: { bannerId: '$metadata.bannerId', campaign: '$campaign' }, impressions: { $sum: { $cond: [{ $eq: ['$name', 'BANNER_IMPRESSION'] }, 1, 0] } }, clicks: { $sum: { $cond: [{ $eq: ['$name', 'BANNER_CLICK'] }, 1, 0] } } } }, { $sort: { impressions: -1 } }, { $limit: 30 }]),
+    AnalyticsEvent.aggregate([
+      { $match: andFilter(eventsMatch, { name: { $in: ['HOME_SECTION_VIEW', 'HOME_PRODUCT_CLICK', 'HOME_CATEGORY_CLICK', 'HOME_VIEW_ALL', 'HOME_SCROLL'] } }) },
+      { $group: { _id: { name: '$name', sectionId: '$metadata.sectionId', categoryId: '$metadata.categoryId', categoryName: '$metadata.categoryName', action: '$metadata.action', milestone: '$metadata.milestone' }, value: { $sum: 1 } } },
+      { $sort: { value: -1 } },
+      { $limit: 100 },
+    ]),
   ]);
   const eventMap = Object.fromEntries(eventRows.map((row) => [row._id, number(row.value)]));
   const steps = ['STORE_VIEW', 'PRODUCT_VIEW', 'ADD_TO_CART', 'BEGIN_CHECKOUT', 'PAYMENT_SUCCESS', 'PURCHASE'].map((name, index, all) => ({
@@ -428,6 +434,10 @@ async function marketingReport(context) {
     attribution: attributedRows.map((row) => ({ source: row._id.source || '', campaign: row._id.campaign || '', reelId: row._id.reelId || '', orders: row.orders, customers: row.customers.filter(Boolean).length, revenue: round(row.revenue) })),
     coupons: couponRows.map((row) => ({ code: row._id, orders: row.orders, customers: row.customers.filter(Boolean).length, discount: round(row.discount), revenue: round(row.revenue), returnOnDiscount: row.discount ? round(row.revenue / row.discount) : null })),
     banners: bannerRows.map((row) => ({ bannerId: row._id.bannerId || '', campaign: row._id.campaign || '', impressions: row.impressions, clicks: row.clicks, ctr: row.impressions ? round((row.clicks / row.impressions) * 100) : 0 })),
+    homeEngagement: homeRows.map((row) => ({
+      event: row._id.name || '', section: row._id.sectionId || '', categoryId: row._id.categoryId || '',
+      category: row._id.categoryName || '', action: row._id.action || '', milestone: number(row._id.milestone), value: row.value,
+    })),
     note: 'Storefront events are first-party events recorded by this application. External Instagram or Facebook views are not imported.',
   };
 }

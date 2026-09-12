@@ -129,6 +129,7 @@ app.use('/api/stores', require('./routes/storeRoutes'));
 app.use('/api/seller', protect, requireStoreMember, require('./routes/sellerRoutes'));
 app.get('/api/instagram/oauth/callback', instagram.oauthCallback);
 app.use('/api/analytics', require('./routes/analyticsRoutes'));
+app.use('/api/storefront/home', optionalResolveStore, require('./routes/storefrontHomeRoutes'));
 app.use('/api/products', optionalResolveStore, require('./routes/publicProductRoutes'));
 app.use('/api/variant-groups', optionalResolveStore, require('./routes/variantGroupRoutes'));
 app.use('/api/categories', optionalResolveStore, require('./routes/categoryRoutes'));

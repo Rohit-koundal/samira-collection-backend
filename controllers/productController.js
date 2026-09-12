@@ -83,6 +83,11 @@ function normalizeProductResponse(product, req) {
   return normalizeProductSizing(data, data.category?.name || '');
 }
 
+// Reuse the exact public catalogue serializer in composed storefront endpoints.
+// Keeping one serializer prevents Home cards and product pages from disagreeing
+// about scheduled pricing, images, variants, or sizing behavior.
+exports.normalizeProductResponse = normalizeProductResponse;
+
 exports.getProducts = asyncHandler(async (req, res) => {
   const baseUrl = String(req.baseUrl || '');
   const isAdminRequest = baseUrl.startsWith('/api/admin/products')
@@ -104,51 +109,74 @@ exports.getProducts = asyncHandler(async (req, res) => {
   };
   const query = catalogQuery(req, isAdminRequest ? archiveFilter : publicVisibility);
   const dynamicFilterKeys = Object.keys(req.query || {}).filter((key) => key.startsWith('attr_'));
-  const catalogConfiguration = req.query.search || dynamicFilterKeys.length
+  const catalogConfiguration = req.query.search || dynamicFilterKeys.length || req.query.includeFacets === 'true'
     ? await readConfiguration(req.store?._id)
     : null;
   const configuredAttributes = collectConfiguredAttributes(catalogConfiguration?.structure);
   const searchableAttributes = configuredAttributes.filter((attribute) => attribute.searchable).map((attribute) => attribute.key);
-  if (req.query.search) query.$or = [
-    { name: { $regex: escapeRegex(String(req.query.search)), $options: 'i' } },
-    { sku: { $regex: escapeRegex(String(req.query.search)), $options: 'i' } },
-    { fabric: { $regex: escapeRegex(String(req.query.search)), $options: 'i' } },
-    { occasion: { $regex: escapeRegex(String(req.query.search)), $options: 'i' } },
-    ...searchableAttributes.map((key) => ({ [`attributeValues.${key}`]: { $regex: escapeRegex(String(req.query.search)), $options: 'i' } })),
-  ];
+  if (req.query.search) {
+    const terms = readQueryValues(String(req.query.search).split(/\s+/), 8);
+    const categoryMatches = await Promise.all(terms.map((term) => Category.find(andFilter({
+      isActive: { $ne: false },
+      $or: searchTermVariants(term).map((variant) => ({ name: { $regex: escapeRegex(variant), $options: 'i' } })),
+    }, req.tenantFilter)).select('_id').limit(50).lean()));
+    terms.forEach((term, index) => addQueryClause(query, { $or: searchTermVariants(term).flatMap((variant) => [
+      { name: { $regex: escapeRegex(variant), $options: 'i' } },
+      { sku: { $regex: escapeRegex(variant), $options: 'i' } },
+      { brand: { $regex: escapeRegex(variant), $options: 'i' } },
+      { fabric: { $regex: escapeRegex(variant), $options: 'i' } },
+      { occasion: { $regex: escapeRegex(variant), $options: 'i' } },
+      { description: { $regex: escapeRegex(variant), $options: 'i' } },
+      { shortDescription: { $regex: escapeRegex(variant), $options: 'i' } },
+      { tags: { $regex: escapeRegex(variant), $options: 'i' } },
+      ...(categoryMatches[index].length ? [{ category: { $in: categoryMatches[index].map((item) => item._id) } }] : []),
+      ...searchableAttributes.map((key) => ({ [`attributeValues.${key}`]: { $regex: escapeRegex(variant), $options: 'i' } })),
+    ]) }));
+  }
   const filterableAttributes = new Set(configuredAttributes.filter((attribute) => attribute.filterable).map((attribute) => attribute.key));
   dynamicFilterKeys.forEach((queryKey) => {
     const attributeKey = queryKey.slice(5);
     if (!filterableAttributes.has(attributeKey)) return;
-    const values = String(req.query[queryKey] || '').split(',').map((value) => value.trim()).filter(Boolean).slice(0, 30);
-    if (values.length) query[`attributeValues.${attributeKey}`] = values.length === 1 ? values[0] : { $in: values };
+    const values = readQueryValues(req.query[queryKey]);
+    if (values.length) query[`attributeValues.${attributeKey}`] = { $in: values.map(exactCaseInsensitive) };
   });
   if (req.query.category) {
-    if (mongoose.Types.ObjectId.isValid(req.query.category)) {
-      query.category = req.query.category;
-    } else {
-      const category = await Category.findOne(andFilter({
-        $or: [
-          { slug: req.query.category },
-          { previousSlugs: req.query.category },
-          { name: { $regex: `^${escapeRegex(req.query.category)}$`, $options: 'i' } },
-        ],
-      }, req.tenantFilter));
-      if (category) query.category = category._id;
-      else query.category = null;
-    }
+    const selectedCategories = readQueryValues(req.query.category);
+    const objectIds = selectedCategories.filter((value) => mongoose.Types.ObjectId.isValid(value));
+    const aliases = selectedCategories.filter((value) => !mongoose.Types.ObjectId.isValid(value));
+    const matchedCategories = aliases.length ? await Category.find(andFilter({ $or: [
+      { slug: { $in: aliases.map(exactCaseInsensitive) } },
+      { previousSlugs: { $in: aliases.map(exactCaseInsensitive) } },
+      { name: { $in: aliases.map(exactCaseInsensitive) } },
+    ] }, req.tenantFilter)).select('_id').lean() : [];
+    const categoryIds = [...new Set([...objectIds, ...matchedCategories.map((item) => String(item._id))])];
+    query.category = categoryIds.length ? { $in: categoryIds } : null;
   }
-  if (req.query.size) query.sizes = req.query.size;
-  if (req.query.color) query.colors = req.query.color;
-  if (req.query.fabric) query.fabric = req.query.fabric;
-  if (req.query.occasion) query.occasion = req.query.occasion;
+  if (req.query.size) {
+    const values = readQueryValues(req.query.size).map(exactCaseInsensitive);
+    if (values.length) addQueryClause(query, { $or: [{ sizes: { $in: values } }, { 'variants.size': { $in: values } }] });
+  }
+  if (req.query.color) {
+    const values = readQueryValues(req.query.color).map(exactCaseInsensitive);
+    if (values.length) addQueryClause(query, { $or: [{ colors: { $in: values } }, { 'variants.color': { $in: values } }] });
+  }
+  if (req.query.fabric) {
+    const values = readQueryValues(req.query.fabric).map(exactCaseInsensitive);
+    if (values.length) query.fabric = { $in: values };
+  }
+  if (req.query.occasion) {
+    const values = readQueryValues(req.query.occasion).map((value) => new RegExp(`(^|[,;|]\\s*)${escapeRegex(value)}(\\s*[,;|]|$)`, 'i'));
+    if (values.length) query.occasion = { $in: values };
+  }
   if (req.query.minPrice || req.query.maxPrice) {
     query.price = {};
-    if (req.query.minPrice) query.price.$gte = Number(req.query.minPrice);
-    if (req.query.maxPrice) query.price.$lte = Number(req.query.maxPrice);
+    const minimum = Number(req.query.minPrice); const maximum = Number(req.query.maxPrice);
+    if (req.query.minPrice && Number.isFinite(minimum) && minimum >= 0) query.price.$gte = minimum;
+    if (req.query.maxPrice && Number.isFinite(maximum) && maximum >= 0) query.price.$lte = maximum;
+    if (!Object.keys(query.price).length) delete query.price;
   }
-  if (req.query.discount) query.discountPercentage = { $gte: Number(req.query.discount) };
-  if (req.query.rating) query.rating = { $gte: Number(req.query.rating) };
+  if (req.query.discount && Number.isFinite(Number(req.query.discount))) query.discountPercentage = { $gte: Math.max(0, Number(req.query.discount)) };
+  if (req.query.rating && Number.isFinite(Number(req.query.rating))) query.rating = { $gte: Math.max(0, Math.min(5, Number(req.query.rating))) };
   if (req.query.stock === 'in') query.stock = { $gt: 0 };
   if (req.query.stock === 'out') query.stock = 0;
   if (req.query.stock === 'low') {
@@ -159,19 +187,21 @@ exports.getProducts = asyncHandler(async (req, res) => {
   if (req.query.featured === 'true') query.isFeatured = true;
   if (req.query.newArrival === 'true') query.isNewArrival = true;
   if (req.query.bestSeller === 'true') query.isBestSeller = true;
+  if (req.query.trending === 'true') query.showInTrending = true;
   if (req.query.completeness === 'missing-media') addQueryClause(query, { $or: [{ images: { $exists: false } }, { images: { $size: 0 } }] });
   if (req.query.completeness === 'missing-seo') addQueryClause(query, { $or: [{ metaTitle: { $in: ['', null] } }, { metaDescription: { $in: ['', null] } }] });
 
   const sortMap = {
-    newest: '-createdAt',
-    priceLowHigh: 'price',
-    priceHighLow: '-price',
-    discount: '-discountPercentage',
-    rating: '-rating',
-    stock: 'stock',
-    updated: '-updatedAt',
+    newest: { createdAt: -1, _id: -1 },
+    bestSeller: { isBestSeller: -1, rating: -1, numReviews: -1, createdAt: -1, _id: -1 },
+    priceLowHigh: { price: 1, _id: 1 },
+    priceHighLow: { price: -1, _id: -1 },
+    discount: { discountPercentage: -1, createdAt: -1, _id: -1 },
+    rating: { rating: -1, numReviews: -1, _id: -1 },
+    stock: { stock: 1, _id: 1 },
+    updated: { updatedAt: -1, _id: -1 },
   };
-  const sort = sortMap[req.query.sort] || '-createdAt';
+  const sort = sortMap[req.query.sort] || sortMap.newest;
   // Admin designer choices need identifiers and labels, not every image,
   // variant, size chart and description in the catalog.
   const designerCatalogRequest = req.query.customizationOptions === 'true'
@@ -184,11 +214,14 @@ exports.getProducts = asyncHandler(async (req, res) => {
   }
   if (wantsPagination(req.query)) {
     const { page, limit, skip } = readPagination(req.query, { defaultLimit: 24, maxLimit: 100 });
-    const [items, total] = await Promise.all([
+    const includeFacets = !isAdminRequest && req.query.includeFacets === 'true';
+    const [items, total, facets] = await Promise.all([
       Product.find(query).populate('category').sort(sort).skip(skip).limit(limit),
       Product.countDocuments(query),
+      includeFacets ? buildPublicCatalogFacets(req, catalogConfiguration, configuredAttributes) : null,
     ]);
     const response = buildPaginatedResponse(items.map((product) => normalizeProductResponse(product, req)), { page, limit, total });
+    if (facets) response.facets = facets;
     if (req.query.includeSummary === 'true') response.summary = await getCatalogSummary(req);
     return res.json(response);
   }
@@ -242,6 +275,190 @@ function collectConfiguredAttributes(structure = {}) {
     if (attribute && typeof attribute === 'object' && attribute.key) definitions.set(attribute.key, { ...(definitions.get(attribute.key) || {}), ...attribute });
   }));
   return Array.from(definitions.values());
+}
+
+function readQueryValues(value, maximum = 30) {
+  const source = Array.isArray(value) ? value : String(value || '').split(',');
+  const seen = new Set();
+  return source.map((item) => String(item || '').trim()).filter((item) => {
+    const key = item.toLowerCase();
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  }).slice(0, maximum);
+}
+
+function exactCaseInsensitive(value) {
+  return new RegExp(`^${escapeRegex(String(value || '').trim())}$`, 'i');
+}
+
+function searchTermVariants(value) {
+  const term = String(value || '').trim();
+  if (term.toLowerCase() === 'accessory') return [term, 'accessories'];
+  if (term.toLowerCase() === 'accessories') return [term, 'accessory'];
+  return [term];
+}
+
+async function buildPublicCatalogFacets(req, catalogConfiguration, configuredAttributes = []) {
+  const visibility = catalogQuery(req, {
+    $and: [
+      { isActive: true, isArchived: { $ne: true } },
+      { $or: [{ publishAt: { $exists: false } }, { publishAt: null }, { publishAt: { $lte: new Date() } }] },
+    ],
+  });
+  const [rawProducts, categories] = await Promise.all([
+    Product.find(visibility).select('name sku brand category subCategory price originalPrice salePrice saleStartAt saleEndAt discountPercentage rating stock sizes colors variants fabric occasion description shortDescription tags attributeValues isFeatured isNewArrival isBestSeller showInTrending').lean(),
+    Category.find(andFilter({ isActive: { $ne: false }, isArchived: { $ne: true } }, req.tenantFilter)).select('_id name slug previousSlugs').lean(),
+  ]);
+  const products = rawProducts.map((product) => applyEffectivePricing(product));
+  const categoryById = new Map(categories.map((category) => [String(category._id), category]));
+  const filters = req.query || {};
+  const matching = (...ignored) => products.filter((product) => productMatchesPublicFilters(product, filters, categoryById, new Set(ignored), configuredAttributes));
+  const categoryProducts = matching('category');
+  const sizeProducts = matching('size');
+  const colorProducts = matching('color');
+  const fabricProducts = matching('fabric');
+  const occasionProducts = matching('occasion');
+  const priceProducts = matching('minPrice', 'maxPrice');
+  const discountProducts = matching('discount');
+  const ratingProducts = matching('rating');
+  const stockProducts = matching('stock');
+  const dynamicFacets = configuredAttributes.filter((attribute) => attribute.filterable).map((attribute) => {
+    const key = String(attribute.key || '').trim();
+    const countProducts = matching(`attr_${key}`);
+    const values = uniqueFacetValues([
+      ...(attribute.options || []),
+      ...products.flatMap((product) => splitStoredValues(readAttributeValue(product, key))),
+    ]);
+    return {
+      key,
+      label: attribute.label || key,
+      type: attribute.type || 'text',
+      options: values.map((value) => ({
+        value,
+        label: value,
+        count: countProducts.filter((product) => hasStoredValue(readAttributeValue(product, key), value)).length,
+      })),
+    };
+  }).filter((facet) => facet.key && facet.options.some((option) => option.count > 0));
+
+  return {
+    categories: categories.map((category) => ({
+      value: String(category._id),
+      label: category.name,
+      count: categoryProducts.filter((product) => String(product.category || '') === String(category._id)).length,
+    })),
+    sizes: buildFacetOptions(products.flatMap((product) => productOptionValues(product, 'size')), sizeProducts, (product, value) => productOptionValues(product, 'size').some((item) => sameText(item, value)), sortFacetSizes),
+    colors: buildFacetOptions(products.flatMap((product) => productOptionValues(product, 'color')), colorProducts, (product, value) => productOptionValues(product, 'color').some((item) => sameText(item, value))),
+    fabrics: buildFacetOptions(products.flatMap((product) => splitStoredValues(product.fabric)), fabricProducts, (product, value) => hasStoredValue(product.fabric, value)),
+    occasions: buildFacetOptions(products.flatMap((product) => splitStoredValues(product.occasion)), occasionProducts, (product, value) => hasStoredValue(product.occasion, value)),
+    prices: buildFacetPriceBuckets(products, priceProducts),
+    discounts: [50, 40, 30, 20, 10].map((value) => ({ value: String(value), label: `${value}% and above`, count: discountProducts.filter((product) => Number(product.discountPercentage || 0) >= value).length })),
+    ratings: [4, 3, 2].map((value) => ({ value: String(value), label: `${value}★ & above`, count: ratingProducts.filter((product) => Number(product.rating || 0) >= value).length })),
+    availability: [
+      { value: 'in', label: 'In stock', count: stockProducts.filter((product) => Number(product.stock || 0) > 0).length },
+      { value: 'out', label: 'Out of stock', count: stockProducts.filter((product) => Number(product.stock || 0) <= 0).length },
+    ],
+    dynamicFacets,
+  };
+}
+
+function productMatchesPublicFilters(product, filters, categoryById, ignored, configuredAttributes) {
+  if (!ignored.has('search') && filters.search) {
+    const category = categoryById.get(String(product.category || ''));
+    const searchableKeys = configuredAttributes.filter((attribute) => attribute.searchable).map((attribute) => attribute.key);
+    const haystack = [product.name, product.sku, product.brand, category?.name, category?.slug, product.subCategory, product.fabric, product.occasion, product.description, product.shortDescription, ...(product.tags || []), ...searchableKeys.map((key) => readAttributeValue(product, key))].flatMap(splitStoredValues).join(' ').toLowerCase();
+    const terms = String(filters.search).trim().toLowerCase().split(/\s+/).filter(Boolean).slice(0, 8);
+    if (!terms.every((term) => searchTermVariants(term).some((variant) => haystack.includes(variant.toLowerCase())))) return false;
+  }
+  if (!ignored.has('category') && filters.category) {
+    const category = categoryById.get(String(product.category || ''));
+    const aliases = [product.category, category?.name, category?.slug, ...(category?.previousSlugs || [])].map(normalizeFacetKey).filter(Boolean);
+    if (!readQueryValues(filters.category).some((value) => aliases.includes(normalizeFacetKey(value)))) return false;
+  }
+  if (!ignored.has('size') && filters.size && !matchesAnyFacet(productOptionValues(product, 'size'), filters.size)) return false;
+  if (!ignored.has('color') && filters.color && !matchesAnyFacet(productOptionValues(product, 'color'), filters.color)) return false;
+  if (!ignored.has('fabric') && filters.fabric && !matchesAnyFacet(splitStoredValues(product.fabric), filters.fabric)) return false;
+  if (!ignored.has('occasion') && filters.occasion && !matchesAnyFacet(splitStoredValues(product.occasion), filters.occasion)) return false;
+  if (!ignored.has('discount') && filters.discount && Number(product.discountPercentage || 0) < Number(filters.discount)) return false;
+  if (!ignored.has('rating') && filters.rating && Number(product.rating || 0) < Number(filters.rating)) return false;
+  if (!ignored.has('stock') && filters.stock && (filters.stock === 'in' ? Number(product.stock || 0) <= 0 : Number(product.stock || 0) > 0)) return false;
+  if (!ignored.has('minPrice') && filters.minPrice && Number(product.price || 0) < Number(filters.minPrice)) return false;
+  if (!ignored.has('maxPrice') && filters.maxPrice && Number(product.price || 0) > Number(filters.maxPrice)) return false;
+  if (filters.featured === 'true' && !product.isFeatured) return false;
+  if (filters.newArrival === 'true' && !product.isNewArrival) return false;
+  if (filters.bestSeller === 'true' && !product.isBestSeller) return false;
+  if (filters.trending === 'true' && !product.showInTrending) return false;
+  for (const attribute of configuredAttributes.filter((item) => item.filterable)) {
+    const queryKey = `attr_${attribute.key}`;
+    if (!ignored.has(queryKey) && filters[queryKey] && !matchesAnyFacet(splitStoredValues(readAttributeValue(product, attribute.key)), filters[queryKey])) return false;
+  }
+  return true;
+}
+
+function readAttributeValue(product, key) {
+  const source = product.attributeValues instanceof Map ? Object.fromEntries(product.attributeValues) : (product.attributeValues || {});
+  return source[key];
+}
+
+function productOptionValues(product, type) {
+  const plural = type === 'size' ? 'sizes' : 'colors';
+  return uniqueFacetValues([...(product[plural] || []), ...(product.variants || []).map((variant) => variant?.[type])]);
+}
+
+function splitStoredValues(value) {
+  return (Array.isArray(value) ? value : [value]).flatMap((item) => String(item || '').split(/[,;|]/)).map((item) => item.trim()).filter(Boolean);
+}
+
+function matchesAnyFacet(values, selected) {
+  const available = values.map(normalizeFacetKey);
+  return readQueryValues(selected).some((value) => available.includes(normalizeFacetKey(value)));
+}
+
+function hasStoredValue(stored, value) {
+  return splitStoredValues(stored).some((item) => sameText(item, value));
+}
+
+function sameText(left, right) { return normalizeFacetKey(left) === normalizeFacetKey(right); }
+function normalizeFacetKey(value) { return String(value || '').trim().toLowerCase(); }
+
+function uniqueFacetValues(values) {
+  const seen = new Set();
+  return values.map((value) => String(value || '').trim()).filter((value) => {
+    const key = normalizeFacetKey(value);
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function buildFacetOptions(values, products, matcher, sorter) {
+  return uniqueFacetValues(values).map((value) => ({ value, label: value, count: products.filter((product) => matcher(product, value)).length })).sort(sorter || ((left, right) => left.label.localeCompare(right.label)));
+}
+
+function sortFacetSizes(left, right) {
+  const order = ['XXS', 'XS', 'S', 'M', 'L', 'XL', 'XXL', 'XXXL', 'FREE SIZE'];
+  const leftIndex = order.indexOf(left.label.toUpperCase()); const rightIndex = order.indexOf(right.label.toUpperCase());
+  if (leftIndex !== -1 || rightIndex !== -1) return (leftIndex === -1 ? order.length : leftIndex) - (rightIndex === -1 ? order.length : rightIndex);
+  return left.label.localeCompare(right.label, undefined, { numeric: true });
+}
+
+function buildFacetPriceBuckets(allProducts, matchingProducts) {
+  const prices = allProducts.map((product) => Number(product.price)).filter((price) => Number.isFinite(price) && price >= 0);
+  if (!prices.length) return [];
+  const minimum = Math.min(...prices); const maximum = Math.max(...prices);
+  if (minimum === maximum) return [{ min: minimum, max: maximum, value: `${minimum}:${maximum}`, label: `₹${minimum.toLocaleString('en-IN')}`, count: matchingProducts.filter((product) => Number(product.price) === minimum).length }];
+  const raw = (maximum - minimum + 1) / 4;
+  const power = 10 ** Math.floor(Math.log10(Math.max(raw, 1)));
+  const normalized = raw / power;
+  const step = (normalized <= 1 ? 1 : normalized <= 2 ? 2 : normalized <= 5 ? 5 : 10) * power;
+  const first = Math.floor(minimum / step) * step;
+  const buckets = [];
+  for (let from = first; from <= maximum && buckets.length < 6; from += step) {
+    const to = Math.min(maximum, from + step - 1);
+    buckets.push({ min: from, max: to, value: `${from}:${to}`, label: `₹${from.toLocaleString('en-IN')} – ₹${to.toLocaleString('en-IN')}`, count: matchingProducts.filter((product) => Number(product.price) >= from && Number(product.price) <= to).length });
+  }
+  return buckets;
 }
 
 exports.getProductBySlug = asyncHandler(async (req, res) => {
