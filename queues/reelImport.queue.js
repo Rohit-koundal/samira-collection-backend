@@ -85,11 +85,12 @@ async function resumePendingReelImports({ schedule = enqueueReelImport } = {}) {
   if (!config.enabled) return { resumed: 0, skipped: 0 };
 
   const hasRedis = Boolean(getRedisConnection());
-  const statuses = hasRedis ? ['uploaded'] : ['uploaded', 'queued', 'processing'];
+  const statuses = hasRedis ? ['uploaded', 'queued'] : ['uploaded', 'queued', 'processing'];
   const jobs = await ReelImport.find({
     status: { $in: statuses },
     cancellationRequested: { $ne: true },
     attemptCount: { $lt: config.maxAttempts },
+    ...(hasRedis ? { $or: [{ status: 'uploaded' }, { status: 'queued', queueJobId: null, attemptCount: 0 }] } : {}),
   }).select('+sourceVideo.url').sort({ createdAt: 1 }).limit(25);
 
   let resumed = 0;

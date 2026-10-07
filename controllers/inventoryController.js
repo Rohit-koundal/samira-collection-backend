@@ -351,7 +351,7 @@ exports.history = asyncHandler(async (req, res) => {
       Product.find(scoped(req, { $or: [{ name: regex }, { sku: regex }, { 'variants.sku': regex }] })).select('_id').limit(100).lean(),
       User.find({ name: regex }).select('_id').limit(50).lean(),
     ]);
-    filter.$or = [{ product: { $in: products.map((item) => item._id) } }, { createdBy: { $in: users.map((item) => item._id) } }, { sku: regex }, { reason: regex }, { note: regex }, { reference: regex }];
+    filter.$or = [{ product: { $in: products.map((item) => item._id) } }, { 'productSnapshot.name': regex }, { createdBy: { $in: users.map((item) => item._id) } }, { sku: regex }, { reason: regex }, { note: regex }, { reference: regex }];
   }
   const movementFilter = scoped(req, filter);
   const [items, total] = await Promise.all([
@@ -360,7 +360,7 @@ exports.history = asyncHandler(async (req, res) => {
   ]);
   res.set('Cache-Control', 'private, no-store, max-age=0');
   res.json({
-    ...buildPaginatedResponse(items.map((item) => ({ ...item, reversible: REVERSIBLE_TYPES.includes(item.type) && !item.reversalOf && !item.reversedBy })), { page, limit, total }),
+    ...buildPaginatedResponse(items.map((item) => ({ ...item, product: item.product || (item.productSnapshot?.deletedAt ? { ...item.productSnapshot, deleted: true } : null), reversible: Boolean(item.product) && REVERSIBLE_TYPES.includes(item.type) && !item.reversalOf && !item.reversedBy })), { page, limit, total }),
     types: TYPES, reasons: Object.entries(ADJUSTMENT_REASONS).map(([value, item]) => ({ value, label: item.label })),
   });
 });
@@ -398,7 +398,7 @@ exports.createPurchaseOrder = asyncHandler(async (req, res) => {
   const items = [];
   let storeId = req.store?._id;
   for (const input of itemInputs) {
-    const product = await Product.findOne(scoped(req, { _id: requireObjectId(input.productId, 'product') })).select('name sku variants storeId costPrice');
+    const product = await Product.findOne(scoped(req, { _id: requireObjectId(input.productId, 'product'), isArchived: { $ne: true } })).select('name sku variants storeId costPrice');
     if (!product) throw new ApiError('NOT_FOUND', 'A selected purchase product was not found');
     if (!storeId) storeId = product.storeId;
     if (String(storeId || '') !== String(product.storeId || '')) throw new ApiError('VALIDATION_ERROR', 'All purchase items must belong to the same store');
@@ -412,10 +412,19 @@ exports.createPurchaseOrder = asyncHandler(async (req, res) => {
   }
   const expectedAt = req.body?.expectedAt ? new Date(req.body.expectedAt) : undefined;
   if (expectedAt && !Number.isFinite(expectedAt.getTime())) throw new ApiError('VALIDATION_ERROR', 'Choose a valid expected arrival date');
-  const created = await InventoryPurchaseOrder.create({
+  const purchaseData = {
     storeId, number: purchaseOrderNumber(), supplier: {
       name: requireString(supplier.name, 'Supplier name', { max: 160 }), phone: optionalString(supplier.phone, 'Supplier phone', { max: 30 }), email: optionalEmail(supplier.email, 'Supplier email'),
     }, expectedAt, notes: optionalString(req.body?.notes, 'Purchase notes', { max: 1000 }), items, createdBy: req.user?._id,
+  };
+  const created = await runInTransaction(async session => {
+    // A new purchase and permanent deletion must contend on the product, not
+    // just independently read it and create an orphan financial reference.
+    const ids = [...new Set(items.map(item => String(item.product)))];
+    const touched = await Product.updateMany(scoped(req, { _id: { $in: ids }, isArchived: { $ne: true } }),
+      { $inc: { catalogReferenceRevision: 1 } }, { session: session || undefined });
+    if (touched.matchedCount !== ids.length) throw new ApiError('NOT_FOUND', 'A selected purchase product was archived or removed. Refresh before creating the purchase order.');
+    return session ? (await InventoryPurchaseOrder.create([purchaseData], { session }))[0] : InventoryPurchaseOrder.create(purchaseData);
   });
   await logAudit({ req, action: 'PURCHASE_ORDER_CREATED', entityType: 'InventoryPurchaseOrder', entityId: created._id, storeId, after: { number: created.number, supplier: created.supplier.name, itemCount: items.length } });
   res.status(201).json(purchaseOrderResponse(created));

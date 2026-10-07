@@ -38,7 +38,7 @@ function errorHandler(error, req, res, next) { // eslint-disable-line no-unused-
   if (error instanceof SyntaxError && error.type === 'entity.parse.failed') {
     return send(res, 400, 'INVALID_JSON', 'The request contains invalid JSON.');
   }
-  if (error.message?.includes('Only jpg')) {
+  if (/only .*evidence files are allowed/i.test(error.message || '') || /only jpg/i.test(error.message || '')) {
     return send(res, 400, 'VALIDATION_ERROR', error.message);
   }
   if (error.code === 'LIMIT_FILE_SIZE') {

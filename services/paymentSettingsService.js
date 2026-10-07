@@ -58,7 +58,14 @@ function resolvePrepaidDiscount(method, amount, settings) {
 }
 
 async function customerRtoBlocked(userId, settings, tenantFilter = {}) {
-  if (!userId || settings?.rtoBlockEnabled !== true) return false;
+  if (!userId) return false;
+  if (settings?.smartCodVerificationEnabled !== false) {
+    const decision = await require('./codVerificationService').evaluateCodVerification({
+      paymentMethod: 'COD', userId, storeId: settings?.storeId || tenantFilter?.storeId, settings, phoneVerified: true,
+    });
+    if (!decision.codAllowed) return true;
+  }
+  if (settings?.rtoBlockEnabled !== true) return false;
   const minOrders = Number(settings?.rtoBlockMinOrders || 0);
   const threshold = Number(settings?.rtoBlockThreshold || 0);
   if (minOrders <= 0 || threshold <= 0) return false;

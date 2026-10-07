@@ -11,17 +11,18 @@ const { normalizeSettingsUpdates } = require('../services/storeSettingsValidatio
 
 const SETTINGS_PERMISSION_FIELDS = Object.freeze({
   branding: ['storeName', 'brandIdentityEnabled', 'logoUrl', 'faviconUrl', 'tagline', 'seoTitle', 'seoDescription', 'socialShareImage', 'searchIndexingEnabled', 'legalBusinessName', 'gstin', 'invoicePrefix', 'billingAddress'],
-  content: ['contactDetailsEnabled', 'announcementEnabled', 'announcementText', 'supportHours', 'invoiceNote', 'contactEmail', 'contactPhone', 'whatsappNumber', 'address', 'footerText', 'returnPolicy', 'privacyPolicy', 'termsConditions', 'shippingPolicy', 'cancellationPolicy', 'sizeGuide', 'faqs', 'ourStory'],
+  content: ['occasionShoppingEnabled', 'recentlyViewedEnabled', 'completeLookEnabled', 'contactDetailsEnabled', 'announcementEnabled', 'announcementText', 'supportHours', 'invoiceNote', 'contactEmail', 'contactPhone', 'whatsappNumber', 'address', 'footerText', 'returnPolicy', 'privacyPolicy', 'termsConditions', 'shippingPolicy', 'cancellationPolicy', 'sizeGuide', 'faqs', 'ourStory'],
   pricing: ['acceptingOrders', 'orderPauseMessage', 'minimumOrderAmount', 'platformFee', 'gstRate'],
-  shipping: ['shippingProvider', 'shippingPricingMode', 'shippingFreeAboveEnabled', 'shippingDefaultWeightKg', 'shippingLengthCm', 'shippingWidthCm', 'shippingHeightCm', 'shippingVolumetricDivisor', 'shippingWeightStepKg', 'shippingAdditionalStepCharge', 'shippingRateZones', 'shippingPickup', 'freeShippingMinAmount', 'deliveryCharge'],
-  payments: ['razorpayEnabled', 'upiEnabled', 'cardPaymentEnabled', 'netBankingEnabled', 'walletEnabled', 'codEnabled', 'codCharge', 'codMinAmount', 'codMaxAmount', 'codPincodes', 'prepaidDiscountType', 'prepaidDiscountValue', 'codConfirmationRequired', 'rtoBlockEnabled', 'rtoBlockMinOrders', 'rtoBlockThreshold', 'rtoRefundDeduction'],
-  returns: ['returnsEnabled', 'returnWindowDays', 'refundDeliveryChargeOnFullReturn', 'refundPlatformFeeOnFullReturn', 'refundCodChargeOnFullReturn', 'customerReturnShippingCharge', 'customerRestockingFeePercent', 'exchangeReservationHours', 'returnSlaHours'],
+  shipping: ['shippingProvider', 'manualDeliveryMode', 'shippingPricingMode', 'shippingFreeAboveEnabled', 'shippingDefaultWeightKg', 'shippingLengthCm', 'shippingWidthCm', 'shippingHeightCm', 'shippingVolumetricDivisor', 'shippingWeightStepKg', 'shippingAdditionalStepCharge', 'shippingRateZones', 'shippingPickup', 'freeShippingMinAmount', 'deliveryCharge'],
+  payments: ['razorpayEnabled', 'upiEnabled', 'cardPaymentEnabled', 'netBankingEnabled', 'walletEnabled', 'codEnabled', 'codCharge', 'codMinAmount', 'codMaxAmount', 'codPincodes', 'prepaidDiscountType', 'prepaidDiscountValue', 'codConfirmationRequired', 'smartCodVerificationEnabled', 'codRtoRestrictionLimit', 'rtoBlockEnabled', 'rtoBlockMinOrders', 'rtoBlockThreshold', 'rtoRefundDeduction'],
+  returns: ['returnsEnabled', 'returnWindowDays', 'refundDeliveryChargeOnFullReturn', 'refundPlatformFeeOnFullReturn', 'refundCodChargeOnFullReturn', 'customerReturnShippingCharge', 'customerRestockingFeePercent', 'exchangeReservationHours', 'returnSlaHours', 'requireProductQrScan', 'requirePackingPhotos', 'requirePackingVideo', 'requireDispatchWeight', 'requireSecuritySeal', 'requireReturnPhotos', 'requireReturnVideo', 'enableSecurityTag', 'enableCustomerRiskDetection', 'autoApproveVerifiedReturns', 'returnWeightToleranceGrams', 'highValueVerificationThreshold'],
   social: ['socialLinks', 'appLinks'],
 });
 
 exports.getSettings = asyncHandler(async (req, res) => {
   const settings = (await Settings.findOne(req.tenantFilter || {})) || await Settings.create({ ...(req.store?._id ? { storeId: req.store._id } : {}) });
   const data = settings.toObject();
+  if (req.baseUrl === '/api/settings') data.commerceMode = req.store?.catalogStructure?.commerce?.mode || 'SALE_ONLY';
   if ((!req.user || req.user.role !== 'admin') && !req.storeMember) {
     delete data.shippingPickup;
     delete data.shippingRateZones;

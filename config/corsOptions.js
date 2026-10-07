@@ -56,7 +56,7 @@ function corsOptions(req, callback) {
       origin: true,
       credentials: true,
       methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-      allowedHeaders: ['Content-Type', 'Authorization', 'x-session-id', 'x-store-slug', 'x-store-id', 'x-request-id'],
+      allowedHeaders: ['Content-Type', 'Authorization', 'x-session-id', 'x-store-slug', 'x-store-id', 'x-request-id', 'Idempotency-Key'],
       maxAge: 86400,
     });
   }

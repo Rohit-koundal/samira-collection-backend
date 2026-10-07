@@ -13,16 +13,14 @@ async function runtimeTelemetry() {
   try {
     const mongoose = require('mongoose');
     const Product = require('../models/Product');
-    const Order = require('../models/Order');
-    const monthStart = new Date(); monthStart.setUTCDate(1); monthStart.setUTCHours(0, 0, 0, 0);
     const pingStartedAt = Date.now();
     if (mongoose.connection.readyState === 1) await mongoose.connection.db.admin().ping();
     const [products, ordersPerMonth] = await Promise.all([
       Product.countDocuments({ isArchived: { $ne: true } }),
-      Order.countDocuments({ createdAt: { $gte: monthStart }, orderStatus: { $ne: 'Cancelled' } }),
+      require('./commerceUsageService').monthlyUsage({ allStores: true }),
     ]);
     return {
-      products, ordersPerMonth, databaseStatus: mongoose.connection.readyState === 1 ? 'CONNECTED' : 'DISCONNECTED', serviceStatus: 'HEALTHY',
+      products, ...ordersPerMonth, databaseStatus: mongoose.connection.readyState === 1 ? 'CONNECTED' : 'DISCONNECTED', serviceStatus: 'HEALTHY',
       databaseLatencyMs: Date.now() - pingStartedAt, uptimeSeconds: Math.floor(process.uptime()),
       memoryRssMb: Math.round(process.memoryUsage().rss / 1048576), nodeVersion: process.version,
       paymentReady: Boolean(process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET),

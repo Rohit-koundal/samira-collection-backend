@@ -16,6 +16,14 @@ const shipmentSchema = new mongoose.Schema({
     date: { type: Date, default: Date.now },
   }],
   provider: { type: String, default: 'manual' },
+  // Manual fulfilment is not a carrier integration. SELF uses an internal
+  // delivery reference, never a fabricated courier AWB.
+  fulfillmentMode: { type: String, enum: ['COURIER', 'SELF'], default: 'COURIER' },
+  deliveryReference: { type: String, maxlength: 80 },
+  deliveryContact: { name: { type: String, maxlength: 80 }, phone: { type: String, maxlength: 24 } },
+  customerNote: { type: String, maxlength: 300 },
+  manualConfiguredAt: Date,
+  manualUpdatedAt: Date,
   providerRef: String,
   providerOrderId: String,
   providerShipmentId: String,

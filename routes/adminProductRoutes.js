@@ -14,6 +14,8 @@ router.get('/:id', product.getProductById);
 router.post('/', product.createProduct);
 router.put('/:id', product.updateProduct);
 router.delete('/:id', product.deleteProduct);
+router.get('/:id/deletion-preview', product.productDeletionPreview);
+router.delete('/:id/permanent', product.permanentlyDeleteProduct);
 router.post('/:id/duplicate', product.duplicateProduct);
 router.patch('/:id/restore', product.restoreProduct);
 router.patch('/:id/status', product.updateStatus);

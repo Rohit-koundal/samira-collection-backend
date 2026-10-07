@@ -86,6 +86,7 @@ const post = new Schema({
   submittedAt: Date,
   leaseUntil: Date, workerId: String, attempts: { type: Number, default: 0 },
   preparedAssetKeys: [String], assetsPurgedAt: Date,
+  generationAssets: { type: Schema.Types.Mixed, default: {} },
 }, { timestamps: true, optimisticConcurrency: true });
 post.index({ storeId: 1, createdAt: -1 });
 post.index({ status: 1, scheduledFor: 1, leaseUntil: 1, updatedAt: 1 }, { name: 'social_post_worker_due' });

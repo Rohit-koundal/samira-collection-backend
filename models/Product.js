@@ -1,5 +1,6 @@
 const mongoose = require('mongoose');
 const storeIdPlugin = require('./plugins/storeId');
+const imageBackground = require('./imageBackgroundSchema');
 
 const variantSchema = new mongoose.Schema({
   sku: String,
@@ -39,6 +40,7 @@ const productSchema = new mongoose.Schema({
   brand: { type: String, default: 'Samira Collection' },
   shortDescription: String,
   industry: { type: String, default: 'fashion', index: true },
+  commerceMode: { type: String, enum: ['SALE_ONLY', 'RENTAL_ONLY', 'SALE_AND_RENTAL'], default: 'SALE_ONLY' },
   industryRevision: { type: Number, default: 0 },
   categoryDefinitionKey: { type: String, default: '' },
   attributeValues: { type: Map, of: String, default: {} },
@@ -53,7 +55,7 @@ const productSchema = new mongoose.Schema({
   gstRate: { type: Number, min: 0, max: 100, default: 0 },
   hsnCode: { type: String, trim: true, default: '' },
   barcode: { type: String, trim: true, default: '' },
-  images: [{ url: String, publicId: String, primary: { type: Boolean, default: false }, sourceFrame: { type: new mongoose.Schema({ timestampSeconds: Number, qualityScore: Number, viewType: String, width: Number, height: Number, selectionVersion: String }, { _id: false }), default: undefined } }],
+  images: [{ url: String, publicId: String, primary: { type: Boolean, default: false }, background: { type: imageBackground, default: undefined }, sourceFrame: { type: new mongoose.Schema({ timestampSeconds: Number, qualityScore: Number, viewType: String, width: Number, height: Number, selectionVersion: String }, { _id: false }), default: undefined } }],
   videos: [{ url: String, publicId: String, thumbnail: String }],
   sizes: [String],
   sizingMode: { type: String, enum: ['auto', 'sized', 'free-size'], default: 'auto' },
@@ -71,6 +73,7 @@ const productSchema = new mongoose.Schema({
   colors: [String],
   fabric: String,
   occasion: String,
+  completeLookProductIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Product' }],
   variantGroupId: { type: mongoose.Schema.Types.ObjectId, ref: 'VariantGroup' },
   variantName: String,
   variantColor: String,
@@ -79,6 +82,7 @@ const productSchema = new mongoose.Schema({
   stock: { type: Number, required: true, default: 0 },
   lowStockAlert: { type: Number, default: 5 },
   inventoryRevision: { type: Number, min: 0, default: 0 },
+  catalogReferenceRevision: { type: Number, default: 0, select: false },
   nonSellableStock: {
     damaged: { type: Number, min: 0, default: 0 },
     quarantine: { type: Number, min: 0, default: 0 },

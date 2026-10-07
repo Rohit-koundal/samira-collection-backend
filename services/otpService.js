@@ -40,8 +40,8 @@ function verifyOtpHash(phone, otp, otpHash) {
   return compareOtp(phone, otp, otpHash);
 }
 
-function buildMemoryKey(targetType, target) {
-  return `${targetType}:${target}`;
+function buildMemoryKey(targetType, target, contextId = '') {
+  return `${targetType}:${target}:${String(contextId || '')}`;
 }
 
 function normalizeEmail(email = '') {
@@ -69,10 +69,10 @@ async function canResendOtp(phone) {
   return canResendTargetOtp(normalizedPhone, 'phone');
 }
 
-async function canResendTargetOtp(target, targetType = 'phone') {
+async function canResendTargetOtp(target, targetType = 'phone', { purpose, contextId } = {}) {
   const normalizedTarget = normalizeTarget(target, targetType);
   if (useMemoryOtpStore()) {
-    const latest = memoryOtps.get(buildMemoryKey(targetType, normalizedTarget));
+    const latest = memoryOtps.get(buildMemoryKey(targetType, normalizedTarget, contextId));
     const cooldownSeconds = Number(process.env.OTP_RESEND_COOLDOWN_SECONDS || 60);
     if (!latest || latest.isUsed) return { allowed: true, latest: null, retryAfter: 0 };
     const elapsedSeconds = Math.floor((Date.now() - latest.createdAt.getTime()) / 1000);
@@ -82,7 +82,7 @@ async function canResendTargetOtp(target, targetType = 'phone') {
       retryAfter: Math.max(0, cooldownSeconds - elapsedSeconds),
     };
   }
-  const latest = await Otp.findOne({ target: normalizedTarget, targetType, isUsed: false }).sort('-createdAt');
+  const latest = await Otp.findOne({ target: normalizedTarget, targetType, isUsed: false, ...(purpose ? { purpose } : {}), ...(contextId ? { contextId: String(contextId) } : {}) }).sort('-createdAt');
   const cooldownSeconds = Number(process.env.OTP_RESEND_COOLDOWN_SECONDS || 60);
   if (!latest) return { allowed: true, latest: null, retryAfter: 0 };
   const elapsedSeconds = Math.floor((Date.now() - latest.createdAt.getTime()) / 1000);
@@ -101,7 +101,7 @@ async function createEmailOtp(email, purpose = 'profile_email_change', req) {
   return createTargetOtp(email, { purpose, req, targetType: 'email' });
 }
 
-async function createTargetOtp(target, { purpose = 'login', req, targetType = 'phone' } = {}) {
+async function createTargetOtp(target, { purpose = 'login', req, targetType = 'phone', contextId } = {}) {
   const demoProvider = purpose === 'master_demo_login' ? getOwnerDemoProvider(req) : '';
   if (purpose === 'master_demo_login' && !demoProvider) {
     const error = new Error('Owner demo login is not enabled for this request. Please request a new OTP.');
@@ -109,7 +109,8 @@ async function createTargetOtp(target, { purpose = 'login', req, targetType = 'p
     throw error;
   }
   const normalizedTarget = normalizeTarget(target, targetType);
-  const resend = await canResendTargetOtp(normalizedTarget, targetType);
+  const normalizedContext = String(contextId || '').trim();
+  const resend = await canResendTargetOtp(normalizedTarget, targetType, { purpose, contextId: normalizedContext });
   if (!resend.allowed) {
     const error = new Error(`Please wait ${resend.retryAfter}s before requesting another OTP`);
     error.statusCode = 429;
@@ -125,6 +126,7 @@ async function createTargetOtp(target, { purpose = 'login', req, targetType = 'p
       targetType,
       otpHash: hashOtp(normalizedTarget, otp),
       purpose,
+      contextId: normalizedContext || undefined,
       provider: process.env.SMS_PROVIDER || 'mock',
       expiresAt: new Date(Date.now() + getExpiryMinutes() * 60 * 1000),
       attempts: 0,
@@ -135,15 +137,15 @@ async function createTargetOtp(target, { purpose = 'login', req, targetType = 'p
       userAgent: req?.headers?.['user-agent'],
       createdAt: new Date(),
       async save() {
-        memoryOtps.set(buildMemoryKey(targetType, normalizedTarget), this);
+        memoryOtps.set(buildMemoryKey(targetType, normalizedTarget, normalizedContext), this);
         return this;
       },
     };
-    memoryOtps.set(buildMemoryKey(targetType, normalizedTarget), record);
+    memoryOtps.set(buildMemoryKey(targetType, normalizedTarget, normalizedContext), record);
     return { record, otp, target: normalizedTarget, [targetType]: normalizedTarget };
   }
 
-  await Otp.updateMany({ target: normalizedTarget, targetType, isUsed: false }, { isUsed: true });
+  await Otp.updateMany({ target: normalizedTarget, targetType, isUsed: false, ...(normalizedContext ? { contextId: normalizedContext, purpose } : {}) }, { isUsed: true });
   const record = await Otp.create({
     phone: targetType === 'phone' ? normalizedTarget : undefined,
     email: targetType === 'email' ? normalizedTarget : undefined,
@@ -151,6 +153,7 @@ async function createTargetOtp(target, { purpose = 'login', req, targetType = 'p
     targetType,
     otpHash: hashOtp(normalizedTarget, otp),
     purpose,
+    contextId: normalizedContext || undefined,
     provider: demoProvider || process.env.SMS_PROVIDER || 'mock',
     expiresAt: new Date(Date.now() + getExpiryMinutes() * 60 * 1000),
     maxAttempts: getMaxAttempts(),
@@ -170,7 +173,7 @@ async function verifyEmailOtp(email, otp) {
   return verifyTargetOtp(email, otp, { targetType: 'email' });
 }
 
-async function verifyTargetOtp(target, otp, { targetType = 'phone', req } = {}) {
+async function verifyTargetOtp(target, otp, { targetType = 'phone', req, purpose, contextId } = {}) {
   const normalizedTarget = normalizeTarget(target, targetType);
   const code = String(otp || '');
   if (!/^\d{6}$/.test(code)) {
@@ -179,9 +182,10 @@ async function verifyTargetOtp(target, otp, { targetType = 'phone', req } = {}) 
     throw error;
   }
 
+  const normalizedContext = String(contextId || '').trim();
   const record = useMemoryOtpStore()
-    ? getMemoryOtp(normalizedTarget, targetType)
-    : await Otp.findOne({ target: normalizedTarget, targetType, isUsed: false }).sort('-createdAt');
+    ? getMemoryOtp(normalizedTarget, targetType, normalizedContext)
+    : await Otp.findOne({ target: normalizedTarget, targetType, isUsed: false, ...(purpose ? { purpose } : {}), ...(normalizedContext ? { contextId: normalizedContext } : {}) }).sort('-createdAt');
   if (!record) {
     const error = new Error('OTP not found or expired');
     error.statusCode = 400;
@@ -208,7 +212,7 @@ async function verifyTargetOtp(target, otp, { targetType = 'phone', req } = {}) 
   const matches = compareOtp(normalizedTarget, code, record.otpHash);
 
   if (!matches) {
-    if ((record.purpose === 'master_login' || ownerDemo) && !useMemoryOtpStore()) {
+    if ((record.purpose === 'master_login' || ownerDemo || normalizedContext) && !useMemoryOtpStore()) {
       await Otp.updateOne({ _id: record._id, isUsed: false, attempts: { $lt: record.maxAttempts } }, { $inc: { attempts: 1 } });
     } else {
       record.attempts += 1;
@@ -219,11 +223,13 @@ async function verifyTargetOtp(target, otp, { targetType = 'phone', req } = {}) 
     throw error;
   }
 
-  if ((record.purpose === 'master_login' || ownerDemo) && !useMemoryOtpStore()) {
-    // Atomically redeem once: parallel verify requests cannot reuse an owner OTP.
+  if ((record.purpose === 'master_login' || ownerDemo || normalizedContext) && !useMemoryOtpStore()) {
+    // Atomically redeem scoped and owner OTPs once; parallel requests cannot reuse them.
     const redeemed = await Otp.findOneAndUpdate({
-      _id: record._id, isUsed: false, purpose: record.purpose, trustedDelivery: !ownerDemo, otpHash: record.otpHash,
+      _id: record._id, isUsed: false, purpose: record.purpose, otpHash: record.otpHash,
+      ...((record.purpose === 'master_login' || ownerDemo) ? { trustedDelivery: !ownerDemo } : {}),
       ...(ownerDemo ? { provider: record.provider } : {}),
+      ...(normalizedContext ? { contextId: normalizedContext } : {}),
       attempts: { $lt: record.maxAttempts }, expiresAt: { $gt: new Date() },
     }, { $set: { isUsed: true } }, { new: true });
     if (!redeemed) {
@@ -253,8 +259,8 @@ function useMemoryOtpStore() {
   return process.env.NODE_ENV !== 'production' && mongoose.connection.readyState !== 1;
 }
 
-function getMemoryOtp(target, targetType = 'phone') {
-  const record = memoryOtps.get(buildMemoryKey(targetType, target));
+function getMemoryOtp(target, targetType = 'phone', contextId = '') {
+  const record = memoryOtps.get(buildMemoryKey(targetType, target, contextId));
   if (!record || record.isUsed) return null;
   return record;
 }
@@ -277,4 +283,5 @@ module.exports = {
   canResendOtp,
   canResendTargetOtp,
   requireValidEmail,
+  getExpiryMinutes,
 };

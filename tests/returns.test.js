@@ -6,6 +6,7 @@ const { createAdmin, createCustomer, createProduct, setSettings, validAddress } 
 const Order = require('../models/Order');
 const Product = require('../models/Product');
 const ReturnExchange = require('../models/ReturnExchange');
+const InventoryItem = require('../models/InventoryItem');
 
 test.before(startTestEnvironment);
 test.after(stopTestEnvironment);
@@ -42,6 +43,72 @@ test('a delivered order can request a return inside the window', async () => {
 
   assert.equal(status, 201);
   assert.equal(data.status, 'Requested');
+});
+
+test('a mismatched tracked item requires a documented manual decision and never auto-refunds', async () => {
+  await setSettings({ requireProductQrScan: true, highValueVerificationThreshold: 0 });
+  const customer = await createCustomer();
+  const admin = await createAdmin();
+  const product = await createProduct({ stock: 5 });
+  const placed = await request('/api/orders/cod', { method: 'POST', token: customer.token, body: { orderItems: [{ product: String(product._id), quantity: 1, size: 'M', color: 'Red' }], shippingAddress: validAddress(), paymentMethod: 'COD' } });
+  assert.equal(placed.status, 201, JSON.stringify(placed.data));
+  await Order.updateOne({ _id: placed.data._id }, { $set: { orderStatus: 'Confirmed' } });
+  const labels = await request(`/api/admin/orders/${placed.data._id}/item-identities/generate`, { method: 'POST', token: admin.token, body: {} });
+  assert.equal(labels.status, 201, JSON.stringify(labels.data));
+  let order = await Order.findById(placed.data._id);
+  const packed = await request(`/api/admin/orders/${order._id}/packing/verify`, { method: 'POST', token: admin.token, body: { items: [{ orderItemId: String(order.orderItems[0]._id), uniqueItemIds: order.orderItems[0].uniqueItemIds }] } });
+  assert.equal(packed.status, 200, JSON.stringify(packed.data));
+  await Order.updateOne({ _id: order._id }, { $set: { orderStatus: 'Delivered', deliveredAt: new Date(), paymentStatus: 'Paid', paymentState: 'PAID' } });
+
+  const created = await request('/api/returns', { method: 'POST', token: customer.token, body: { order: String(order._id), product: String(product._id), type: 'return', reason: 'Size issue', quantity: 1 } });
+  assert.equal(created.status, 201, JSON.stringify(created.data));
+  for (const status of ['Approved', 'Received']) {
+    const moved = await request(`/api/admin/returns/${created.data._id}/status`, { method: 'PUT', token: admin.token, body: { status } });
+    assert.equal(moved.status, 200, JSON.stringify(moved.data));
+  }
+  const bypass = await request(`/api/admin/returns/${created.data._id}/status`, { method: 'PUT', token: admin.token, body: { status: 'QC Passed', inventoryDisposition: 'RESTOCK', receivedQuantity: 1, qcNotes: 'Attempted without identity inspection.' } });
+  assert.equal(bypass.status, 409);
+  assert.equal(bypass.data.code, 'RETURN_INSPECTION_REQUIRED');
+  const inspection = await request(`/api/admin/returns/${created.data._id}/inspect`, { method: 'POST', token: admin.token, body: { returnedUniqueItemIds: ['SC-WRONG-999999'], condition: 'DIFFERENT_ITEM', notes: 'Scanned item does not match dispatch record.' } });
+  assert.equal(inspection.status, 200, JSON.stringify(inspection.data));
+  assert.equal(inspection.data.request.status, 'Mismatch Found');
+  assert.ok(inspection.data.assessment.flags.includes('ITEM_ID_MISMATCH'));
+  assert.equal((await InventoryItem.findOne({ order: order._id })).status, 'RETURNED');
+
+  const unsafeApproval = await request(`/api/admin/returns/${created.data._id}/decision`, { method: 'POST', token: admin.token, body: { decision: 'APPROVED' } });
+  assert.equal(unsafeApproval.status, 409);
+  assert.equal(unsafeApproval.data.code, 'MANUAL_REVIEW_REQUIRED');
+  const rejected = await request(`/api/admin/returns/${created.data._id}/decision`, { method: 'POST', token: admin.token, body: { decision: 'REJECTED', reason: 'Returned identifier and product do not match the dispatch record.', customerMessage: 'The returned product could not be verified. Please contact support if you need a second review.' } });
+  assert.equal(rejected.status, 200, JSON.stringify(rejected.data));
+  assert.equal((await Order.findById(order._id)).refundedAmount, 0);
+});
+
+test('a verified tracked return can be approved and refunded without exposing internal evidence', async () => {
+  await setSettings({ requireProductQrScan: true, highValueVerificationThreshold: 0, autoApproveVerifiedReturns: true });
+  const customer = await createCustomer();
+  const admin = await createAdmin();
+  const product = await createProduct({ stock: 5, price: 1000 });
+  const placed = await request('/api/orders/cod', { method: 'POST', token: customer.token, body: { orderItems: [{ product: String(product._id), quantity: 1, size: 'M', color: 'Red' }], shippingAddress: validAddress(), paymentMethod: 'COD' } });
+  await Order.updateOne({ _id: placed.data._id }, { $set: { orderStatus: 'Confirmed' } });
+  const labels = await request(`/api/admin/orders/${placed.data._id}/item-identities/generate`, { method: 'POST', token: admin.token, body: {} });
+  assert.equal(labels.status, 201, JSON.stringify(labels.data));
+  const trackedId = labels.data.items[0].uniqueItemId;
+  let order = await Order.findById(placed.data._id);
+  assert.equal((await request(`/api/admin/orders/${order._id}/packing/verify`, { method: 'POST', token: admin.token, body: { items: [{ orderItemId: String(order.orderItems[0]._id), uniqueItemIds: [trackedId] }] } })).status, 200);
+  await Order.updateOne({ _id: order._id }, { $set: { orderStatus: 'Delivered', deliveredAt: new Date(), paymentStatus: 'Paid', paymentState: 'PAID' } });
+  const created = await request('/api/returns', { method: 'POST', token: customer.token, body: { order: String(order._id), product: String(product._id), type: 'return', reason: 'Size issue', quantity: 1 } });
+  for (const status of ['Approved', 'Received']) assert.equal((await request(`/api/admin/returns/${created.data._id}/status`, { method: 'PUT', token: admin.token, body: { status } })).status, 200);
+  const inspected = await request(`/api/admin/returns/${created.data._id}/inspect`, { method: 'POST', token: admin.token, body: { returnedUniqueItemIds: [trackedId], condition: 'GOOD', notes: 'Identity and condition matched.' } });
+  assert.equal(inspected.status, 200, JSON.stringify(inspected.data));
+  assert.equal(inspected.data.request.status, 'Verified');
+  assert.equal(inspected.data.request.refundDecision.decision, 'APPROVED');
+  assert.equal((await request(`/api/admin/returns/${created.data._id}/status`, { method: 'PUT', token: admin.token, body: { status: 'QC Passed', inventoryDisposition: 'RESTOCK', receivedQuantity: 1, qcNotes: 'Verified and sellable.' } })).status, 200);
+  assert.equal((await request(`/api/admin/returns/${created.data._id}/status`, { method: 'PUT', token: admin.token, body: { status: 'Refund Initiated', refundAmount: 1000 } })).status, 200);
+  const customerView = await request('/api/returns/my-requests', { token: customer.token });
+  assert.equal(customerView.status, 200);
+  assert.equal(customerView.data[0].inspection.expectedUniqueItemIds, undefined);
+  assert.equal(customerView.data[0].inspection.flags, undefined);
+  assert.equal(customerView.data[0].refundDecision.reason, undefined);
 });
 
 test('refund destination stays encrypted and requires an audited admin reveal', async () => {

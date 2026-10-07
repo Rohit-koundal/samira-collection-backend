@@ -5,6 +5,7 @@ const SECRET_KEYS = [
   'password', 'otp', 'demoOtp', 'devOtp', 'token', 'refreshToken', 'authorization',
   'jwt', 'secret', 'razorpay_secret', 'razorpaySecret', 'webhookSecret', 'key_secret',
   'accessToken', 'encryptedAccessToken', 'encryptedRefreshToken',
+  'apiKey', 'authKey', 'accountSid', 'credentials', 'codeHash',
 ];
 
 function isSecretKey(key) {

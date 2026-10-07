@@ -6,6 +6,7 @@ const { decryptSecret } = require('../../utils/secretBox');
 const meta = require('./meta');
 const media = require('./media');
 const { notifyLater } = require('../../services/notificationService');
+const { createRecordOnce, invalidateRecordCreation } = require('../../services/recordCreationService');
 function catalogFilter(store) { return store.isDefault ? defaultStoreFilter(store._id) : { storeId: store._id }; }
 function productImages(product) { return [...new Set([product.primaryImage, ...(product.images || []).map(i => i.url)].filter(Boolean))].slice(0, 20); }
 function productLink(product, store) {
@@ -40,11 +41,11 @@ async function saveDraft(req, res) {
     draft = await Post.findOne({ _id: req.params.id, storeId: req.socialStore._id, status: 'draft', videoStatus: { $nin: ['queued', 'processing'] }, ...versionFilter });
     if (!draft) throw meta.fail('This post is processing or has already been submitted. Create a new draft to make changes.', 409);
     if (JSON.stringify(draft.images) !== JSON.stringify(images) || String(draft.productId) !== String(product._id) || draft.productName !== product.name || draft.productPrice !== product.price) {
-      discardedAssets = [...(draft.preparedImages || []), draft.videoUrl].filter(Boolean);
-      draft.videoUrl = ''; draft.videoStatus = 'none'; draft.preparedImages = [];
+      discardedAssets = media.generatedAssets(draft);
+      draft.videoUrl = ''; draft.videoStatus = 'none'; draft.preparedImages = []; draft.generationAssets = {};
     }
     Object.assign(draft, values); await draft.save();
-  } else draft = await Post.create({ ...values, storeId: req.socialStore._id, createdBy: req.user._id });
+  } else draft = await createRecordOnce(req, { Model: Post, filter: { storeId: req.socialStore._id }, create: identity => Post.create({ ...values, ...identity, storeId: req.socialStore._id, createdBy: req.user._id }) });
   if (discardedAssets.length) setImmediate(() => media.removeAssets(discardedAssets));
   res.json({ post: draft });
 }
@@ -91,7 +92,8 @@ async function publish(req, res) {
 async function remove(req, res) {
   const post = await Post.findOneAndDelete({ _id: req.params.id, storeId: req.socialStore._id, status: 'draft', videoStatus: { $nin: ['queued', 'processing'] } });
   if (!post) throw meta.fail('Only idle drafts can be deleted.', 409);
-  setImmediate(() => media.removeAssets([...(post.preparedImages || []), post.videoUrl]));
+  await invalidateRecordCreation(post._id);
+  setImmediate(() => media.removeAssets(media.generatedAssets(post)));
   res.json({ success: true });
 }
 async function cancelSchedule(req, res) {

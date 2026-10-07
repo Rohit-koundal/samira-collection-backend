@@ -408,12 +408,14 @@ test('social workspace uses isolated persistence and mocked Meta only', { timeou
   }
 });
 
-test('real product video rendering produces a playable vertical H.264 MP4', { timeout: 60000 }, async () => {
+test('real product video rendering produces a playable vertical H.264 MP4', { timeout: 60000 }, async t => {
+  // Rendering is isolated from the closed database used by the HTTP suite.
+  t.mock.method(Post, 'updateOne', async () => ({ matchedCount: 1 }));
   const folder = path.resolve(__dirname, '../../uploads'); await fs.mkdir(folder, { recursive: true });
   const source = path.join(folder, 'social-isolated-test-' + crypto.randomUUID() + '.png'); let output;
   try {
     await media.run(['-f', 'lavfi', '-i', 'color=c=0xb26783:s=640x800', '-frames:v', '1', source], folder);
-    const url = await media.prepare({ productName: 'Test cotton kurta', productPrice: 1299, images: ['/uploads/' + path.basename(source)] }, true);
+    const url = await media.prepare({ _id: new mongoose.Types.ObjectId(), storeId: new mongoose.Types.ObjectId(), productName: 'Test cotton kurta', productPrice: 1299, images: ['/uploads/' + path.basename(source)] }, true);
     output = path.resolve(folder, path.basename(new URL(url).pathname));
     assert.ok(output.startsWith(folder + path.sep));
     const info = await require('../../services/videoMetadata.service').inspectVideo(output);

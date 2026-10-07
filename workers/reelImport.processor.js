@@ -11,26 +11,38 @@ const {
 } = require('../services/reelImportProgress.service');
 
 async function processReelImportJob({ jobId, storageKey }) {
-  const job = await ReelImport.findOne({ _id: jobId, 'sourceVideo.storageKey': storageKey }).select('+sourceVideo.url');
+  let job = await ReelImport.findOne({ _id: jobId, 'sourceVideo.storageKey': storageKey }).select('+sourceVideo.url');
   if (!job) throw processingError('REEL_JOB_NOT_FOUND', 'The reel import job no longer exists.');
   if (job.status === 'cancelled' || job.cancellationRequested) return { cancelled: true };
   if (job.status === 'review_required' || job.status === 'completed') return { idempotent: true };
 
   const started = Date.now();
   const runId = crypto.randomUUID();
+  const expired = new Date(Date.now() - 90000);
+  const claimed = await ReelImport.findOneAndUpdate({ _id: job._id, cancellationRequested: { $ne: true }, $or: [
+    { status: { $in: ['uploaded', 'queued', 'failed'] } },
+    { status: 'processing', $or: [{ lastHeartbeatAt: { $lt: expired } }, { lastHeartbeatAt: { $exists: false }, updatedAt: { $lt: expired } }] },
+  ] }, { $set: { status: 'processing', activeRunId: runId, lastHeartbeatAt: new Date() } }, { new: true }).select('+sourceVideo.url +activeRunId');
+  if (!claimed) {
+    const current = await ReelImport.findById(job._id);
+    return current?.status === 'processing' ? { busy: true } : { idempotent: true };
+  }
+  job = claimed;
   job.status = 'processing';
   job.activeRunId = runId;
   job.startedAt = job.startedAt || new Date();
   job.attemptCount += 1;
   job.error = undefined;
-  await saveProgress(job, {
-    stage: 'preparing_video',
-    percentage: 10,
-    currentStep: 'Preparing video',
-    message: `Processing attempt ${job.attemptCount} started.`,
-  });
-
+  const heartbeat = setInterval(() => heartbeatActiveRun(job._id, runId).catch(() => {}), 15000);
+  heartbeat.unref?.();
   try {
+    await saveProgress(job, {
+      stage: 'preparing_video',
+      percentage: 10,
+      currentStep: 'Preparing video',
+      message: `Processing attempt ${job.attemptCount} started.`,
+    });
+
     const result = await requestAiWorker(job, runId);
     result.candidates = await enrichCandidatesWithSmartDetails(job, runId, result.candidates || []);
     const refreshed = await ReelImport.findOne({
@@ -104,7 +116,18 @@ async function processReelImportJob({ jobId, storageKey }) {
       message: error.message,
     });
     throw error;
+  } finally { clearInterval(heartbeat); }
+}
+
+async function processQueuedReelImport(bullJob, token) {
+  const result = await processReelImportJob(bullJob.data);
+  if (result.busy) {
+    // Do not mark a still-running/crashed lease as completed or consume attempts.
+    // The same queue job will retry after the live lease has released/expired.
+    await bullJob.moveToDelayed(Date.now() + 30000, token);
+    throw new (require('bullmq').DelayedError)();
   }
+  return result;
 }
 
 async function requestAiWorker(job, runId) {
@@ -132,9 +155,6 @@ async function requestAiWorker(job, runId) {
   });
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), config.timeoutMinutes * 60 * 1000);
-  const heartbeat = setInterval(() => {
-    heartbeatActiveRun(job._id, runId).catch(() => null);
-  }, 15000);
   try {
     const response = await fetch(`${baseUrl}/internal/reel-processing/jobs`, {
       method: 'POST',
@@ -165,15 +185,12 @@ async function requestAiWorker(job, runId) {
     throw processingError('AI_WORKER_UNAVAILABLE', 'The video processing worker could not be reached.');
   } finally {
     clearTimeout(timeout);
-    clearInterval(heartbeat);
   }
 }
 
 async function persistCandidates(job, candidates) {
-  const existing = await ReelCandidate.countDocuments({ job: job._id });
-  if (existing) return;
   if (!candidates.length) throw processingError('NO_USABLE_FRAMES', 'No usable product frames were detected. Try better lighting and slower transitions.');
-  await ReelCandidate.insertMany(candidates.map((candidate, index) => ({
+  await ReelCandidate.bulkWrite(candidates.map((candidate, index) => ({ updateOne: { filter: { job: job._id, groupNumber: index + 1 }, upsert: true, update: { $setOnInsert: {
     job: job._id,
     groupNumber: index + 1,
     status: 'suggested',
@@ -186,7 +203,7 @@ async function persistCandidates(job, candidates) {
     confidence: candidate.confidence || {},
     analysis: candidate.analysis || {},
     adminOverrides: {},
-  })));
+  } } } })));
 }
 
 async function enrichCandidatesWithSmartDetails(job, runId, candidates) {
@@ -268,4 +285,4 @@ function structuredLog(event, jobId, details = {}) {
   console.log(JSON.stringify({ event, jobId: String(jobId), ...details }));
 }
 
-module.exports = { processReelImportJob, processingError, safeProcessingMessage };
+module.exports = { processReelImportJob, processQueuedReelImport, processingError, safeProcessingMessage };

@@ -99,12 +99,14 @@ test('concurrent ordinary draft publications and retry create exactly one produc
   assert.equal(String(saved.publishedProductId), String(retry.data.data.products[0]._id));
 });
 
-test('retry recovers product creation if saving draft publication state was interrupted', async () => {
+test('publication rolls back product creation if saving draft state is interrupted and retry succeeds', async () => {
   const draft = await draftFixture();
   const actualSave = draft.save.bind(draft);
   draft.save = async () => { throw new Error('Synthetic local write interruption'); };
   await assert.rejects(publishPreparedDraft(draft), /write interruption/);
-  assert.equal(await Product.countDocuments({ sourceDraftId: draft._id }), 1);
+  assert.equal(await Product.countDocuments({ sourceDraftId: draft._id }), 0);
+  assert.equal(await InventoryTransaction.countDocuments(), 0);
+  assert.equal((await ProductDraft.findById(draft._id).select('+publishingToken')).publishingToken, undefined);
   const retryDraft = await ProductDraft.findById(draft._id);
   assert.equal(retryDraft.status, 'draft');
   const result = await publishPreparedDraft(retryDraft);

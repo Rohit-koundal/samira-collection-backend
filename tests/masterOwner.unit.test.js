@@ -75,7 +75,7 @@ test('service-level guard rejects direct configuration calls without a master se
 test('all industry presets are independent, valid and have the intended sizing profile', () => {
   assert.deepEqual(
     INDUSTRY_PRESETS.map((preset) => preset.industry),
-    ['fashion', 'mobile', 'electronics', 'jewellery', 'cosmetics', 'art', 'bakery', 'footwear', 'home'],
+    ['fashion', 'mobile', 'electronics', 'jewellery', 'cosmetics', 'art', 'bakery', 'footwear', 'home', 'boutique'],
   );
   for (const preset of INDUSTRY_PRESETS) {
     const result = service.validateStructure({ ...copy(preset), clientPermissions: { content: true, payments: true } });
@@ -115,10 +115,19 @@ test('standalone project generator creates a renamed isolated source package wit
   assert.equal(result.buffer.readUInt32LE(0), 0x04034b50);
   const entries = readZip(result.buffer);
   const prefix = 'rohit-mobiles/';
+  for (const name of ['backend/services/rentalService.js', 'backend/services/rentalProofService.js', 'backend/services/rentalCourierService.js', 'backend/services/rentalAssetConversionService.js', 'backend/services/rentalDocumentsService.js', 'src/components/rentals/RentalPolicyControls.jsx', 'src/components/rentals/RentalProofPanel.jsx', 'src/components/rentals/RentalCourierPanel.jsx', 'src/components/rentals/RentalDocuments.jsx', 'src/components/rentals/RentalSaleTransfer.jsx']) assert.ok(entries.has(prefix + name), name);
+  assert.equal(JSON.parse(entries.get(prefix + 'backend/package.json')).dependencies.sharp, '^0.34.5');
   for (const name of ['package.json', 'backend/package.json', 'src/App.jsx', 'src/components/pwa/MobileAppCompanion.jsx', 'src/components/admin/OrderWorkflowActions.jsx', 'backend/services/orderWorkflowService.js', 'public/sw.js', 'public/offline.html', 'README.md', '.gitignore', '.env.example', 'backend/.env.example', 'backend/controllers/catalogConfigurationController.js', 'project-manifest.json']) assert.ok(entries.has(prefix + name), name);
   assert.equal(JSON.parse(entries.get(prefix + 'package.json')).name, 'rohit-mobiles');
   assert.equal(JSON.parse(entries.get(prefix + 'backend/package.json')).name, 'rohit-mobiles-backend');
   assert.match(entries.get(prefix + 'src/config/websiteCustomization.js').toString('utf8'), /Rohit Mobiles/);
+  assert.match(entries.get(prefix + 'src/assets/generated-brand-logo.svg').toString('utf8'), /Rohit Mobiles/);
+  assert.match(entries.get(prefix + 'src/components/ui/StoreLogo.jsx').toString('utf8'), /generated-brand-logo\.svg/);
+  for (const [name, contents] of entries) {
+    if (!/^rohit-mobiles\/(?:src|backend|public)\//.test(name) || /(?:\.test\.|\/tests\/)/.test(name)) continue;
+    if (!/\.(?:html|js|jsx|json|md|svg|txt|ya?ml)$/.test(name)) continue;
+    assert.doesNotMatch(contents.toString('utf8'), /Samira Collection|SAMIRA COLLECTION|\bSamira\b/, name);
+  }
   assert.match(entries.get(prefix + 'backend/services/storeService.js').toString('utf8'), /DEFAULT_STORE_SLUG = 'rohit-mobiles'/);
   assert.match(entries.get(prefix + 'backend/config/industryPresets.js').toString('utf8'), /"industry":"mobile"/);
   assert.doesNotMatch(entries.get(prefix + 'src/App.jsx').toString('utf8'), /MasterConfiguration|MasterRoute|PlatformStores|masterPages|isMaster/);
@@ -148,6 +157,19 @@ test('standalone project generator creates a renamed isolated source package wit
   assert.match(entries.get(prefix + 'backend/config/corsOptions.js').toString('utf8'), /https:\/\/rohit-mobiles\.onrender\.com/);
   assert.doesNotMatch(entries.get(prefix + 'backend/config/corsOptions.js').toString('utf8'), /endsWith\('\.onrender\.com'\)/);
   assert.match(entries.get(prefix + '.env.example').toString('utf8'), /GENERATE_SOURCEMAP=false/);
+  for (const name of ['backend/SMS.md', 'backend/scripts/check-sms-config.js', 'backend/services/providers/twoFactorProvider.js']) assert.ok(entries.has(prefix + name), name);
+  const smsExample = entries.get(prefix + 'backend/.env.example').toString('utf8');
+  assert.match(smsExample, /^JWT_ADMIN_EXPIRES_IN=24h$/m);
+  assert.match(smsExample, /^JWT_EXPIRES_IN=15m$/m);
+  assert.match(entries.get(prefix + 'backend/utils/generateToken.js').toString('utf8'), /JWT_ADMIN_EXPIRES_IN/);
+  for (const key of ['MSG91_AUTH_KEY', 'MSG91_TEMPLATE_ID', 'TWOFACTOR_API_KEY', 'TWOFACTOR_TEMPLATE_NAME']) assert.match(smsExample, new RegExp(`^${key}=$`, 'm'));
+  for (const name of ['render.yaml', 'backend/render.yaml']) {
+    const blueprint = entries.get(prefix + name).toString('utf8');
+    assert.match(blueprint, /key: SMS_PROVIDER\r?\n\s+sync: false/);
+    assert.match(blueprint, /key: JWT_ADMIN_EXPIRES_IN\r?\n\s+value: 24h/);
+    assert.match(blueprint, /key: SMS_AUTH_TOKEN\r?\n\s+value: ""/);
+    assert.match(blueprint, /key: ALLOW_HOSTED_OWNER_DEMO\r?\n\s+value: "false"/);
+  }
 });
 
 test('rejects malicious, duplicate and incomplete structural definitions', () => {
@@ -513,6 +535,7 @@ test('hybrid OTP sends real owner SMS while customer demo uses 123456 without SM
   process.env.ALLOW_HOSTED_OWNER_DEMO = 'false';
   try {
     let record;
+    t.mock.method(require('../models/SmsConfiguration'), 'findById', () => ({ select: () => ({ lean: async () => null }) }));
     t.mock.method(crypto, 'randomInt', () => 765432);
     t.mock.method(Otp, 'findOne', () => ({ sort: async () => record && !record.isUsed ? record : null }));
     t.mock.method(Otp, 'updateMany', async () => {});

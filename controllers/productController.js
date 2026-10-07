@@ -15,6 +15,7 @@ const { logAudit } = require('../services/auditService');
 const { auditSnapshot } = require('../utils/auditData');
 const PRODUCT_AUDIT_FIELDS = ['name', 'sku', 'slug', 'brand', 'category', 'subCategory', 'price', 'originalPrice', 'salePrice', 'costPrice', 'gstRate', 'hsnCode', 'barcode', 'stock', 'lowStockAlert', 'reorderQuantity', 'shippingWeightKg', 'packageDimensions', 'countryOfOrigin', 'manufacturerDetails', 'warranty', 'supplierName', 'supplierSku', 'restockAt', 'publishAt', 'saleStartAt', 'saleEndAt', 'isActive', 'isArchived', 'isFeatured', 'isBestSeller', 'isNewArrival', 'showOnHomepage', 'showInTrending', 'showInFestive', 'sizes', 'colors', 'fabric', 'occasion', 'description', 'shortDescription', 'variants', 'variantGroupId', 'sizingMode', 'sizeChartProfile', 'sizeChart', 'sizeFitNotes', 'attributeValues', 'specifications', 'highlights', 'careInstructions', 'returnPolicy', 'returnable', 'exchangeable', 'returnWindowDays', 'tags'];
 const { analyzeQuickAddImage, getQuickAddVisionStatus } = require('../services/quickAddVision.service');
+PRODUCT_AUDIT_FIELDS.push('completeLookProductIds', 'commerceMode');
 const { wantsPagination, readPagination, buildPaginatedResponse } = require('../utils/validators');
 const { normalizeProductSizing, validateProductSizing } = require('../services/productSizingService');
 const { applyEffectivePricing } = require('../services/productPricingService');
@@ -80,6 +81,8 @@ function normalizeProductResponse(product, req) {
   const isPrivateCatalog = baseUrl.startsWith('/api/admin/products') || baseUrl.startsWith('/api/seller');
   const data = normalizeProductImages(isPrivateCatalog ? product : applyEffectivePricing(product), req);
   if (data.attributeValues instanceof Map) data.attributeValues = Object.fromEntries(data.attributeValues);
+  if (!isPrivateCatalog) delete data.completeLookProductIds;
+  if (!isPrivateCatalog && req?.store?.catalogStructure?.commerce?.mode === 'RENTAL_ONLY') data.commerceMode = 'RENTAL_ONLY';
   return normalizeProductSizing(data, data.category?.name || '');
 }
 
@@ -165,7 +168,7 @@ exports.getProducts = asyncHandler(async (req, res) => {
     if (values.length) query.fabric = { $in: values };
   }
   if (req.query.occasion) {
-    const values = readQueryValues(req.query.occasion).map((value) => new RegExp(`(^|[,;|]\\s*)${escapeRegex(value)}(\\s*[,;|]|$)`, 'i'));
+    const values = readQueryValues(req.query.occasion).map((value) => new RegExp(`(^|[,;|])\\s*${value.trim().split(/\s+/).map(escapeRegex).join('\\s+')}\\s*(?=[,;|]|$)`, 'i'));
     if (values.length) query.occasion = { $in: values };
   }
   if (req.query.minPrice || req.query.maxPrice) {
@@ -420,7 +423,7 @@ function hasStoredValue(stored, value) {
 }
 
 function sameText(left, right) { return normalizeFacetKey(left) === normalizeFacetKey(right); }
-function normalizeFacetKey(value) { return String(value || '').trim().toLowerCase(); }
+function normalizeFacetKey(value) { return String(value || '').trim().replace(/\s+/g, ' ').toLowerCase(); }
 
 function uniqueFacetValues(values) {
   const seen = new Set();
@@ -505,6 +508,7 @@ exports.analyzeQuickAdd = async (req, res) => {
 };
 
 exports.createProduct = asyncHandler(async (req, res) => {
+  await require('../services/storefrontDiscoveryService').validateComplements(req, req.body || {});
   const basePayload = await applyProductStructure(withStoreId({ ...req.body, images: sanitizeProductImages(req.body.images) }, req));
   const categoryName = await getCategoryName(basePayload.category, req);
   if (basePayload.category && !categoryName) return res.status(400).json({ message: 'Choose a category from this store' });
@@ -542,6 +546,7 @@ exports.updateProduct = asyncHandler(async (req, res) => {
   const existingProduct = await Product.findOne(catalogQuery(req, { _id: req.params.id }));
   if (!existingProduct) return res.status(404).json({ message: 'Product not found' });
   assertStoreOwned(existingProduct, req);
+  await require('../services/storefrontDiscoveryService').validateComplements(req, req.body || {}, existingProduct._id, existingProduct.storeId);
   const expectedInventoryRevision = req.body?.inventoryRevision === undefined ? null : Number(req.body.inventoryRevision);
   if (expectedInventoryRevision !== null && (!Number.isSafeInteger(expectedInventoryRevision) || expectedInventoryRevision < 0)) return res.status(400).json({ message: 'Inventory revision must be a whole number of zero or more' });
   if (expectedInventoryRevision !== null && expectedInventoryRevision !== Number(existingProduct.inventoryRevision || 0)) {
@@ -596,7 +601,9 @@ exports.updateProduct = asyncHandler(async (req, res) => {
     }
     return saved;
   });
-  await cleanupRemovedProductImages(existingProduct.images || [], product.images || []);
+  await cleanupRemovedProductImages(existingProduct.images || [], [
+    ...(product.images || []), ...(product.variants || []).flatMap(variant => variant.images || []),
+  ]);
   logAudit({
     req,
     action: 'PRODUCT_UPDATE',
@@ -620,6 +627,17 @@ exports.deleteProduct = asyncHandler(async (req, res) => {
   await product.save();
   logAudit({ req, action: 'PRODUCT_ARCHIVE', entityType: 'Product', entityId: product._id, storeId: product.storeId, before, after: auditSnapshot(product, ['isActive', 'isArchived']) });
   res.json({ message: 'Product archived', product });
+});
+
+exports.productDeletionPreview = asyncHandler(async (req, res) => {
+  require('../utils/validators').requireObjectId(req.params.id, 'product id');
+  res.set('Cache-Control', 'private, no-store');
+  res.json(await require('../services/productDeletionService').preview(req));
+});
+
+exports.permanentlyDeleteProduct = asyncHandler(async (req, res) => {
+  require('../utils/validators').requireObjectId(req.params.id, 'product id');
+  res.json(await require('../services/productDeletionService').permanentlyDelete(req));
 });
 
 exports.updateStatus = asyncHandler(async (req, res) => {
@@ -836,6 +854,7 @@ function applyVariantPayload(data = {}) {
 }
 
 function validateProduct(data, creating = true) {
+  if (data.commerceMode !== undefined && !['SALE_ONLY', 'RENTAL_ONLY', 'SALE_AND_RENTAL'].includes(data.commerceMode)) return 'Choose a valid sale/rental product mode';
   if (!data.name || data.name.trim().length < 3) return 'Product name must be at least 3 characters';
   if (!data.sku) return 'SKU is required';
   if (creating && !data.category) return 'Category is required';
@@ -907,11 +926,18 @@ function isInaccessibleImageUrl(url = '') {
 }
 
 async function cleanupRemovedProductImages(existingImages = [], nextImages = []) {
+  existingImages = existingImages.flatMap(imageAssets);
+  nextImages = nextImages.flatMap(imageAssets);
   const retainedKeys = new Set(
     nextImages.map((image) => String(image.publicId || image.url || '')).filter(Boolean),
   );
   const removedImages = existingImages.filter((image) => !retainedKeys.has(String(image.publicId || image.url || '')));
   await Promise.all(removedImages.map((image) => safeDeleteImage(image)));
+}
+
+function imageAssets(image) {
+  const assets = [image, image?.background?.original, image?.background?.edited].filter(Boolean);
+  return [...new Map(assets.map(asset => [asset.publicId || asset.url, asset])).values()];
 }
 
 async function safeDeleteImage(image) {
@@ -926,7 +952,7 @@ async function safeDeleteImage(image) {
 async function cleanupProductAssets(product) {
   const deletions = [];
   if (Array.isArray(product.images)) {
-    deletions.push(...product.images.map((image) => safeDeleteImage(image)));
+    deletions.push(...product.images.flatMap(imageAssets).map((image) => safeDeleteImage(image)));
   }
   if (Array.isArray(product.videos)) {
     for (const video of product.videos) {

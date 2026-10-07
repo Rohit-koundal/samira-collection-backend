@@ -328,6 +328,8 @@ async function validateInstallation({ installationId, secret, appVersion, protoc
     installation.usage = {
       products: Number.isFinite(products) && products >= 0 ? Math.floor(products) : Number(installation.usage?.products || 0),
       ordersPerMonth: Number.isFinite(ordersPerMonth) && ordersPerMonth >= 0 ? Math.floor(ordersPerMonth) : Number(installation.usage?.ordersPerMonth || 0),
+      saleOrdersPerMonth: Number.isSafeInteger(telemetry.saleOrdersPerMonth) && telemetry.saleOrdersPerMonth >= 0 ? telemetry.saleOrdersPerMonth : installation.usage?.saleOrdersPerMonth,
+      rentalBookingsPerMonth: Number.isSafeInteger(telemetry.rentalBookingsPerMonth) && telemetry.rentalBookingsPerMonth >= 0 ? telemetry.rentalBookingsPerMonth : installation.usage?.rentalBookingsPerMonth,
       reportedAt: now,
     };
     installation.runtime = {

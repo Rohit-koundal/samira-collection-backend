@@ -10,6 +10,7 @@ const InventoryTransaction = require('../models/InventoryTransaction');
 const ReturnExchange = require('../models/ReturnExchange');
 const Shipment = require('../models/Shipment');
 const Cart = require('../models/Cart');
+const InventoryItem = require('../models/InventoryItem');
 const { retryPendingCartCleanup } = require('../services/checkoutSafetyService');
 
 test.before(startTestEnvironment);
@@ -28,7 +29,8 @@ function codOrderBody(product, overrides = {}) {
   };
 }
 
-test('a COD order is priced from the database, not from the request', async () => {
+test('a COD order is priced from the database, not from the request', async t => {
+  const queued = t.mock.method(require('../services/orderAlertService'), 'queueLater', () => {});
   const { token } = await createCustomer();
   const product = await createProduct({ price: 1200, originalPrice: 2000, stock: 5 });
 
@@ -45,6 +47,8 @@ test('a COD order is priced from the database, not from the request', async () =
   });
 
   assert.equal(status, 201);
+  assert.equal(queued.mock.callCount(), 1);
+  assert.equal(String(queued.mock.calls[0].arguments[0]), String(data._id));
   assert.equal(data.orderItems[0].price, 1200);
   assert.equal(data.totalMRP, 4000);
   // 2 x 1200 = 2400, above the 999 free-shipping threshold.
@@ -520,4 +524,39 @@ test('checkout honors its resolved store when loading authoritative product rows
     orderItems: [{ product: String(product._id), quantity: 1 }],
     tenantFilter: { storeId: '0123456789abcdef11111111' },
   }), (error) => error.errorCode === 'NOT_FOUND');
+});
+
+test('protected orders cannot be packed until every physical unit is verified', async () => {
+  await setSettings({ requireProductQrScan: true, highValueVerificationThreshold: 0 });
+  const customer = await createCustomer();
+  const admin = await createAdmin();
+  const product = await createProduct({ stock: 5 });
+  const created = await request('/api/orders/cod', { method: 'POST', token: customer.token, body: codOrderBody(product, { orderItems: [{ product: String(product._id), quantity: 2, size: 'M', color: 'Red' }] }) });
+  assert.equal(created.status, 201, JSON.stringify(created.data));
+
+  let current = await Order.findById(created.data._id);
+  const confirmed = await request(`/api/admin/orders/${current._id}/status`, { method: 'PUT', token: admin.token, body: { orderStatus: 'Confirmed', revision: current.revision } });
+  assert.equal(confirmed.status, 200, JSON.stringify(confirmed.data));
+  current = await Order.findById(current._id);
+  const blocked = await request(`/api/admin/orders/${current._id}/status`, { method: 'PUT', token: admin.token, body: { orderStatus: 'Packed', revision: current.revision } });
+  assert.equal(blocked.status, 409);
+  assert.equal(blocked.data.code, 'PACKING_VERIFICATION_REQUIRED');
+
+  const labels = await request(`/api/admin/orders/${current._id}/item-identities/generate`, { method: 'POST', token: admin.token, body: {} });
+  assert.equal(labels.status, 201, JSON.stringify(labels.data));
+  assert.equal(labels.data.items.length, 2);
+  assert.equal(new Set(labels.data.items.map(item => item.uniqueItemId)).size, 2);
+  assert.ok(labels.data.items.every(item => item.barcodeDataUrl.startsWith('data:image/svg+xml;base64,')));
+
+  current = await Order.findById(current._id);
+  const verification = await request(`/api/admin/orders/${current._id}/packing/verify`, {
+    method: 'POST', token: admin.token,
+    body: { items: [{ orderItemId: String(current.orderItems[0]._id), uniqueItemIds: current.orderItems[0].uniqueItemIds }] },
+  });
+  assert.equal(verification.status, 200, JSON.stringify(verification.data));
+  current = await Order.findById(current._id);
+  assert.equal(current.packageVerification.status, 'VERIFIED');
+  assert.equal((await InventoryItem.countDocuments({ order: current._id, status: 'PACKED' })), 2);
+  const packed = await request(`/api/admin/orders/${current._id}/status`, { method: 'PUT', token: admin.token, body: { orderStatus: 'Packed', revision: current.revision } });
+  assert.equal(packed.status, 200, JSON.stringify(packed.data));
 });

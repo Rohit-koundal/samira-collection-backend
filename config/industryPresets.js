@@ -13,9 +13,10 @@ const category = (key, name, parentKey = '', config = {}) => ({
   filters: config.filters || (config.attributes || []).filter((item) => item?.filterable).map((item) => item.key),
 });
 
-function preset({ id, name, sizing = false, attributes, categories, categoryDefinitions = [], filters, sections, variants = [], features = {}, inventory = {}, delivery = {}, returns = {}, productSections = [] }) {
+function preset({ id, name, sizing = false, attributes, categories, categoryDefinitions = [], filters, sections, variants = [], features = {}, inventory = {}, delivery = {}, returns = {}, productSections = [], commerce = { mode: 'SALE_ONLY' } }) {
   return {
     id, name, industry: id, version: 2, active: true,
+    commerce: { ...commerce, rentalModuleVersion: 1, stockMode: 'SEPARATE_RENTAL_ASSETS' },
     features: { sizing, specifications: true, comparison: false, perishable: false, customization: false, technical: false, ...features },
     attributes: attributes.map((item, index) => ({ ...item, sortOrder: item.sortOrder || index + 1 })),
     defaultCategories: categories,
@@ -321,6 +322,9 @@ const INDUSTRY_PRESETS = [
   preset({ id: 'footwear', name: 'Shoes & Footwear', sizing: true, attributes: footwearAttributes, categories: ['Women', 'Men', 'Kids', 'Sports Shoes', 'Sandals', 'Formal Shoes'], categoryDefinitions: withSubcategories(namesToCategories(['Women', 'Men', 'Kids', 'Sports Shoes', 'Sandals', 'Formal Shoes'], ['size', 'colour']), { women: ['Heels', 'Flats', 'Women Sneakers'], men: ['Men Sneakers', 'Loafers', 'Boots'], kids: ['Girls Footwear', 'Boys Footwear'], sports_shoes: ['Running Shoes', 'Training Shoes'], sandals: ['Casual Sandals', 'Ethnic Sandals'] }), filters: ['category', 'price', 'gender', 'size', 'colour', 'upper_material', 'occasion', 'fit', 'availability'], sections: ['hero', 'categories', 'newArrivals', 'trending', 'bestSellers', 'offers'], variants: ['size', 'colour'], productSections: ['overview', 'size-guide', 'materials', 'fit-comfort', 'care', 'delivery', 'returns', 'reviews'] }),
   preset({ id: 'home', name: 'Home & Decor', attributes: homeAttributes, categories: ['Decor', 'Furnishing', 'Kitchen', 'Lighting', 'Storage', 'Gifting'], categoryDefinitions: withSubcategories(namesToCategories(['Decor', 'Furnishing', 'Kitchen', 'Lighting', 'Storage', 'Gifting']), { decor: ['Wall Decor', 'Vases', 'Clocks'], furnishing: ['Bedsheets', 'Cushions', 'Curtains'], kitchen: ['Cookware', 'Dining', 'Kitchen Storage'], lighting: ['Lamps', 'Ceiling Lights'], storage: ['Organisers', 'Shelves'], gifting: ['Gift Sets', 'Personalised Gifts'] }), filters: ['category', 'price', 'product_type', 'material', 'colour', 'room_type', 'style', 'availability'], sections: ['hero', 'categories', 'featured', 'newArrivals', 'bestSellers', 'offers'], variants: ['colour'], productSections: ['overview', 'dimensions', 'material-finish', 'assembly-care', 'package-contents', 'delivery', 'returns', 'reviews'] }),
 ];
+
+// Append optional workflows: the legacy fashion/default preset remains first.
+INDUSTRY_PRESETS.push(preset({ id: 'boutique', name: 'Boutique — Sale & Rental', sizing: true, commerce: { mode: 'SALE_AND_RENTAL' }, attributes: [...fashionAttributes, choice('accessory_size', 'Bangle / ring size', ['2.2', '2.4', '2.6', '2.8', 'Adjustable', 'Free Size'], { filterable: true, group: 'Accessories' }), attribute('set_contents', 'Set components', 'textarea', { group: 'Rental set' })], categories: ['Lehengas', 'Sarees', 'Bridal Sets', 'Bangles', 'Necklaces', 'Accessories'], categoryDefinitions: namesToCategories(['Lehengas', 'Sarees', 'Bridal Sets', 'Bangles', 'Necklaces', 'Accessories'], ['size', 'colour']), filters: ['category', 'price', 'size', 'colour', 'occasion', 'availability'], sections: ['hero', 'categories', 'wedding', 'newArrivals', 'bestSellers'], variants: ['size', 'colour'], productSections: ['overview', 'size-guide', 'material-care', 'specifications', 'delivery', 'returns', 'reviews'] }));
 
 function key(value) { return String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, ''); }
 function title(value) { return String(value || '').replace(/_/g, ' ').replace(/\b\w/g, (letter) => letter.toUpperCase()); }

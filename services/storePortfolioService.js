@@ -117,6 +117,7 @@ function storeView(store, usage = {}) {
   const usageView = {
     products: Number(usage.products || 0), productsAddedMonth: Number(usage.productsAddedMonth || 0),
     ordersPerMonth: Number(usage.ordersPerMonth || 0), paidRevenueMonth: Number(usage.paidRevenueMonth || 0),
+    saleOrdersPerMonth: Number(usage.saleOrdersPerMonth || 0), rentalBookingsPerMonth: Number(usage.rentalBookingsPerMonth || 0),
   };
   usageView.projectedProductLimitAt = projectedLimitAt({ current: usageView.products, addedThisMonth: usageView.productsAddedMonth, limit: platform.limits.products });
   usageView.projectedOrderLimitAt = projectedLimitAt({ current: usageView.ordersPerMonth, addedThisMonth: usageView.ordersPerMonth, limit: platform.limits.ordersPerMonth, resetsMonthly: true });
@@ -142,16 +143,18 @@ function storeView(store, usage = {}) {
 async function usageForStores(ids) {
   if (!ids.length) return new Map();
   const monthStart = new Date(); monthStart.setUTCDate(1); monthStart.setUTCHours(0, 0, 0, 0);
-  const [products, productsAdded, orders, revenue] = await Promise.all([
+  const [products, productsAdded, orders, revenue, rentals] = await Promise.all([
     Product.aggregate([{ $match: { storeId: { $in: ids }, isArchived: { $ne: true } } }, { $group: { _id: '$storeId', count: { $sum: 1 } } }]),
     Product.aggregate([{ $match: { storeId: { $in: ids }, isArchived: { $ne: true }, createdAt: { $gte: monthStart } } }, { $group: { _id: '$storeId', count: { $sum: 1 } } }]),
     Order.aggregate([{ $match: { storeId: { $in: ids }, createdAt: { $gte: monthStart }, orderStatus: { $ne: 'Cancelled' } } }, { $group: { _id: '$storeId', count: { $sum: 1 } } }]),
     Order.aggregate([{ $match: { storeId: { $in: ids }, createdAt: { $gte: monthStart }, paymentStatus: 'Paid', orderStatus: { $ne: 'Cancelled' } } }, { $group: { _id: '$storeId', value: { $sum: { $ifNull: ['$finalAmount', { $ifNull: ['$totalPrice', 0] }] } } } }]),
+    require('../models/Rental').Booking.aggregate([{ $match: { storeId: { $in: ids }, ...require('./commerceUsageService').rentalMonthFilter() } }, { $group: { _id: '$storeId', count: { $sum: 1 } } }]),
   ]);
-  const map = new Map(ids.map((id) => [String(id), { products: 0, productsAddedMonth: 0, ordersPerMonth: 0, paidRevenueMonth: 0 }]));
+  const map = new Map(ids.map((id) => [String(id), { products: 0, productsAddedMonth: 0, ordersPerMonth: 0, saleOrdersPerMonth: 0, rentalBookingsPerMonth: 0, paidRevenueMonth: 0 }]));
   products.forEach((row) => { map.get(String(row._id)).products = row.count; });
   productsAdded.forEach((row) => { map.get(String(row._id)).productsAddedMonth = row.count; });
-  orders.forEach((row) => { map.get(String(row._id)).ordersPerMonth = row.count; });
+  orders.forEach((row) => { map.get(String(row._id)).ordersPerMonth = row.count; map.get(String(row._id)).saleOrdersPerMonth = row.count; });
+  rentals.forEach((row) => { map.get(String(row._id)).ordersPerMonth += row.count; map.get(String(row._id)).rentalBookingsPerMonth = row.count; });
   revenue.forEach((row) => { map.get(String(row._id)).paidRevenueMonth = row.value; });
   return map;
 }

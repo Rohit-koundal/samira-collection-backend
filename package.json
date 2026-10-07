@@ -12,6 +12,7 @@
     "worker:reels": "node workers/reelImport.worker.js",
     "check": "node --check server.js && node --check app.js",
     "keys:license": "node scripts/generate-license-keys.js",
+    "check:sms": "node scripts/check-sms-config.js",
     "test": "node --test --test-concurrency=1 \"tests/*.test.js\"",
     "test:payments": "node scripts/test-payment-flow.js"
   },
@@ -34,6 +35,7 @@
     "mongoose": "^8.9.5",
     "multer": "^1.4.5-lts.1",
     "razorpay": "^2.9.6",
+    "sharp": "^0.34.5",
     "twilio": "^6.0.2"
   },
   "devDependencies": {

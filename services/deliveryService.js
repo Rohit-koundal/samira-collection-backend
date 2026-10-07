@@ -19,10 +19,14 @@ async function assertCarrierStore(storeId, settings) {
   const accountStore = settings.storeId || (await require('../models/Store').findOne({ isDefault: true }).select('_id').lean())?._id;
   if (!accountStore || String(accountStore) !== String(storeId)) throw new ApiError('SHIPPING_UNAVAILABLE', 'This store does not have a connected delivery account.', { statusCode: 503 });
 }
-function publicShipment(row) {
+function publicShipment(row, { customer = false } = {}) {
   if (!row) return null;
   const data = row.toObject ? row.toObject() : { ...row };
   for (const key of ['labelPdf', 'pickupAddress', 'destination', 'syncLeaseUntil']) delete data[key];
+  if (customer) {
+    const allowed = new Set(['_id', 'order', 'provider', 'courierName', 'trackingNumber', 'trackingUrl', 'awb', 'status', 'events', 'fulfillmentMode', 'deliveryReference', 'deliveryContact', 'customerNote', 'expectedDeliveryAt', 'environment', 'providerStatus', 'lastSyncedAt', 'manualUpdatedAt', 'createdAt', 'updatedAt']);
+    for (const key of Object.keys(data)) if (!allowed.has(key)) delete data[key];
+  }
   return data;
 }
 async function checkoutShipping({ items, settings, address, paymentMethod, amount }) {
@@ -30,7 +34,7 @@ async function checkoutShipping({ items, settings, address, paymentMethod, amoun
   const parcel = integrated || settings.shippingPricingMode === 'weight' ? packageForItems(items, settings) : null;
   if (!integrated) {
     const pricing = deliveryPrice(amount, address, parcel, settings);
-    return { provider: 'manual', deliveryCharge: pricing.charge, pricingSource: pricing.pricingSource, parcel };
+    return { provider: 'manual', fulfillmentMode: settings.manualDeliveryMode || 'COURIER', deliveryCharge: pricing.charge, pricingSource: pricing.pricingSource, parcel };
   }
   const adapter = providerFor(settings.shippingProvider), ready = adapter.readiness();
   await assertCarrierStore(items[0]?.storeId, settings);
@@ -66,6 +70,7 @@ function assertBookable(order, returnRequest) {
   if (returnRequest) {
     if (!['Approved', 'Pickup Scheduled'].includes(returnRequest.status)) throw new ApiError('SHIPPING_VALIDATION', 'Approve this return before arranging reverse pickup.');
   } else {
+    require('./codVerificationService').assertCodDispatchable(order);
     if (!['Pending', 'Confirmed', 'Packed'].includes(order.orderStatus)) throw new ApiError('SHIPPING_VALIDATION', 'Only an unshipped, active order can be booked.');
     if (order.paymentMethod === 'COD' && order.codConfirmationStatus === 'PENDING') throw new ApiError('SHIPPING_VALIDATION', 'Confirm this COD order with the customer before booking delivery.');
     if (order.paymentMethod !== 'COD' && order.paymentStatus !== 'Paid') throw new ApiError('SHIPPING_VALIDATION', 'Online payment must be confirmed before booking delivery.');
@@ -99,6 +104,7 @@ async function createBooking(order, body, returnRequest, direction = 'reverse') 
     if (!ready.liveBooking) throw new ApiError('SHIPPING_UNAVAILABLE', ready.note, { statusCode: 503 });
     const Model = bookingModel(returnRequest, direction), filter = bookingFilter(order, returnRequest);
     let existing = await findBooking(order, returnRequest, direction);
+    if (existing?.provider === 'manual' && (existing.manualConfiguredAt || existing.fulfillmentMode === 'SELF')) throw new ApiError('SHIPPING_VALIDATION', 'This order already uses store-managed delivery. Do not create a second courier booking for the same parcel.');
     if (existing?.awb || existing?.bookingState === 'BOOKED') return publicShipment(existing);
     if (existing?.operation || ['BOOKING', 'UNKNOWN', 'CANCELLED'].includes(existing?.bookingState)) throw conflict('This shipment needs reconciliation before another booking. Use Check booking outcome.');
     const slot = pickupSlot(body.date, body.time, body.closeTime);

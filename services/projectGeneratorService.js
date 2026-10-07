@@ -8,12 +8,13 @@ const PROJECT_ROOT = path.resolve(__dirname, '..', '..');
 const INCLUDED_ROOTS = ['src', 'public', 'backend', 'ai-video-worker', 'scripts'];
 const INCLUDED_FILES = ['package.json', 'package-lock.json', 'postcss.config.js', 'tailwind.config.js', 'render.yaml'];
 const EXCLUDED_DIRECTORIES = new Set([
-  '.git', '.github', '.idea', '.vscode', '.cache', '.pytest_cache', '.venv', 'venv', '__pycache__',
+  '.git', '.github', '.idea', '.vscode', '.cache', '.pytest_cache', '.venv', 'venv', '__pycache__', '.models',
   'node_modules', 'build', 'dist', 'coverage', 'uploads', 'tmp', '.tmp', 'logs', '.next', '.output',
 ]);
 const MAX_FILES = 4000;
 const MAX_FILE_BYTES = 12 * 1024 * 1024;
 const MAX_TOTAL_BYTES = 60 * 1024 * 1024;
+const BRANDABLE_TEXT_EXTENSIONS = new Set(['.css', '.html', '.js', '.jsx', '.json', '.md', '.svg', '.txt', '.yaml', '.yml']);
 const CLIENT_PROJECT_EXCLUDES = new Set([
   'src/pages/admin/MasterConfiguration.jsx',
   'src/pages/admin/MasterConfiguration.test.jsx',
@@ -138,7 +139,7 @@ function replaceJson(buffer, update) {
   return Buffer.from(`${JSON.stringify(parsed, null, 2)}\n`);
 }
 
-function transformEntry(entry, project, structure) {
+function transformProjectEntry(entry, project, structure) {
   const { name } = entry;
   if (name === 'package.json') return { ...entry, data: replaceJson(entry.data, (value) => { value.name = project.projectSlug; value.description = `${project.companyName} ${project.industryName} commerce application`; }) };
   if (name === 'package-lock.json') return { ...entry, data: replaceJson(entry.data, (value) => { value.name = project.projectSlug; if (value.packages?.['']) value.packages[''].name = project.projectSlug; }) };
@@ -292,11 +293,15 @@ function transformEntry(entry, project, structure) {
       .replace(/\n\s*\/\/ CLIENT_PROJECT_REMOVE_SUBSCRIPTION_START[\s\S]*?\/\/ CLIENT_PROJECT_REMOVE_SUBSCRIPTION_END\r?\n/, '\n');
     return { ...entry, data: Buffer.from(content) };
   }
-  if (name === 'render.yaml') {
+  if (name === 'render.yaml' || name === 'backend/render.yaml') {
     const content = entry.data.toString('utf8')
       .replaceAll('samira-collection-backend', `${project.projectSlug}-backend`)
       .replaceAll('samira-collection', project.projectSlug)
       .replaceAll('samira-reel-', `${project.projectSlug}-reel-`)
+      // Ask each client to select a provider; Twilio credentials are optional.
+      .replace(/(- key: SMS_PROVIDER\r?\n\s*)value: twilio/, '$1sync: false')
+      .replace(/(- key: SMS_(?:ACCOUNT_SID|AUTH_TOKEN|SENDER_ID)\r?\n\s*)sync: false/g, '$1value: ""')
+      .replace(/(- key: ALLOW_HOSTED_OWNER_DEMO\r?\n\s*)value: "true"/, '$1value: "false"')
       .replace(/^\s*- key: CONTROL_PLANE_PUBLIC_URL\r?\n\s*(?:value:.*|sync:.*)\r?\n/gm, '')
       .replace(/^\s*- key: LICENSE_SIGNING_PRIVATE_KEY\r?\n\s*(?:value:.*|sync:.*)\r?\n/gm, '')
       .replace(/^\s*- key: PLATFORM_CREDENTIAL_ENCRYPTION_KEY\r?\n\s*(?:value:.*|sync:.*)\r?\n/gm, '')
@@ -307,12 +312,41 @@ function transformEntry(entry, project, structure) {
   return entry;
 }
 
+function transformBranding(entry, project) {
+  if (!BRANDABLE_TEXT_EXTENSIONS.has(path.extname(entry.name).toLowerCase())) return entry;
+  const companyName = project.companyName;
+  const shortName = companyName.split(/\s+/).filter(Boolean)[0] || companyName;
+  const content = entry.data.toString('utf8')
+    .replaceAll('samira-collection-logo.png', 'generated-brand-logo.svg')
+    .replaceAll('SAMIRA COLLECTION', companyName.toUpperCase())
+    .replaceAll('Samira Collection', companyName)
+    .replaceAll('samira collection', companyName.toLowerCase())
+    .replace(/\bSamira\b/g, shortName);
+  return { ...entry, data: Buffer.from(content) };
+}
+
+function transformEntry(entry, project, structure) {
+  return transformBranding(transformProjectEntry(entry, project, structure), project);
+}
+
 function escapeSingleQuotedJs(value) {
   return String(value).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
 }
 
 function escapeHtml(value) {
   return String(value).replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[character]));
+}
+
+function generatedBrandLogo(project) {
+  const label = escapeHtml(project.companyName);
+  const fontSize = project.companyName.length > 28 ? 20 : project.companyName.length > 20 ? 23 : 27;
+  return Buffer.from(`<svg width="360" height="88" viewBox="0 0 360 88" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="${label}">
+  <rect width="360" height="88" rx="18" fill="#FFFAF2"/>
+  <path d="M31 61C41 35 50 25 59 25C69 25 76 37 82 61" stroke="#6D1F34" stroke-width="6" stroke-linecap="round"/>
+  <path d="M41 61C49 43 54 36 59 36C65 36 69 44 74 61" stroke="#FF5F86" stroke-width="6" stroke-linecap="round"/>
+  <path d="M27 24C38 16 60 15 75 24" stroke="#B8914A" stroke-width="4" stroke-linecap="round"/>
+  <text x="100" y="53" fill="#17161A" font-family="Georgia, serif" font-size="${fontSize}" font-weight="700">${label}</text>
+</svg>\n`);
 }
 
 function environmentExamples(project) {
@@ -351,6 +385,9 @@ function environmentExamples(project) {
         'FRONTEND_URL=http://localhost:3000',
         'JWT_SECRET=replace-with-a-long-random-secret',
         'JWT_REFRESH_SECRET=replace-with-a-different-long-random-secret',
+        'JWT_EXPIRES_IN=15m',
+        'JWT_ADMIN_EXPIRES_IN=24h',
+        'JWT_REFRESH_EXPIRES_IN=30d',
         'ALLOW_REFRESH_TOKEN_BODY=false',
         'RETURN_REFRESH_TOKEN_IN_BODY=false',
         'AUTH_COOKIE_DOMAIN=',
@@ -364,10 +401,27 @@ function environmentExamples(project) {
         'DEMO_OTP=123456',
         '# Keep false in client packages; only the platform owner may enable hosted owner demo access.',
         'ALLOW_HOSTED_OWNER_DEMO=false',
+        '# Choose twilio, msg91, twofactor (or 2factor), fast2sms. Use mock only for demo.',
+        '# Before public login: OTP_MODE=production. See backend/SMS.md and npm run check:sms.',
+        '# After first login, Settings > OTP & SMS can safely switch providers after a real test.',
+        '# Keep encryption material stable; no provider credentials are copied into this ZIP.',
+        'DATA_ENCRYPTION_KEY=',
+        'DATA_ENCRYPTION_PREVIOUS_KEYS=',
+        '# Emergency only: set SMS_CONFIG_SOURCE=environment to ignore saved SMS settings.',
         'SMS_PROVIDER=mock',
+        '# Twilio (existing variable names)',
         'SMS_ACCOUNT_SID=',
         'SMS_AUTH_TOKEN=',
         'SMS_SENDER_ID=',
+        '# MSG91: OTP template ID from the MSG91 dashboard',
+        'MSG91_AUTH_KEY=',
+        'MSG91_TEMPLATE_ID=',
+        '# 2Factor: template name is optional; blank uses its default OTP template',
+        'TWOFACTOR_API_KEY=',
+        'TWOFACTOR_TEMPLATE_NAME=',
+        '# Fast2SMS (India)',
+        'FAST2SMS_API_KEY=',
+        'FAST2SMS_SENDER_ID=',
         'BREVO_API_KEY=',
         'BREVO_SENDER_EMAIL=',
         `BREVO_SENDER_NAME=${JSON.stringify(project.companyName)}`,
@@ -428,7 +482,7 @@ function environmentExamples(project) {
 
 function generatedReadme(project, structure, installation) {
   const managedSetup = installation ? `\n## Managed installation\n\nThis package has one unique, revocable installation identity. Open \`client-installation.json\`, copy its values into the **backend hosting environment**, and then permanently delete that file before committing or sharing the project. Never put \`CLIENT_LICENSE_KEY\` in the frontend. The admin **System & updates** screen shows subscription, limits, connection state and assigned updates without exposing that key.\n` : '';
-  return Buffer.from(`# ${project.projectName}\n\nA standalone ${project.industryName} commerce project generated for **${project.companyName}**. It has its own source tree and must use its own database, storage and service credentials. Master Configuration, Store Portfolio and project-generation tools are intentionally absent from this client project.${managedSetup}\n## Start locally\n\n1. Extract this folder.\n2. Copy \`.env.example\` to \`.env\`.\n3. Copy \`backend/.env.example\` to \`backend/.env\`.\n4. Set a new MongoDB database URL and replace the JWT secrets.\n5. If present, transfer \`client-installation.json\` values to the backend environment and delete the file.\n6. Run \`npm install\` in this folder and in \`backend\`.\n7. Run \`npm run server\` in one terminal and \`npm start\` in another.\n\n## Phone app experience\n\nThe responsive storefront is also an installable Progressive Web App. It includes mobile navigation, product search and filters, product detail and sharing, bag, wishlist, address and payment checkout, orders and tracking, returns, profile, notifications, offline/update status, safe-area layout and home-screen shortcuts. The same backend remains the source of truth for identity, price, stock, coupons, payment and order state.\n\nThe default catalog uses **${structure.name}** with ${(structure.attributes || []).length} product fields and ${(structure.categoryDefinitions || []).length} category definitions. Update branding, owner phone, payment, media, SMS and shipping credentials in the new installation before deployment. Website Designer remains available to the project admin.\n\n## Security\n\nNo existing \`.env\` file, database record, upload, Git history, build output or dependency is copied from the source platform. The one-time installation credential is newly generated for this client and can be revoked independently. Production builds omit source maps, deployment headers restrict script sources and framing, private API responses are not cached, CORS accepts only configured origins, and sensitive actions are validated by the backend. Browser JavaScript is public by design, so never put secrets or authorization decisions in frontend code.\n`);
+  return Buffer.from(`# ${project.projectName}\n\nA standalone ${project.industryName} commerce project generated for **${project.companyName}**. It has its own source tree and must use its own database, storage and service credentials. Master Configuration, Store Portfolio and project-generation tools are intentionally absent from this client project.${managedSetup}\n## Start locally\n\n1. Extract this folder.\n2. Copy \`.env.example\` to \`.env\`.\n3. Copy \`backend/.env.example\` to \`backend/.env\`.\n4. Set a new MongoDB database URL and replace the JWT secrets.\n5. If present, transfer \`client-installation.json\` values to the backend environment and delete the file.\n6. Run \`npm install\` in this folder and in \`backend\`.\n7. Run \`npm run server\` in one terminal and \`npm start\` in another.\n\n## Phone app experience\n\nThe responsive storefront is also an installable Progressive Web App. It includes mobile navigation, product search and filters, product detail and sharing, bag, wishlist, address and payment checkout, orders and tracking, returns, profile, notifications, offline/update status, safe-area layout and home-screen shortcuts. The same backend remains the source of truth for identity, price, stock, coupons, payment and order state.\n\nThe default catalog uses **${structure.name}** with ${(structure.attributes || []).length} product fields and ${(structure.categoryDefinitions || []).length} category definitions. Update branding, owner phone, payment, media, SMS and shipping credentials in the new installation before deployment. Website Designer remains available to the project admin and publishes a shared theme across desktop, mobile, loaders and admin. Configure email and WhatsApp alerts in Settings > Order alerts; the settings panel includes provider instructions, testing and delivery history. Each client supplies its own credentials; alerts start disabled.\n\n## Security\n\nNo existing \`.env\` file, database record, upload, Git history, build output or dependency is copied from the source platform. The one-time installation credential is newly generated for this client and can be revoked independently. Production builds omit source maps, deployment headers restrict script sources and framing, private API responses are not cached, CORS accepts only configured origins, and sensitive actions are validated by the backend. Browser JavaScript is public by design, so never put secrets or authorization decisions in frontend code.\n`);
 }
 
 function installationFile(installation) {
@@ -519,7 +573,7 @@ function makeZip(entries, rootFolder) {
 async function previewProject(input, structure) {
   const project = normalizeProject(input, structure);
   const { entries, counters } = await sourceEntries(project);
-  const packagedFiles = entries.filter((entry) => !CLIENT_PROJECT_EXCLUDES.has(entry.name)).length + 5;
+  const packagedFiles = entries.filter((entry) => !CLIENT_PROJECT_EXCLUDES.has(entry.name)).length + 6;
   return {
     projectName: project.projectName,
     companyName: project.companyName,
@@ -529,7 +583,7 @@ async function previewProject(input, structure) {
     industryName: project.industryName,
     sourceFiles: packagedFiles,
     approximateSourceBytes: counters.bytes,
-    includes: ['Frontend application', 'Backend API', 'Industry product schema', 'Responsive storefront and admin', 'Installable phone app with safe offline shell', 'Bag, wishlist, checkout, orders, returns, tracking and notifications', 'Reports and Insights Center with protected exports', 'Signed subscription and update connector', 'Production security headers and server-side validation', ...(project.includeAiWorker ? ['AI video worker source'] : [])],
+    includes: ['Frontend application', 'Backend API', 'Industry product schema', 'Responsive storefront and admin', 'Installable phone app with safe offline shell', 'Bag, wishlist, checkout, orders, returns, tracking and notifications', 'Boutique sale/rental studio, date-safe bookings, deposits, inspection and reminders', 'Reports and Insights Center with protected exports', 'Signed subscription and update connector', 'Production security headers and server-side validation', ...(project.includeAiWorker ? ['AI video worker source'] : [])],
     excludes: ['Master Configuration, Store Portfolio and Client Control', 'Existing products and orders', 'Database records', 'Existing environment secrets', 'Uploaded media', 'Git history', 'Dependencies and build output'],
   };
 }
@@ -546,11 +600,16 @@ async function generateProject(input, structure, options = {}) {
     format: 'standalone-commerce-project', version: 1, generatedAt: new Date().toISOString(),
     project: { name: project.projectName, folder: project.projectSlug, companyName: project.companyName },
     industry: { id: project.industry, name: project.industryName },
+    commerce: structure.commerce || { mode: 'SALE_ONLY', rentalModuleVersion: 1, stockMode: 'SEPARATE_RENTAL_ASSETS' },
     features: {
       masterConfiguration: false,
       storePortfolio: false,
       projectGenerator: false,
       websiteDesigner: true,
+      applicationWideTheme: true,
+      ownerEmailAndWhatsAppOrderAlerts: true,
+      reviewedWorkflowSmartFill: true,
+      smartFillWorkflows: ['catalog', 'category', 'banner', 'campaign', 'website', 'coupon', 'shipment', 'purchase', 'support', 'returns', 'store'],
       responsiveStorefront: true,
       installablePhoneApp: true,
       offlineAppShell: true,
@@ -558,11 +617,33 @@ async function generateProject(input, structure, options = {}) {
       cartWishlistCheckout: true,
       ordersReturnsTracking: true,
       customerNotifications: true,
+      rentalManagementAvailable: true,
+      rentalManagementEnabled: structure.commerce?.mode !== undefined && structure.commerce.mode !== 'SALE_ONLY',
+      rentalPhysicalAssetsAndCalendar: true,
+      rentalDepositsAndReturnInspection: true,
+      rentalCompulsoryOwnerConfiguredAdvance: true,
+      rentalPrivateConditionEvidence: true,
+      rentalInvoicesAndReceipts: true,
+      rentalTrialCalendarAndSaleTransfer: true,
+      rentalConnectedCourierLegs: true,
+      rentalTrialAvailabilityAndOutcomes: true,
+      rentalMeasurementRevisionsAndWorkshopJobs: true,
+      rentalDateFirstShoppingAndWaitlist: true,
+      rentalRefundDeadlinesAndPiecePerformance: true,
+      rentalStructuredAddressesAndAuthorisedContacts: true,
+      rentalPieceMeasurementsAndAlterationLimits: true,
       reportsAndInsights: true,
+      privacyAwareTrafficAnalytics: true,
+      trafficSettingsAndDigests: true,
       sellerAndAdminMobileViews: true,
       backendTrustValidation: true,
       signedPlatformEntitlements: true,
       systemUpdateStatus: true,
+      clientSubscriptionExpiryNotice: true,
+      retrySafeMediaUploads: true,
+      retrySafeRecordCreation: true,
+      resumableGeneratedMedia: true,
+      refreshSafeUploadRecovery: true,
     },
     dataIncluded: false, credentialsIncluded: Boolean(installation), managedInstallation: Boolean(installation),
   };
@@ -570,6 +651,7 @@ async function generateProject(input, structure, options = {}) {
     { name: 'README.md', data: generatedReadme(project, structure, installation) },
     { name: '.gitignore', data: cleanGitignore() },
     ...environmentExamples(project),
+    { name: 'src/assets/generated-brand-logo.svg', data: generatedBrandLogo(project) },
     { name: 'backend/controllers/catalogConfigurationController.js', data: catalogConfigurationController() },
     { name: 'project-manifest.json', data: Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`) },
   );

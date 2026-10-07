@@ -27,6 +27,7 @@ const inventoryTransactionSchema = new mongoose.Schema({
   product: { type: mongoose.Schema.Types.ObjectId, ref: 'Product', required: true },
   variantId: { type: String, default: '' },
   sku: String,
+  productSnapshot: { name: String, sku: String, deletedAt: Date },
   order: { type: mongoose.Schema.Types.ObjectId, ref: 'Order' },
   type: { type: String, enum: INVENTORY_TRANSACTION_TYPES, required: true },
   // Signed: negative removes stock, positive returns it.

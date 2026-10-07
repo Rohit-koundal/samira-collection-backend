@@ -10,6 +10,7 @@ const { logAudit } = require('../services/auditService');
 const { auditSnapshot } = require('../utils/auditData');
 const { asyncHandler } = require('../middleware/validate');
 const { ApiError, notFound } = require('../utils/apiError');
+const { createRecordOnce } = require('../services/recordCreationService');
 const {
   buildPaginatedResponse, optionalString, readPagination, requireBoolean,
   requireEnum, requireObjectId, requireString, wantsPagination,
@@ -140,10 +141,13 @@ exports.createBanner = asyncHandler(async (req, res) => {
   const payload = readBannerPayload(req.body);
   delete payload.storeId;
   if (req.store?._id) payload.storeId = req.store._id;
-  const banner = new Banner(payload);
-  if (!banner.campaignKey) banner.campaignKey = `banner-${String(banner._id)}`;
-  await banner.save();
-  logAudit({ req, action: 'BANNER_CREATE', entityType: 'Banner', entityId: banner._id, storeId: banner.storeId, after: auditSnapshot(banner, AUDIT_FIELDS) });
+  const banner = await createRecordOnce(req, { Model: Banner, filter: req.tenantFilter || {}, create: async identity => {
+    const record = new Banner({ ...payload, ...identity });
+    if (!record.campaignKey) record.campaignKey = `banner-${String(record._id)}`;
+    await record.save();
+    logAudit({ req, action: 'BANNER_CREATE', entityType: 'Banner', entityId: record._id, storeId: record.storeId, after: auditSnapshot(record, AUDIT_FIELDS) });
+    return record;
+  } });
   res.status(201).json(managementBannerView(banner));
 });
 
@@ -243,6 +247,8 @@ exports.reorderBanners = asyncHandler(async (req, res) => {
 });
 
 exports.recordBannerEvent = asyncHandler(async (req, res) => {
+  const config = await require('../services/trafficConfigurationService').configuration(req.store);
+  if (!config.enabled || (config.consentRequired && req.body?.consent !== true)) return res.status(202).json({ success: true, ignored: true });
   const id = requireObjectId(req.params.id, 'banner id');
   const event = requireEnum(String(req.body.event || '').toLowerCase(), ['impression', 'click'], 'event');
   const sessionId = optionalString(req.body.sessionId, 'sessionId', { max: 80 });
@@ -268,10 +274,9 @@ exports.recordBannerEvent = asyncHandler(async (req, res) => {
   const increment = event === 'impression' ? { impressions: 1, views: 1 } : { clicks: 1 };
   const banner = await Banner.findOneAndUpdate(liveQuery, { $inc: increment }, { new: true });
   if (!banner) throw notFound('Banner not found');
-  recordEventLater({
+  if (req.body.trafficHandled !== true) recordEventLater({
     name: event === 'impression' ? 'BANNER_IMPRESSION' : 'BANNER_CLICK',
     storeId: banner.storeId,
-    userId: req.user?._id,
     sessionId,
     campaign: banner.campaignKey || `banner-${banner._id}`,
     metadata: { bannerId: String(banner._id), position: banner.position },

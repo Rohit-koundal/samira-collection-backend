@@ -25,11 +25,11 @@ function getShippingProvider(name) {
     }
   }
   return {
-    name: 'manual', label: 'Manual courier', mode: 'manual', configured: true, missing: [],
+    name: 'manual', label: 'Manual / self delivery', mode: 'manual', configured: true, missing: [],
     liveBooking: false,
     trackingLookup: false,
     cod: true, reverse: true, rateQuotes: false,
-    note: 'Shipping is manual. Book the parcel with your courier, then paste the real AWB here. Fake tracking numbers are never generated.',
+    note: 'No courier API credentials are needed. Deliver with your own team, or book a courier yourself and add its real tracking ID and link. Staff must update delivery progress; there is no automatic courier tracking.',
   };
 }
 
@@ -38,7 +38,7 @@ function getShippingProviders(selected = 'manual') {
 }
 
 function providerLabel(name) {
-  return name === 'manual' ? 'Manual courier' : PROVIDERS[name]?.label || 'Courier';
+  return name === 'manual' ? 'Manual / self delivery' : PROVIDERS[name]?.label || 'Courier';
 }
 
 function isIntegratedProvider(name) {

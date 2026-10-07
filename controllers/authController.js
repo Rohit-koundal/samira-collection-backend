@@ -5,7 +5,7 @@ const mongoose = require('mongoose');
 const jwt = require('jsonwebtoken');
 const { generateRefreshToken, generateToken } = require('../utils/generateToken');
 const { normalizePhone, normalizeEmail, createOtp, createEmailOtp, verifyOtp: verifyOtpRecord, verifyEmailOtp: verifyEmailOtpRecord } = require('../services/otpService');
-const { sendOtp } = require('../services/smsService');
+const { sendOtp, isRealSmsProvider } = require('../services/smsService');
 const { sendOtpEmail } = require('../services/emailService');
 const { getDemoOtp, getJwtRefreshSecret, getJwtSecret, getOtpMode, isDemoOtpMode } = require('../config/env');
 const { ApiError } = require('../utils/apiError');
@@ -450,7 +450,7 @@ async function deliverOtpWithFallback(phone, otp, record, req) {
 
   const delivery = await sendOtp(phone, otp, { requireReal: owner });
   if (owner) {
-    if (!delivery?.success || !['twilio', 'msg91', 'fast2sms'].includes(delivery.provider)) {
+    if (!delivery?.success || !isRealSmsProvider(delivery.provider)) {
       if (record) { record.isUsed = true; await record.save(); }
       throw otpDeliveryError(delivery);
     }
@@ -458,7 +458,10 @@ async function deliverOtpWithFallback(phone, otp, record, req) {
     return { success: true, owner: true, provider: delivery.provider };
   }
 
-  if (delivery?.success) return { success: true, provider: delivery.provider };
+  if (delivery?.success) {
+    if (record) { record.provider = delivery.provider; await record.save(); }
+    return { success: true, provider: delivery.provider };
+  }
   if (record) { record.isUsed = true; await record.save(); }
   throw otpDeliveryError(delivery);
 }

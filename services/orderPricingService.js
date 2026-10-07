@@ -60,6 +60,7 @@ async function loadOrderItems(orderItems, { tenantFilter = {} } = {}) {
 
     const product = await Product.findOne(andFilter({ _id: productId }, tenantFilter));
     if (!product) throw new ApiError('NOT_FOUND', `${raw.name || 'A product'} is no longer available`);
+    if (product.commerceMode === 'RENTAL_ONLY') throw new ApiError('CHECKOUT_RESTRICTED', `${product.name} is available for rental bookings only`);
     if (!productAvailableForSale(product)) throw new ApiError('OUT_OF_STOCK', `${product.name} is not available for sale yet`);
 
     const variant = requireVariant(product, {

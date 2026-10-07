@@ -4,7 +4,9 @@ const os = require('os');
 const https = require('https');
 const dns = require('dns/promises');
 const { spawn } = require('child_process');
-const crypto = require('crypto');
+const { persistGeneratedFile, generatedUploadId } = require('../../services/generatedMediaService');
+const { Post } = require('./models');
+const { storageFingerprint } = require('../../services/uploadRetryService');
 const { fail } = require('./meta');
 const storage = require('../../services/mediaStorage.service');
 const uploads = path.resolve(__dirname, '../../uploads');
@@ -78,29 +80,48 @@ function run(args, cwd) {
     process.on('exit', code => { clearTimeout(timer); code === 0 ? resolve() : reject(fail('Video or photo rendering failed. Check that the selected product photos are valid images.')); });
   });
 }
-async function persist(file, video) {
-  if (!video && storage.getStorageProvider() === 'r2') {
-    return (await storage.putBufferToR2(await fs.readFile(file), `social-studio/${crypto.randomUUID()}.jpg`, 'image/jpeg')).url;
-  }
-  if (storage.getStorageProvider()) return (await (video ? storage.uploadOriginalVideo : storage.uploadGeneratedImage)({ path: file, mimetype: video ? 'video/mp4' : 'image/jpeg', originalname: path.basename(file) })).url;
-  await fs.mkdir(uploads, { recursive: true });
-  const name = `social-${crypto.randomUUID()}${video ? '.mp4' : '.jpg'}`; await fs.copyFile(file, path.join(uploads, name));
-  return `${String(process.env.PUBLIC_API_URL || 'http://localhost:5000').replace(/\/$/, '')}/uploads/${name}`;
+async function persist(file, video, identity) {
+  if (!identity) throw fail('Save a post before generating its media.');
+  return (await persistGeneratedFile({ path: file, mimetype: video ? 'video/mp4' : 'image/jpeg', originalname: video ? 'product-reel.mp4' : 'product-photo.jpg' }, identity, { video, folder: 'social-studio' })).url;
 }
 async function prepare(post, video = false) {
+  const recipe = ['social-render-v2', storageFingerprint(), process.env.PUBLIC_API_URL || '', post.images.slice(0, 6), ...(video ? [post.productName || '', post.productPrice ?? null] : [])];
+  const identity = { namespace: video ? 'social-video' : 'social-photos', ownerId: post._id, storeId: post.storeId, slot: 'recipe', recipe };
+  const key = generatedUploadId(identity);
+  const checkpoint = async (slot, url) => {
+    const filter = { _id: post._id, storeId: post.storeId, ...(post.workerId ? { workerId: post.workerId } : {}) };
+    const result = await Post.updateOne(filter, { $set: { [`generationAssets.${key}.${slot}`]: url } });
+    if (!result.matchedCount) throw fail('This post changed while media was being prepared. Reload it before retrying.', 409);
+    post.generationAssets ||= {};
+    post.generationAssets[key] ||= {};
+    post.generationAssets[key][slot] = url;
+  };
+  const prior = post.generationAssets?.[key] || {};
+  if (video && prior.video) return prior.video;
+  if (!video && post.images.slice(0, 6).every((_, i) => prior[`photo${i}`])) return post.images.slice(0, 6).map((_, i) => prior[`photo${i}`]);
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'samira-social-'));
   try {
     const images = post.images.slice(0, 6);
     if (!images.length) throw fail('Select at least one product photo.');
     const outputs = [];
     for (let i = 0; i < images.length; i++) {
+      if (!video && prior[`photo${i}`]) { outputs.push(null); continue; }
       const input = path.join(directory, `source-${i}`), output = path.join(directory, `photo-${i}.jpg`);
       await photoFile(images[i], input);
       await verifyImage(input);
       await run(['-protocol_whitelist', 'file,pipe', '-i', input, '-vf', 'scale=1080:1350:force_original_aspect_ratio=decrease,pad=1080:1350:(ow-iw)/2:(oh-ih)/2:color=0xfff8ef,setsar=1', '-frames:v', '1', '-q:v', '2', output], directory);
       outputs.push(output);
     }
-    if (!video) { const urls = []; for (const file of outputs) urls.push(await persist(file, false)); return urls; }
+    if (!video) {
+      const urls = [];
+      for (let i = 0; i < outputs.length; i++) {
+        const slot = `photo${i}`;
+        const url = prior[slot] || await persist(outputs[i], false, { ...identity, slot });
+        if (!prior[slot]) await checkpoint(slot, url);
+        urls.push(url);
+      }
+      return urls;
+    }
     const clips = [];
     for (let i = 0; i < outputs.length; i++) {
       const clip = `clip-${i}.mp4`; clips.push(clip);
@@ -114,7 +135,9 @@ async function prepare(post, video = false) {
     await fs.writeFile(path.join(directory, 'clips.txt'), clips.map(clip => `file '${clip}'`).join('\n'));
     const output = path.join(directory, 'product-reel.mp4');
     await run(['-f', 'concat', '-safe', '1', '-i', 'clips.txt', '-c', 'copy', '-movflags', '+faststart', output], directory);
-    return await persist(output, true);
+    const url = await persist(output, true, { ...identity, slot: 'video' });
+    await checkpoint('video', url);
+    return url;
   } finally {
     // mkdtemp creates this exact directory; no user-provided path can reach cleanup.
     await fs.rm(directory, { recursive: true, force: true });
@@ -123,6 +146,15 @@ async function prepare(post, video = false) {
 async function removeAssets(values = []) {
   const provider = storage.getStorageProvider();
   for (const value of [...new Set(values.filter(Boolean))]) {
+    if (!provider) {
+      try {
+        const root = new URL(process.env.PUBLIC_API_URL || 'http://localhost:5000');
+        const local = new URL(value, root);
+        const name = path.basename(decodeURIComponent(local.pathname));
+        if (local.origin === root.origin && local.pathname === `/uploads/${name}` && /^(?:social-[a-f0-9-]+|retry-[a-f0-9]{64})\.(?:jpg|mp4)$/i.test(name)) await fs.unlink(path.join(uploads, name)).catch(() => {});
+      } catch { /* Invalid/foreign URLs are never deletion targets. */ }
+      continue;
+    }
     let url; try { url = trustedUrl(value); } catch { continue; }
     try {
       if (provider === 'r2' && process.env.R2_PUBLIC_URL) {
@@ -131,11 +163,14 @@ async function removeAssets(values = []) {
       } else if (provider === 'cloudinary' && process.env.CLOUDINARY_CLOUD_NAME) {
         const match = url.pathname.match(/\/(?:image|video)\/upload\/(?:v\d+\/)?(.+)\.[a-z0-9]+$/i);
         if (match) await require('../../services/cloudinaryUpload').deleteFile(decodeURIComponent(match[1]), /\.(?:mp4|mov|webm)$/i.test(url.pathname) ? 'video' : 'image');
-      } else if (url.pathname.startsWith('/uploads/social-')) {
+      } else if (/^\/uploads\/(?:social-|retry-)/.test(url.pathname)) {
         const name = path.basename(decodeURIComponent(url.pathname));
-        if (/^social-[a-f0-9-]+\.(?:jpg|mp4)$/i.test(name)) await fs.unlink(path.join(uploads, name)).catch(() => {});
+        if (/^(?:social-[a-f0-9-]+|retry-[a-f0-9]{64})\.(?:jpg|mp4)$/i.test(name)) await fs.unlink(path.join(uploads, name)).catch(() => {});
       }
     } catch { /* Retention cleanup retries later; original catalogue media is never passed here. */ }
   }
 }
-module.exports = { trustedUrl, publicIPv4, photoFile, run, persist, prepare, removeAssets };
+function generatedAssets(post) {
+  return [...(post.preparedImages || []), post.videoUrl, ...Object.values(post.generationAssets || {}).flatMap(slots => Object.values(slots || {}))].filter(Boolean);
+}
+module.exports = { trustedUrl, publicIPv4, photoFile, run, persist, prepare, removeAssets, generatedAssets };

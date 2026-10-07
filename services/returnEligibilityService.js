@@ -51,7 +51,7 @@ function returnEligibility(order, requests, configuration, now = Date.now()) {
   return { windowDays: days, deliveredAt: delivered, deadline, items };
 }
 function returnOrderStatus(order, requests) {
-  const active = requests.filter((request) => ['Requested', 'Approved', 'Pickup Scheduled', 'Picked Up', 'In Transit', 'Received', 'QC Passed', 'Refund Initiated', 'Exchange Allocated', 'Replacement Shipped', 'Replacement Delivered'].includes(request.status));
+  const active = requests.filter((request) => ['Requested', 'Approved', 'Pickup Scheduled', 'Picked Up', 'In Transit', 'Received', 'Inspection Pending', 'Verified', 'Mismatch Found', 'QC Passed', 'Refund Initiated', 'Exchange Allocated', 'Replacement Shipped', 'Replacement Delivered'].includes(request.status));
   if (active.length) return active.some((request) => request.type === 'return') ? 'Return Requested' : 'Exchange Requested';
   const allCovered = (predicate) => (order.orderItems || []).length > 0 && order.orderItems.every((item) => (
     requests.filter((request) => matchesItem(request, item) && predicate(request)).reduce((sum, request) => sum + Number(request.quantity || 1), 0) >= Math.max(0, Number(item.quantity || 1) - Number(item.cancelledQuantity || 0))

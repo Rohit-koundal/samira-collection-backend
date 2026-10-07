@@ -154,10 +154,12 @@ test('banner schedules, safe links and engagement counters behave like real stor
     destinationType: 'COLLECTION', destinationValue: 'Wedding Edit', endsAt: new Date(Date.now() + 86400000).toISOString(), isActive: true,
   }, token, 201);
   assert.equal(live.link, '/products?collection=Wedding%20Edit');
-  await call('POST', `/api/banners/${live._id}/events`, { event: 'impression', sessionId: 'campaign-session-1' }, undefined, 202);
-  const duplicate = await call('POST', `/api/banners/${live._id}/events`, { event: 'impression', sessionId: 'campaign-session-1' }, undefined, 202);
+  const denied = await call('POST', `/api/banners/${live._id}/events`, { event: 'impression', sessionId: 'campaign-session-1' }, undefined, 202);
+  assert.equal(denied.ignored, true);
+  await call('POST', `/api/banners/${live._id}/events`, { event: 'impression', sessionId: 'campaign-session-1', consent: true }, undefined, 202);
+  const duplicate = await call('POST', `/api/banners/${live._id}/events`, { event: 'impression', sessionId: 'campaign-session-1', consent: true }, undefined, 202);
   assert.equal(duplicate.duplicate, true);
-  await call('POST', `/api/banners/${live._id}/events`, { event: 'click', sessionId: 'campaign-session-1' }, undefined, 202);
+  await call('POST', `/api/banners/${live._id}/events`, { event: 'click', sessionId: 'campaign-session-1', consent: true }, undefined, 202);
   const stored = await Banner.findById(live._id).lean();
   assert.equal(stored.impressions, 1);
   assert.equal(stored.clicks, 1);
@@ -433,8 +435,9 @@ test('seller CRM, campaign analytics, manual shipment and reports agree with its
   const callback = await fetch(`${getBaseUrl()}/api/instagram/oauth/callback`, { redirect: 'manual' });
   assert.equal(callback.status, 302);
   assert.match(callback.headers.get('location'), /\/seller\/instagram\?ig=error$/);
-  for (const name of ['STORE_VIEW','PRODUCT_VIEW','ADD_TO_CART','BEGIN_CHECKOUT']) await call('POST', `/api/analytics/events?store=${seller.store.slug}`, { name, productId: String(product._id), sessionId: 'workflow-analytics-session', source: 'instagram', campaign: 'workflow-launch' }, customer.token, 202);
+  for (const name of ['STORE_VIEW','PRODUCT_VIEW','ADD_TO_CART','BEGIN_CHECKOUT']) await call('POST', `/api/analytics/events?store=${seller.store.slug}`, { name, consent: true, productId: String(product._id), sessionId: 'workflow-analytics-session', source: 'instagram', campaign: 'workflow-launch' }, customer.token, 202);
   const order = await call('POST', '/api/orders/cod', { orderItems: [{ product: String(product._id), quantity: 1, size: 'M', color: 'Red' }], shippingAddress: validAddress(), paymentMethod: 'COD', attribution: { source: 'instagram', campaign: 'workflow-launch' } }, customer.token, 201, storefrontHeaders);
+  if (order.codVerification?.required) await call('POST', `/api/orders/${order._id}/cod-verification/verify`, { otp: '123456' }, customer.token, 200, storefrontHeaders);
   assert.equal((await get('/api/seller/inventory/history', seller.token, headers)).items[0].type, 'SALE');
   assert.equal((await get('/api/seller/orders', seller.token, headers)).length, 1);
   assert.equal((await get(`/api/seller/orders/${order._id}`, seller.token, headers))._id, order._id);

@@ -249,12 +249,15 @@ function validateStructure(input) {
   const categoryDefinitions = cleanCategories(input.categoryDefinitions === undefined ? selectedPreset.categoryDefinitions : input.categoryDefinitions, attributes);
   const filters = cleanFilters(input.filters === undefined ? selectedPreset.filters : input.filters, attributes, categoryDefinitions);
   const variantConfig = cleanVariantConfig(input.variantConfig === undefined ? selectedPreset.variantConfig : input.variantConfig, attributes);
+  const commerce = input.commerce || selectedPreset.commerce || { mode: 'SALE_ONLY' };
+  if (!commerce || Array.isArray(commerce) || !['SALE_ONLY', 'RENTAL_ONLY', 'SALE_AND_RENTAL'].includes(commerce.mode)) bad('Choose a valid sale/rental business mode');
   return {
     id: text(input.id, 40) || industry,
     name: text(input.name, 80) || title(industry),
     industry,
     version: Math.max(2, safeInteger(input.version, 2, 1, 100000)),
     active: input.active !== false,
+    commerce: { mode: commerce.mode, rentalModuleVersion: 1, stockMode: 'SEPARATE_RENTAL_ASSETS' },
     attributes,
     features: {
       sizing: input.features.sizing, specifications: input.features.specifications,

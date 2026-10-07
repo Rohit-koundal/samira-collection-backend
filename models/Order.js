@@ -52,6 +52,7 @@ const orderSchema = new mongoose.Schema({
       actor: { id: String, name: String, role: String },
       date: { type: Date, default: Date.now },
     }],
+    uniqueItemIds: { type: [String], default: [] },
   }],
   shippingAddress: Object,
   shippingQuote: Object,
@@ -74,6 +75,32 @@ const orderSchema = new mongoose.Schema({
   },
   shipment: { type: mongoose.Schema.Types.ObjectId, ref: 'Shipment' },
   deliveredAt: Date,
+  deliveryProof: {
+    trackingNumber: String,
+    courierName: String,
+    deliveredAt: Date,
+    deliveryOtpVerified: { type: Boolean, default: false },
+    source: { type: String, enum: ['MANUAL', 'COURIER', 'SYSTEM'], default: 'SYSTEM' },
+  },
+  fraudProtectionSnapshot: {
+    capturedAt: Date,
+    requireProductQrScan: Boolean,
+    requirePackingPhotos: Boolean,
+    requirePackingVideo: Boolean,
+    requireDispatchWeight: Boolean,
+    requireSecuritySeal: Boolean,
+    enableSecurityTag: Boolean,
+    highValueThreshold: Number,
+  },
+  packageVerification: {
+    status: { type: String, enum: ['NOT_REQUIRED', 'PENDING', 'VERIFIED'], default: 'NOT_REQUIRED' },
+    sealId: { type: String, trim: true, uppercase: true, maxlength: 80 },
+    securityTagId: { type: String, trim: true, uppercase: true, maxlength: 80 },
+    dispatchWeightGrams: { type: Number, min: 1, max: 1000000 },
+    evidenceCount: { type: Number, default: 0, min: 0 },
+    verifiedAt: Date,
+    verifiedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  },
   paymentMethod: { type: String, enum: ['COD', 'UPI', 'CARD', 'Card', 'NETBANKING', 'WALLET', 'Razorpay'], default: 'COD' },
   paymentProvider: { type: String, default: 'COD' },
   paymentStatus: { type: String, enum: ['Pending', 'Paid', 'Failed', 'Refunded'], default: 'Pending' },
@@ -218,9 +245,30 @@ const orderSchema = new mongoose.Schema({
     capturedAt: Date,
     expiresAt: Date,
   },
+  traffic: {
+    visitorId: { type: String, maxlength: 80 },
+    sessionId: { type: String, maxlength: 80 },
+  },
   prepaidDiscount: { type: Number, default: 0 },
   codConfirmationStatus: { type: String, enum: ['NOT_REQUIRED', 'PENDING', 'CONFIRMED', 'CANCELLED'], default: 'NOT_REQUIRED' },
+  codVerification: {
+    required: { type: Boolean, default: false },
+    status: { type: String, enum: ['NOT_REQUIRED', 'PENDING', 'VERIFIED', 'CANCELLED'], default: 'NOT_REQUIRED' },
+    reason: { type: String, enum: ['PREPAID', 'FIRST_COD_ORDER', 'PHONE_NOT_VERIFIED', 'RTO_HISTORY', 'RTO_LIMIT', 'TRUSTED_CUSTOMER', 'STORE_POLICY', 'NOT_REQUIRED'] },
+    trustState: { type: String, enum: ['NEW', 'VERIFIED', 'TRUSTED', 'RESTRICTED'] },
+    successfulDeliveries: { type: Number, default: 0, min: 0 },
+    rtoCount: { type: Number, default: 0, min: 0 },
+    phoneLast4: String,
+    evaluatedAt: Date,
+    sentAt: Date,
+    expiresAt: Date,
+    verifiedAt: Date,
+    deliveryStatus: { type: String, enum: ['NOT_SENT', 'SENT', 'DELIVERED', 'FAILED'], default: 'NOT_SENT' },
+    sendCount: { type: Number, default: 0, min: 0 },
+    lastDeliveryError: String,
+  },
   revision: { type: Number, default: 0, min: 0 },
+  ownerAlertQueued: { type: Boolean, default: false, select: false },
 }, { timestamps: true });
 
 orderSchema.plugin(storeIdPlugin);
@@ -231,11 +279,14 @@ orderSchema.index({ user: 1, paymentStatus: 1, createdAt: -1 });
 orderSchema.index({ orderStatus: 1, createdAt: -1 });
 orderSchema.index({ createdAt: -1 });
 orderSchema.index({ storeId: 1, createdAt: -1 });
+orderSchema.index({ storeId: 1, ownerAlertQueued: 1, createdAt: 1 });
 orderSchema.index({ storeId: 1, user: 1, createdAt: -1 });
+orderSchema.index({ storeId: 1, 'traffic.sessionId': 1, 'traffic.visitorId': 1, createdAt: 1 }, { partialFilterExpression: { 'traffic.sessionId': { $type: 'string' } }, name: 'traffic_verified_order_lookup' });
 orderSchema.index({ storeId: 1, orderStatus: 1, createdAt: -1 });
 orderSchema.index({ storeId: 1, paymentStatus: 1, createdAt: -1 });
 orderSchema.index({ storeId: 1, 'coupon.couponId': 1, createdAt: -1 });
 orderSchema.index({ storeId: 1, 'coupon.code': 1, createdAt: -1 });
+orderSchema.index({ storeId: 1, 'orderItems.uniqueItemIds': 1 });
 orderSchema.index({ invoiceNumber: 1 }, { sparse: true });
 
 module.exports = mongoose.model('Order', orderSchema);

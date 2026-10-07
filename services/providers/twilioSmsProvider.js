@@ -1,49 +1,36 @@
-async function sendOtp(phone, otp) {
-  const config = getTwilioConfig();
-  if (!config.accountSid || !config.authToken || !config.from) {
-    const error = new Error('Twilio SMS provider is not configured. Check the backend SMS account, token and sender settings.');
-    error.errorCode = 'OTP_PROVIDER_NOT_CONFIGURED';
-    throw error;
-  }
+const { readConfiguration, requireConfiguration, internationalPhone, requireOtp, requestJson, providerError } = require('./smsProviderUtils');
+
+async function sendOtp(phone, otp, override) {
+  const config = requireConfiguration(getConfiguration(override));
+  const code = requireOtp(otp);
 
   const body = new URLSearchParams({
-    To: String(phone).startsWith('+') ? String(phone) : `+91${phone}`,
+    To: internationalPhone(phone),
     From: config.from,
-    Body: `Your Samira Collection OTP is ${otp}. It is valid for ${process.env.OTP_EXPIRY_MINUTES || 5} minutes. Do not share this OTP with anyone.`,
+    Body: `Your Samira Collection OTP is ${code}. It is valid for ${process.env.OTP_EXPIRY_MINUTES || 5} minutes. Do not share this OTP with anyone.`,
   });
-  const response = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${config.accountSid}/Messages.json`, {
+  const { response, data } = await requestJson(`https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(config.accountSid)}/Messages.json`, {
     method: 'POST',
     headers: {
       Authorization: `Basic ${Buffer.from(`${config.accountSid}:${config.authToken}`).toString('base64')}`,
       'Content-Type': 'application/x-www-form-urlencoded',
     },
     body,
-    signal: AbortSignal.timeout(15000),
   });
 
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    const rejectedCredentials = response.status === 401 || response.status === 403 || Number(data.code) === 20003;
+  if (!response.ok || typeof data?.sid !== 'string' || !data.sid || data.error_code || ['failed', 'undelivered', 'canceled'].includes(data.status)) {
+    const rejectedCredentials = response.status === 401 || response.status === 403 || Number(data?.code) === 20003;
     // Provider messages can contain account identifiers or other request data.
     // Keep diagnostics actionable without logging or returning that raw text.
-    const error = new Error(rejectedCredentials
-      ? 'Twilio rejected the SMS credentials or permissions. Check SMS_ACCOUNT_SID and SMS_AUTH_TOKEN on the backend.'
-      : 'Twilio could not accept the OTP message. Check the SMS delivery error in the Twilio console.');
-    error.errorCode = rejectedCredentials ? 'OTP_PROVIDER_AUTH_FAILED' : 'OTP_DELIVERY_UNAVAILABLE';
-    error.providerCode = Number.isSafeInteger(Number(data.code)) ? Number(data.code) : undefined;
-    error.statusCode = 503;
+    const error = providerError(rejectedCredentials ? 'OTP_PROVIDER_AUTH_FAILED' : 'OTP_DELIVERY_UNAVAILABLE');
+    error.providerCode = Number.isSafeInteger(Number(data?.code)) ? Number(data.code) : undefined;
     throw error;
   }
   return { success: true, provider: 'twilio', accountSid: config.accountSid, messageSid: data.sid };
 }
 
-function getTwilioConfig() {
-  const value = (key) => String(process.env[key] || '').trim();
-  return {
-    accountSid: value('SMS_ACCOUNT_SID'),
-    authToken: value('SMS_AUTH_TOKEN'),
-    from: value('SMS_SENDER_ID'),
-  };
+function getConfiguration(override) {
+  return readConfiguration({ accountSid: ['SMS_ACCOUNT_SID'], authToken: ['SMS_AUTH_TOKEN'], from: ['SMS_SENDER_ID'] }, {}, override);
 }
 
-module.exports = { sendOtp };
+module.exports = { sendOtp, getConfiguration };

@@ -9,11 +9,12 @@ const TEXT_LIMITS = {
   cancellationPolicy: 20000, sizeGuide: 20000, faqs: 20000, ourStory: 20000,
 };
 const NUMBERS = ['deliveryCharge', 'freeShippingMinAmount', 'codCharge', 'codMaxAmount', 'codMinAmount',
-  'returnWindowDays', 'prepaidDiscountValue', 'rtoBlockMinOrders', 'rtoBlockThreshold', 'platformFee', 'gstRate', 'minimumOrderAmount',
-  'customerReturnShippingCharge', 'customerRestockingFeePercent', 'exchangeReservationHours', 'returnSlaHours', 'rtoRefundDeduction'];
-const BOOLEANS = ['brandIdentityEnabled', 'contactDetailsEnabled', 'announcementEnabled', 'acceptingOrders', 'razorpayEnabled', 'upiEnabled',
-  'cardPaymentEnabled', 'netBankingEnabled', 'walletEnabled', 'codEnabled', 'codConfirmationRequired', 'rtoBlockEnabled', 'searchIndexingEnabled',
-  'returnsEnabled', 'refundDeliveryChargeOnFullReturn', 'refundPlatformFeeOnFullReturn', 'refundCodChargeOnFullReturn'];
+  'returnWindowDays', 'prepaidDiscountValue', 'codRtoRestrictionLimit', 'rtoBlockMinOrders', 'rtoBlockThreshold', 'platformFee', 'gstRate', 'minimumOrderAmount',
+  'customerReturnShippingCharge', 'customerRestockingFeePercent', 'exchangeReservationHours', 'returnSlaHours', 'rtoRefundDeduction', 'returnWeightToleranceGrams', 'highValueVerificationThreshold'];
+const BOOLEANS = ['occasionShoppingEnabled', 'recentlyViewedEnabled', 'completeLookEnabled', 'brandIdentityEnabled', 'contactDetailsEnabled', 'announcementEnabled', 'acceptingOrders', 'razorpayEnabled', 'upiEnabled',
+  'cardPaymentEnabled', 'netBankingEnabled', 'walletEnabled', 'codEnabled', 'codConfirmationRequired', 'smartCodVerificationEnabled', 'rtoBlockEnabled', 'searchIndexingEnabled',
+  'returnsEnabled', 'refundDeliveryChargeOnFullReturn', 'refundPlatformFeeOnFullReturn', 'refundCodChargeOnFullReturn',
+  'requireProductQrScan', 'requirePackingPhotos', 'requirePackingVideo', 'requireDispatchWeight', 'requireSecuritySeal', 'requireReturnPhotos', 'requireReturnVideo', 'enableSecurityTag', 'enableCustomerRiskDetection', 'autoApproveVerifiedReturns'];
 function invalid(message) { throw new ApiError('VALIDATION_ERROR', message); }
 function safeUrl(value, label, image = false) {
   if (!value) return '';
@@ -54,11 +55,13 @@ function normalizeSettingsUpdates(input, current = {}) {
     if (!['number', 'string'].includes(typeof value) || String(value).trim() === '' || !Number.isFinite(Number(value)) || Number(value) < 0 || Number(value) > 100000000) invalid(`${key} must be zero or a positive number.`);
     updates[key] = Number(value);
   }
-  for (const key of ['returnWindowDays', 'rtoBlockMinOrders', 'exchangeReservationHours', 'returnSlaHours']) if (updates[key] !== undefined && updates[key] !== null && !Number.isInteger(updates[key])) invalid(`${key} must be a whole number.`);
+  for (const key of ['returnWindowDays', 'codRtoRestrictionLimit', 'rtoBlockMinOrders', 'exchangeReservationHours', 'returnSlaHours']) if (updates[key] !== undefined && updates[key] !== null && !Number.isInteger(updates[key])) invalid(`${key} must be a whole number.`);
+  if (updates.codRtoRestrictionLimit > 100) invalid('COD RTO restriction limit cannot exceed 100.');
   if (updates.returnWindowDays !== null && updates.returnWindowDays > 365) invalid('Return window must be between 0 and 365 days.');
   if (updates.customerRestockingFeePercent > 100) invalid('Restocking fee must be between 0 and 100 percent.');
   if (updates.exchangeReservationHours !== undefined && (updates.exchangeReservationHours < 1 || updates.exchangeReservationHours > 720)) invalid('Exchange reservation must be between 1 and 720 hours.');
   if (updates.returnSlaHours !== undefined && (updates.returnSlaHours < 1 || updates.returnSlaHours > 720)) invalid('Return SLA must be between 1 and 720 hours.');
+  if (updates.returnWeightToleranceGrams !== undefined && updates.returnWeightToleranceGrams > 10000) invalid('Return weight tolerance cannot exceed 10,000 grams.');
   if (updates.rtoBlockThreshold > 1) invalid('RTO block rate must be between 0 and 1.');
   if (updates.gstRate > 100) invalid('GST rate must be between 0 and 100.');
   if (updates.gstin) {

@@ -13,7 +13,7 @@ const storage = multer.diskStorage({
   },
   filename(req, file, cb) {
     const safeName = file.originalname.replace(/[^a-z0-9.]+/gi, '-').toLowerCase();
-    cb(null, `${Date.now()}-${safeName}`);
+    cb(null, `${require('crypto').randomUUID()}-${safeName}`);
   },
 });
 

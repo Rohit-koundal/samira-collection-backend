@@ -19,25 +19,39 @@ async function uploadFile(file, resourceType = 'image', options = {}) {
   const suffix = String(options.folder || '').replace(/[^a-z0-9/_-]/gi, '').replace(/^\/+|\/+$/g, '');
   const folder = suffix ? `${baseFolder}/${suffix}` : baseFolder;
   const timestamp = Math.floor(Date.now() / 1000);
+  const uploadId = /^[a-f0-9]{64}$/.test(options.uploadId || '') ? `retry-${options.uploadId}` : '';
+  if (uploadId && options.recovering) {
+    const existing = await fetch(`https://api.cloudinary.com/v1_1/${cloudName}/resources/${resourceType}/upload/${encodeURIComponent(`${folder}/${uploadId}`)}`, {
+      headers: { Authorization: `Basic ${Buffer.from(`${apiKey}:${apiSecret}`).toString('base64')}` }, signal: AbortSignal.timeout(30000),
+    });
+    if (existing.ok) {
+      const saved = await existing.json();
+      if (saved.secure_url && saved.public_id) return { url: saved.secure_url, publicId: saved.public_id, originalName: file.originalname };
+      throw new Error('Cloudinary did not return the saved file. Please retry.');
+    }
+    if (existing.status !== 404) throw new Error('Unable to check the previous Cloudinary upload. Please retry.');
+  }
+  const parameters = { folder, timestamp, ...(uploadId ? { public_id: uploadId, overwrite: 'false' } : {}) };
   const signature = crypto
     .createHash('sha1')
-    .update(`folder=${folder}&timestamp=${timestamp}${apiSecret}`)
+    .update(`${Object.keys(parameters).sort().map(key => `${key}=${parameters[key]}`).join('&')}${apiSecret}`)
     .digest('hex');
 
   const buffer = await fs.readFile(file.path);
   const form = new FormData();
   form.append('file', new Blob([buffer], { type: file.mimetype }), file.originalname);
   form.append('api_key', apiKey);
-  form.append('timestamp', String(timestamp));
-  form.append('folder', folder);
+  Object.entries(parameters).forEach(([key, value]) => form.append(key, String(value)));
   form.append('signature', signature);
 
   const response = await fetch(`https://api.cloudinary.com/v1_1/${cloudName}/${resourceType}/upload`, {
     method: 'POST',
     body: form,
+    signal: AbortSignal.timeout(resourceType === 'video' ? 10 * 60 * 1000 : 2 * 60 * 1000),
   });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(data.error?.message || 'Cloudinary upload failed');
+  if (!data.secure_url || !data.public_id) throw new Error('Cloudinary did not return an uploaded file. Please retry.');
 
   return {
     url: data.secure_url,
@@ -67,7 +81,9 @@ async function deleteFile(identifier, resourceType = 'image') {
   const response = await fetch(`https://api.cloudinary.com/v1_1/${process.env.CLOUDINARY_CLOUD_NAME}/${safeResourceType}/destroy`, { method: 'POST', body: form });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(data.error?.message || 'Cloudinary file deletion failed');
-  return ['ok', 'not found'].includes(data.result);
+  const deleted = ['ok', 'not found'].includes(data.result);
+  if (deleted) await require('./uploadRetryService').invalidateStoredUpload('cloudinary', String(publicId));
+  return deleted;
 }
 
 module.exports = { deleteFile, isCloudinaryConfigured, uploadImage, uploadVideo };

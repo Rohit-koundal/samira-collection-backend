@@ -4,6 +4,9 @@ const assert = require('node:assert/strict');
 const { request, resetDatabase, startTestEnvironment, stopTestEnvironment } = require('./helpers');
 const { createAdmin, createCustomer } = require('./factories');
 const User = require('../models/User');
+const jwt = require('jsonwebtoken');
+const { generateToken, generateRefreshToken } = require('../utils/generateToken');
+const { COOKIE_NAME } = require('../utils/authCookies');
 
 test.before(startTestEnvironment);
 test.after(stopTestEnvironment);
@@ -179,4 +182,87 @@ test('customer password login is disabled because storefront login is OTP-only',
     body: { email: 'shopper@test.local', password: 'CorrectHorse1' },
   });
   assert.equal(byEmail.status, 404);
+});
+
+function assertAccessLifetime(token, seconds) {
+  const claims = jwt.decode(token);
+  assert.equal(claims.exp - claims.iat, seconds);
+}
+
+function accessTokenIssuedAgo(t, user, seconds) {
+  const issuedAt = Date.now() - seconds * 1000;
+  const clock = t.mock.method(Date, 'now', () => issuedAt);
+  try { return generateToken(user); }
+  finally { clock.mock.restore(); }
+}
+
+test('admin OTP login, mode switch and cookie refresh all issue 24-hour access tokens', async () => {
+  const { user } = await createAdmin();
+  const sent = await request('/api/auth/send-otp', { method: 'POST', body: { phone: user.phone } });
+  assert.equal(sent.status, 200);
+  const login = await request('/api/auth/verify-otp', { method: 'POST', body: { phone: user.phone, otp: '123456' } });
+  assert.equal(login.status, 200);
+  assert.equal(login.data.user.role, 'admin');
+  assertAccessLifetime(login.data.token, 24 * 60 * 60);
+  const cookie = login.headers.get('set-cookie');
+  assert.match(cookie, /HttpOnly/i);
+  assert.match(cookie, /Max-Age=2592000/);
+  for (const mode of ['admin', 'customer']) {
+    const switched = await request('/api/auth/switch-mode', { method: 'POST', token: login.data.token, body: { mode } });
+    assert.equal(switched.status, 200);
+    assert.equal(switched.data.user.activeMode, mode);
+    assertAccessLifetime(switched.data.token, 24 * 60 * 60);
+  }
+  const refreshed = await request('/api/auth/refresh', { method: 'POST', headers: { Cookie: cookie.split(';')[0] }, body: {} });
+  assert.equal(refreshed.status, 200);
+  assertAccessLifetime(refreshed.data.token, 24 * 60 * 60);
+});
+
+test('an admin can still use protected APIs just before 24 hours without a refresh cookie', async (t) => {
+  const { user } = await createAdmin();
+  const token = accessTokenIssuedAgo(t, user, 24 * 60 * 60 - 60);
+  assert.equal((await request('/api/auth/me', { token })).status, 200);
+  assert.equal((await request('/api/admin/categories', { token })).status, 200);
+  const expired = accessTokenIssuedAgo(t, user, 24 * 60 * 60 + 1);
+  assert.equal((await request('/api/auth/me', { token: expired })).status, 401);
+});
+
+test('customer access still expires after 15 minutes and recovers with the existing refresh cookie', async (t) => {
+  const { user } = await createCustomer();
+  const token = accessTokenIssuedAgo(t, user, 16 * 60);
+  assert.equal((await request('/api/auth/me', { token })).status, 401);
+  const refreshed = await request('/api/auth/refresh', {
+    method: 'POST', body: {}, headers: { Cookie: `${COOKIE_NAME}=${generateRefreshToken(user)}` },
+  });
+  assert.equal(refreshed.status, 200);
+  assertAccessLifetime(refreshed.data.token, 15 * 60);
+});
+
+test('explicit logout immediately revokes both long-lived admin access and refresh tokens', async () => {
+  const { user, token } = await createAdmin();
+  const cookie = `${COOKIE_NAME}=${generateRefreshToken(user)}`;
+  assert.equal((await request('/api/auth/logout', { method: 'POST', token, body: {} })).status, 200);
+  assert.equal((await request('/api/auth/me', { token })).status, 401);
+  const refreshed = await request('/api/auth/refresh', { method: 'POST', headers: { Cookie: cookie }, body: {} });
+  assert.equal(refreshed.status, 401);
+});
+
+test('blocking an admin immediately rejects unexpired access and refresh tokens', async () => {
+  const { user, token } = await createAdmin();
+  const cookie = `${COOKIE_NAME}=${generateRefreshToken(user)}`;
+  await User.updateOne({ _id: user._id }, { $set: { isBlocked: true } });
+  assert.equal((await request('/api/auth/me', { token })).status, 401);
+  assert.equal((await request('/api/auth/refresh', { method: 'POST', headers: { Cookie: cookie }, body: {} })).status, 401);
+});
+
+test('demoting an admin immediately removes admin access and refreshes with customer lifetime', async () => {
+  const { user, token } = await createAdmin();
+  const cookie = `${COOKIE_NAME}=${generateRefreshToken(user)}`;
+  assert.equal((await request('/api/admin/categories', { token })).status, 200);
+  await User.updateOne({ _id: user._id }, { $set: { role: 'customer', activeMode: 'customer', availableModes: ['customer'] } });
+  assert.equal((await request('/api/admin/categories', { token })).status, 403);
+  const refreshed = await request('/api/auth/refresh', { method: 'POST', headers: { Cookie: cookie }, body: {} });
+  assert.equal(refreshed.status, 200);
+  assert.equal(refreshed.data.user.role, 'customer');
+  assertAccessLifetime(refreshed.data.token, 15 * 60);
 });

@@ -16,7 +16,7 @@ const DAY = 86400000;
 const CLOSED = ['Cancelled', 'Returned', 'Refunded'];
 const PAYMENT_METHODS = ['COD', 'UPI', 'CARD', 'Card', 'NETBANKING', 'WALLET', 'Razorpay'];
 const ORDER_STATUSES = ['Pending', 'Confirmed', 'Packed', 'Shipped', 'Out for Delivery', 'Delivered', 'Cancelled', 'Return Requested', 'Exchange Requested', 'Returned', 'Refunded'];
-const SECTIONS = ['summary', 'products', 'customers', 'marketing', 'fulfillment'];
+const SECTIONS = ['summary', 'products', 'customers', 'marketing', 'fulfillment', 'traffic'];
 
 const round = (value) => Math.round(Number(value || 0) * 100) / 100;
 const number = (value) => Number(value || 0);
@@ -71,6 +71,9 @@ function reportRange(query = {}, timezone = 'Asia/Kolkata', now = new Date()) {
     const end = calendarDate(String(query.to), zone);
     if (end < from || end > today) throw new ApiError('VALIDATION_ERROR', 'Choose an end date on or after the start date, up to today.');
     to = new Date(Math.min(end.getTime() + DAY, to.getTime()));
+  } else if (preset === 'yesterday') {
+    from = new Date(today.getTime() - DAY);
+    to = today;
   } else if (preset === 'month') {
     from = calendarDate(`${todayKey.slice(0, 7)}-01`, zone);
   } else {
@@ -531,12 +534,12 @@ async function createReportContext({ query = {}, tenantFilter = {}, store }) {
 
 async function generateSection(section, context) {
   if (!SECTIONS.includes(section)) throw new ApiError('VALIDATION_ERROR', 'Choose a valid report section.');
-  const handlers = { summary: summaryReport, products: productsReport, customers: customersReport, marketing: marketingReport, fulfillment: fulfillmentReport };
+  const handlers = { summary: summaryReport, products: productsReport, customers: customersReport, marketing: marketingReport, fulfillment: fulfillmentReport, traffic: require('./trafficReportingService').trafficReport };
   const data = await handlers[section](context);
   return {
-    schemaVersion: 1, section, generatedAt: new Date(), currency: context.currency, timezone: context.timezone,
-    range: { preset: context.range.preset, fromDate: context.range.fromDate, toDate: context.range.toDate, days: context.range.days },
-    filters: Object.fromEntries(['status', 'paymentMethod', 'product', 'category', 'coupon', 'campaign', 'source', 'city', 'pincode', 'provider'].filter((key) => context.query[key]).map((key) => [key, context.query[key]])),
+    schemaVersion: 1, section, generatedAt: new Date(), currency: context.currency, timezone: data.timezone || context.timezone,
+    range: section === 'traffic' ? { preset: data.range.preset, fromDate: data.range.fromDate, toDate: data.range.toDate, days: data.range.days } : { preset: context.range.preset, fromDate: context.range.fromDate, toDate: context.range.toDate, days: context.range.days },
+    filters: Object.fromEntries(['status', 'paymentMethod', 'product', 'category', 'coupon', 'campaign', 'source', 'city', 'pincode', 'provider', 'device', 'browser'].filter((key) => context.query[key]).map((key) => [key, context.query[key]])),
     data,
   };
 }

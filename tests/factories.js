@@ -72,6 +72,7 @@ async function setSettings(overrides = {}) {
   return Settings.findOneAndUpdate({}, {
     storeName: 'Samira Collection',
     codEnabled: true,
+    smartCodVerificationEnabled: false,
     codCharge: 0,
     razorpayEnabled: false,
     deliveryCharge: 99,

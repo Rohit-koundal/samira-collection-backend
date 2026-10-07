@@ -55,10 +55,10 @@ async function cleanupRetention() {
   const postCutoff = new Date(Date.now() - Math.max(90, Number.isFinite(configuredPostDays) ? configuredPostDays : 730) * 86400000);
   const configuredAssetDays = Number(process.env.SOCIAL_PUBLISHED_ASSET_RETENTION_DAYS || 30);
   const assetCutoff = new Date(Date.now() - Math.max(7, Number.isFinite(configuredAssetDays) ? configuredAssetDays : 30) * 86400000);
-  const assets = await Post.find({ status: { $in: ['published', 'failed', 'partial', 'review'] }, assetsPurgedAt: null, updatedAt: { $lt: assetCutoff } }).select('preparedImages videoUrl').limit(100);
-  for (const post of assets) { await require('./media').removeAssets([...(post.preparedImages || []), post.videoUrl]); post.preparedImages = []; post.videoUrl = ''; post.assetsPurgedAt = new Date(); await post.save(); }
-  const staleDrafts = await Post.find({ status: 'draft', updatedAt: { $lt: postCutoff } }).select('preparedImages videoUrl').limit(100);
-  for (const post of staleDrafts) { await require('./media').removeAssets([...(post.preparedImages || []), post.videoUrl]); await Post.deleteOne({ _id: post._id, status: 'draft' }); }
+  const assets = await Post.find({ status: { $in: ['published', 'failed', 'partial', 'review'] }, assetsPurgedAt: null, updatedAt: { $lt: assetCutoff } }).select('preparedImages videoUrl generationAssets').limit(100);
+  for (const post of assets) { await require('./media').removeAssets(require('./media').generatedAssets(post)); post.preparedImages = []; post.videoUrl = ''; post.generationAssets = {}; post.assetsPurgedAt = new Date(); await post.save(); }
+  const staleDrafts = await Post.find({ status: 'draft', updatedAt: { $lt: postCutoff } }).select('preparedImages videoUrl generationAssets').limit(100);
+  for (const post of staleDrafts) { await require('./media').removeAssets(require('./media').generatedAssets(post)); await Post.deleteOne({ _id: post._id, status: 'draft' }); await require('../../services/recordCreationService').invalidateRecordCreation(post._id); }
 }
 async function tick() {
   if (running) return;

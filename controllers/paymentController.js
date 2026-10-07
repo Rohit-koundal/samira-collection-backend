@@ -20,6 +20,7 @@ const { assertCustomerCanCheckout } = require('../services/customerAccessService
 const { returnOrderStatus } = require('../services/returnEligibilityService');
 const { beginPaymentAttempt, checkoutAttemptId, checkoutFingerprint, checkoutCartItems, consumePurchasedCart, failPaymentAttempt, findCheckoutReplay, finishPaymentAttempt, isDuplicateKey } = require('../services/checkoutSafetyService');
 const { processCancellationRefund } = require('../services/paymentRefundService');
+const { snapshotForOrder } = require('../services/fraudProtectionService');
 
 /**
  * Razorpay flow.
@@ -67,6 +68,12 @@ async function finalizePaidOrder(orderId, { razorpayPaymentId, note, req, source
           paymentStatus: 'Paid',
           paymentState: 'PAID',
           orderStatus: 'Confirmed',
+          codConfirmationStatus: 'NOT_REQUIRED',
+          'codVerification.required': false,
+          'codVerification.status': 'NOT_REQUIRED',
+          'codVerification.reason': 'PREPAID',
+          'codVerification.trustState': 'VERIFIED',
+          'codVerification.verifiedAt': new Date(),
           razorpayPaymentId,
           paymentFailureReason: undefined,
         },
@@ -173,6 +180,7 @@ async function finalizePaidOrder(orderId, { razorpayPaymentId, note, req, source
 
 async function notifyPaid(order) {
   if (!order) return;
+  require('../services/orderAlertService').queueLater(order._id);
   notifyLater({
     userId: order.user,
     storeId: order.storeId,
@@ -242,10 +250,12 @@ async function createPaymentOrder(req, res) {
   }
 
   const cartItems = checkoutCartItems(req.body);
+  const fraudSnapshot = snapshotForOrder(draft.settings, draft.totals.finalAmount);
   let order;
   let replayed = false;
   try {
     order = await runInTransaction(async (session) => {
+    await require('../services/commerceUsageService').assertMonthlyCapacity(req.store, { session, platform: req.platformLicense, lock: true });
     const [created] = await Order.create([{
       ...buildPersistedOrderFields({
         userId: req.user._id,
@@ -259,16 +269,21 @@ async function createPaymentOrder(req, res) {
           checkoutCartItems: cartItems,
           cartCleanupStatus: cartItems.length ? 'PENDING' : 'NOT_REQUIRED',
           attribution: readAttribution(req.body?.attribution || req.body),
+          traffic: require('../utils/trafficContext')(req.body),
           prepaidDiscount: draft.totals.prepaidDiscount || 0,
           paymentProvider: 'Razorpay',
           paymentStatus: 'Pending',
           paymentState: 'PENDING',
           orderStatus: 'Pending',
+          codConfirmationStatus: 'NOT_REQUIRED',
+          codVerification: { required: false, status: 'NOT_REQUIRED', reason: 'PREPAID', trustState: 'VERIFIED', evaluatedAt: new Date() },
           razorpayOrderId: razorpayOrder.id,
           inventoryDeducted: true,
           inventoryDeductedAt: new Date(),
           couponConsumed: Boolean(draft.totals.coupon?.code),
           statusTimeline: [{ status: 'Pending', date: new Date(), note: 'Awaiting Razorpay payment' }],
+          fraudProtectionSnapshot: Object.fromEntries(Object.entries(fraudSnapshot).filter(([key]) => key !== 'packageStatus')),
+          packageVerification: { status: fraudSnapshot.packageStatus },
           paymentEvents: [{ state: 'PENDING', status: 'Pending', amount: draft.totals.finalAmount, reference: razorpayOrder.id, source: 'CHECKOUT', note: 'Awaiting Razorpay payment', date: new Date() }],
         },
       }),
@@ -432,6 +447,16 @@ async function razorpayWebhook(req, res) {
   const paymentEntity = payload.payload?.payment?.entity;
   const refundEntity = payload.payload?.refund?.entity;
   const paymentLinkEntity = payload.payload?.payment_link?.entity;
+
+  // Rental payments use their own ledger; never deduct sale stock for them.
+  // The signature above is verified before routing to either workflow.
+  if (paymentEntity?.notes?.purpose === 'rental' || refundEntity?.notes?.purpose === 'rental' || ['payment.captured', 'payment.failed', 'order.paid'].includes(event) || event.startsWith('refund.')) {
+    try {
+      if (await require('../services/rentalService').handleWebhook(payload)) return res.json({ success: true });
+    } catch (error) {
+      return res.status(500).json({ success: false, code: 'INTERNAL_ERROR', message: 'Rental webhook reconciliation needs retry.' });
+    }
+  }
 
   if (event === 'payment_link.paid' && paymentLinkEntity?.id) {
     try {

@@ -33,6 +33,8 @@ const clientInstallationSchema = new mongoose.Schema({
   usage: {
     products: { type: Number, min: 0, default: 0 },
     ordersPerMonth: { type: Number, min: 0, default: 0 },
+    saleOrdersPerMonth: { type: Number, min: 0 },
+    rentalBookingsPerMonth: { type: Number, min: 0 },
     reportedAt: Date,
   },
   runtime: {

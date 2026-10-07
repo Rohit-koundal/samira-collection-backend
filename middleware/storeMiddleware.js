@@ -138,8 +138,11 @@ function requireActiveStoreLicenseForWrites(req, _res, next) {
   return next(new ApiError('SUBSCRIPTION_REQUIRED', `Your ${plan.name} subscription is ${plan.status.toLowerCase()}. Renew it to make changes; your existing data remains available.`));
 }
 
-function assertStoreCanAcceptOrders(store) {
+function assertStoreCanAcceptOrders(store, { rental = false } = {}) {
   if (!store) return;
+  if (!rental && (store.salesEnabled === false || store.catalogStructure?.commerce?.mode === 'RENTAL_ONLY')) {
+    throw new ApiError('CHECKOUT_RESTRICTED', 'This store offers rental bookings rather than product sales.');
+  }
   if (store.checkoutEnabled === false || store.archivedAt || store.status === 'SUSPENDED') {
     throw new ApiError('SUBSCRIPTION_REQUIRED', 'This store is temporarily not accepting new orders. Please contact the store for help.');
   }
@@ -154,10 +157,7 @@ async function assertMonthlyOrderCapacity(store) {
   assertStoreCanAcceptOrders(store);
   const limit = storeLimit(store, 'ordersPerMonth');
   if (!Number.isFinite(limit)) return;
-  const monthStart = new Date();
-  monthStart.setUTCDate(1);
-  monthStart.setUTCHours(0, 0, 0, 0);
-  const count = await require('../models/Order').countDocuments({ storeId: store._id, createdAt: { $gte: monthStart }, orderStatus: { $ne: 'Cancelled' } });
+  const { ordersPerMonth: count } = await require('../services/commerceUsageService').monthlyUsage({ store });
   if (count >= limit) throw new ApiError('PLAN_LIMIT_REACHED', `This store has reached its ${limit.toLocaleString('en-IN')} orders per month plan limit.`);
 }
 

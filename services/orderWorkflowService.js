@@ -29,11 +29,15 @@ function allowedStatusTransitions(order, shipment) {
   if (!order) return [];
   const current = shipmentOf(order, shipment);
   const manual = !current || !isIntegratedShipment(current);
-  const tracked = Boolean(current?.awb || current?.trackingNumber);
+  if (manual && (['RTO_IN_TRANSIT', 'RETURNED', 'CANCELLED'].includes(current?.status) || (order.rto?.status && order.rto.status !== 'NONE'))) return [];
+  const tracked = current?.fulfillmentMode === 'SELF'
+    ? Boolean(current.deliveryReference)
+    : Boolean(current?.courierName && (current?.awb || current?.trackingNumber));
   const transitions = [];
 
-  if (order.orderStatus === 'Pending' && isOnlinePaid(order)) transitions.push('Confirmed');
-  if (order.orderStatus === 'Confirmed' && isOnlinePaid(order)) transitions.push('Packed');
+  const codVerificationPending = order.paymentMethod === 'COD' && order.codVerification?.required === true && order.codVerification.status !== 'VERIFIED';
+  if (order.orderStatus === 'Pending' && isOnlinePaid(order) && !codVerificationPending) transitions.push('Confirmed');
+  if (order.orderStatus === 'Confirmed' && isOnlinePaid(order) && order.packageVerification?.status !== 'PENDING') transitions.push('Packed');
   if (order.orderStatus === 'Packed' && manual && tracked) transitions.push('Shipped');
   if (order.orderStatus === 'Shipped' && manual) transitions.push('Out for Delivery');
   if (order.orderStatus === 'Out for Delivery' && manual) transitions.push('Delivered');

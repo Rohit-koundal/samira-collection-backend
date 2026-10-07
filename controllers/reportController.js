@@ -8,9 +8,9 @@ const { createReportContext, generateSection, reportOptions, SECTIONS } = requir
 const { nextRun, runScheduledView } = require('../services/reportScheduleService');
 const { ApiError } = require('../utils/apiError');
 
-const FILTER_KEYS = ['range', 'from', 'to', 'status', 'paymentMethod', 'product', 'category', 'coupon', 'campaign', 'source', 'city', 'pincode', 'provider', 'scope', 'store'];
+const FILTER_KEYS = ['range', 'from', 'to', 'status', 'paymentMethod', 'product', 'category', 'coupon', 'campaign', 'source', 'city', 'pincode', 'provider', 'scope', 'store', 'device', 'browser'];
 const isAdmin = (req) => req.user?.role === 'admin' && req.user.activeMode === 'admin';
-const allows = (req, permission) => isAdmin(req) || roleAllows(req.storeMember?.role, permission);
+const allows = (req, permission) => (isAdmin(req) && !req.storeMember) || roleAllows(req.storeMember?.role, permission);
 
 function capabilities(req) {
   const sections = {
@@ -18,6 +18,7 @@ function capabilities(req) {
     products: allows(req, 'reports.manage') || allows(req, 'catalog.read') || allows(req, 'inventory.read'),
     customers: allows(req, 'reports.manage') || allows(req, 'crm.read'),
     marketing: allows(req, 'reports.manage') || allows(req, 'marketing.read'),
+    traffic: allows(req, 'reports.read'),
     fulfillment: allows(req, 'reports.manage') || allows(req, 'orders.read') || allows(req, 'returns.read'),
   };
   return {
@@ -25,7 +26,7 @@ function capabilities(req) {
     canExport: allows(req, 'reports.export'),
     canViewProfit: allows(req, 'reports.profit.read'),
     canManage: allows(req, 'reports.manage'),
-    canSchedule: allows(req, 'reports.manage') && Boolean(process.env.BREVO_API_KEY && process.env.BREVO_SENDER_EMAIL),
+    canSchedule: allows(req, 'reports.manage') && allows(req, 'reports.export') && Boolean(process.env.BREVO_API_KEY && process.env.BREVO_SENDER_EMAIL),
     sections,
   };
 }

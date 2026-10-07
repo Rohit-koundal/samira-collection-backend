@@ -14,7 +14,7 @@ function requestSource(req) {
 
 // Awaitable, non-blocking for business operations. Audit storage failures are
 // observable, without leaking a database error or invalidating a saved order.
-async function logAudit({ req, action, entityType, entityId, before, after, storeId, source, outcome = 'SUCCESS', summary, http }) {
+async function logAudit({ req, action, entityType, entityId, before, after, storeId, source, outcome = 'SUCCESS', summary, http, session, strict = false }) {
   if (req) req.auditEventRecorded = true;
   try {
     const actorId = req?.user?._id;
@@ -24,7 +24,7 @@ async function logAudit({ req, action, entityType, entityId, before, after, stor
     const safeAfter = sanitizeAudit(after);
     const resolvedSource = source || requestSource(req);
     const path = String(req?.originalUrl || req?.baseUrl || '').split('?')[0];
-    return await AuditLog.create({
+    const event = {
       storeId: validId(resolvedStore) ? resolvedStore : undefined,
       actor: validId(actorId) ? actorId : undefined,
       actorSnapshot: {
@@ -42,8 +42,10 @@ async function logAudit({ req, action, entityType, entityId, before, after, stor
       requestId: safeText(req?.requestId, 100) || undefined,
       http: http ? sanitizeAudit(http) : undefined,
       // No IP, request bodies, cookies or headers are retained.
-    });
-  } catch {
+    };
+    if (session) return (await AuditLog.create([event], { session }))[0];
+    return await AuditLog.create(event);
+  } catch (error) {
     writeFailures += 1;
     try {
       log('error', 'Audit event could not be persisted', {
@@ -51,6 +53,7 @@ async function logAudit({ req, action, entityType, entityId, before, after, stor
         requestId: safeText(req?.requestId, 100),
       });
     } catch { /* A failed logging transport must not reject a saved order. */ }
+    if (strict) throw error;
     return null;
   }
 }

@@ -2,6 +2,8 @@ const crypto = require('node:crypto');
 const mongoose = require('mongoose');
 const SocialImport = require('../../models/SocialProductImport');
 const ProductDraft = require('../../models/ProductDraft');
+const DeletedProductDraft = require('../../models/DeletedProductDraft');
+const Product = require('../../models/Product');
 const Category = require('../../models/Category');
 const { asyncHandler } = require('../../middleware/validate');
 const { ApiError, notFound } = require('../../utils/apiError');
@@ -51,7 +53,7 @@ exports.list = asyncHandler(async (req, res) => {
 exports.get = asyncHandler(async (req, res) => {
   const job = await SocialImport.findOne(identity(req));
   if (!job) throw notFound('Import not found.');
-  if (job.draftId && !await ProductDraft.exists({ _id: job.draftId })) {
+  if (job.draftId && !await ProductDraft.exists({ _id: job.draftId }) && !await DeletedProductDraft.exists({ draftId: job.draftId })) {
     job.draftId = undefined; await job.save();
   }
   if (job.status === 'queued') service.enqueue(job._id);
@@ -76,6 +78,7 @@ exports.createDraft = asyncHandler(async (req, res) => {
   let draft = await ProductDraft.findOne({ sourceSocialImportId: job._id });
   let duplicate = Boolean(draft);
   if (!draft) {
+    if (await DeletedProductDraft.exists({ sourceSocialImportId: job._id })) throw new ApiError('SOCIAL_ALREADY_PUBLISHED', 'This import was already published and its draft removed. Manage the existing product from Products.', { statusCode: 409 });
     const payload = validateDraftReview(req.body, job);
     if (payload.category && !await Category.exists({ _id: payload.category, ...(job.storeId ? { storeId: job.storeId } : {}) })) throw new ApiError('VALIDATION_ERROR', 'The selected category is unavailable. Choose another category.');
     const draftId = new mongoose.Types.ObjectId();
@@ -95,9 +98,19 @@ exports.createDraft = asyncHandler(async (req, res) => {
 async function reviewView(job, suppliedDraft) {
   const data = view(job);
   const draft = suppliedDraft || await ProductDraft.findOne({ sourceSocialImportId: job._id });
-  if (!draft) return data;
+  if (!draft) {
+    const receipt = await DeletedProductDraft.findOne({ sourceSocialImportId: job._id }).lean();
+    if (receipt) {
+      delete data.draftId;
+      data.publishedProductId = String(receipt.productId);
+      data.publishedProductDeleted = !await Product.exists({ _id: receipt.productId });
+      data.draftRemoved = true;
+    }
+    return data;
+  }
   const value = draft.toObject();
   data.draftId = String(draft._id); data.publishedProductId = value.publishedProductId ? String(value.publishedProductId) : undefined;
+  if (value.publishedProductId) data.publishedProductDeleted = !await Product.exists({ _id: value.publishedProductId });
   data.images = [...(data.images || [])];
   // Keep photos added later in the draft editor available when resuming here.
   const selected = (value.images || []).map((image) => {
@@ -122,7 +135,15 @@ async function saveReviewedImport(req, res, publish) {
   if (!job) throw notFound('Import not found.');
   if (job.status !== 'ready') throw new ApiError('SOCIAL_NOT_READY', 'Wait for the import to finish before saving.', { statusCode: 409 });
   let draft = await ProductDraft.findOne({ sourceSocialImportId: job._id });
+  if (!draft) {
+    const receipt = await DeletedProductDraft.findOne({ sourceSocialImportId: job._id }).lean();
+    if (receipt) {
+      if (!await Product.exists({ _id: receipt.productId })) throw new ApiError('SOCIAL_ALREADY_PUBLISHED', 'The published product was permanently deleted. This import cannot recreate it.', { statusCode: 409 });
+      return res.json({ success: true, duplicate: true, productId: String(receipt.productId), data: await reviewView(job) });
+    }
+  }
   if (draft?.status === 'published' && draft.publishedProductId) {
+    if (!await Product.exists({ _id: draft.publishedProductId })) throw new ApiError('SOCIAL_ALREADY_PUBLISHED', 'The published product was permanently deleted. This import cannot recreate it.', { statusCode: 409 });
     return res.json({ success: true, duplicate: true, draftId: String(draft._id), productId: String(draft.publishedProductId), data: await reviewView(job, draft) });
   }
   if (draft && req.body.draftUpdatedAt !== draft.updatedAt.toISOString()) throw new ApiError('SOCIAL_REVIEW_CHANGED', 'This draft changed in another screen. Reload this import to keep the latest edits.', { statusCode: 409 });
@@ -143,7 +164,7 @@ async function saveReviewedImport(req, res, publish) {
   // publishing before creating/updating anything. Missing fields stay editable.
   const prepared = publish ? await prepareImportedDraft(preview) : null;
   if (draft) {
-    draft = await ProductDraft.findOneAndUpdate({ _id: draft._id, updatedAt: draft.updatedAt, status: 'draft' }, { $set: data }, { new: true, runValidators: true });
+    draft = await ProductDraft.findOneAndUpdate({ _id: draft._id, updatedAt: draft.updatedAt, status: 'draft', publishingToken: { $exists: false } }, { $set: data, $inc: { revision: 1 } }, { new: true, runValidators: true });
     if (!draft) throw new ApiError('SOCIAL_REVIEW_CHANGED', 'This draft changed in another screen. Reload this import before saving.', { statusCode: 409 });
   } else {
     try { draft = await ProductDraft.create(preview); }

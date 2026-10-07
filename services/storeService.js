@@ -257,6 +257,7 @@ function publicStoreView(store, extra = {}) {
     isDefault: Boolean(data.isDefault),
     industry: data.industry || 'fashion',
     catalog: data.catalogStructure ? {
+      commerce: data.catalogStructure.commerce || { mode: 'SALE_ONLY' },
       filters: data.catalogStructure.filters || [],
       homepageSections: data.catalogStructure.homepageSections || [],
     } : undefined,

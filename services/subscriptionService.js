@@ -1,6 +1,5 @@
 const Store = require('../models/Store');
 const Product = require('../models/Product');
-const Order = require('../models/Order');
 const SubscriptionPayment = require('../models/SubscriptionPayment');
 const { createRazorpayOrder, isRazorpayConfigured } = require('./razorpayService');
 const { verifyRazorpaySignature } = require('../utils/paymentUtils');
@@ -28,20 +27,17 @@ async function readPurchase(input = {}, store) {
   return { plan, billingCycle, ...(await priceFor(plan, billingCycle)) };
 }
 
-async function usageFor(storeId) {
-  const monthStart = new Date();
-  monthStart.setUTCDate(1);
-  monthStart.setUTCHours(0, 0, 0, 0);
+async function usageFor(store) {
   const [products, ordersPerMonth] = await Promise.all([
-    Product.countDocuments({ storeId, isArchived: { $ne: true } }),
-    Order.countDocuments({ storeId, createdAt: { $gte: monthStart }, orderStatus: { $ne: 'Cancelled' } }),
+    Product.countDocuments({ storeId: store._id, isArchived: { $ne: true } }),
+    require('./commerceUsageService').monthlyUsage({ store }),
   ]);
-  return { products, ordersPerMonth };
+  return { products, ...ordersPerMonth };
 }
 
 async function subscriptionStatus(store) {
   const [usage, payments, pricing] = await Promise.all([
-    usageFor(store._id),
+    usageFor(store),
     SubscriptionPayment.find({ store: store._id }).sort('-createdAt').limit(20).lean(),
     readPlanPricing(),
   ]);

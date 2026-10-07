@@ -36,6 +36,7 @@ test('website customization is master-only and publishing controls the public th
 
   const draftConfig = created.data.draftConfig;
   draftConfig.colors.primary = '#123456';
+  draftConfig.mobile.inheritThemeColors = false;
   draftConfig.branding.websiteName = 'Samira Autumn';
   const hero = draftConfig.homepage.sections.find((section) => section.id === 'hero');
   hero.heading = 'Autumn Celebration';
@@ -50,6 +51,7 @@ test('website customization is master-only and publishing controls the public th
   });
   assert.equal(saved.status, 200);
   assert.equal(saved.data.draftConfig.colors.primary, '#123456');
+  assert.equal(saved.data.draftConfig.mobile.inheritThemeColors, false);
   assert.equal(saved.data.draftConfig.homepage.sections.find((section) => section.id === 'hero').buttonLink, '');
   assert.equal(saved.data.draftConfig.footer.socialLinks.instagram, '');
   assert.deepEqual(saved.data.draftConfig.footer.menus.shopping, []);
@@ -73,6 +75,7 @@ test('website customization is master-only and publishing controls the public th
   const live = await request('/api/website-config');
   assert.equal(live.status, 200);
   assert.equal(live.data.config.colors.primary, '#123456');
+  assert.equal(live.data.config.mobile.inheritThemeColors, false);
   assert.equal(live.data.config.branding.websiteName, 'Samira Autumn');
   assert.equal(live.data.config.homepage.sections.find((section) => section.id === 'hero').heading, 'Autumn Celebration');
 });
@@ -97,7 +100,7 @@ test('mobile storefront feed returns bounded card data and live customer policie
   assert.equal(response.data.collections.featured.find((item) => item.slug === 'mobile-home-saree').images[0].publicId, undefined);
   assert.equal(response.data.collections.recentlyViewed[0].slug, 'mobile-home-saree');
   assert.equal(response.data.collections.featured[0].description, undefined);
-  assert.match(response.headers.get('cache-control'), /stale-while-revalidate/);
+  assert.equal(response.headers.get('cache-control'), 'private, no-store', 'personalized history cannot be cached as a public feed');
 });
 
 test('mobile storefront feed does not truncate active categories needed by the home rail', async () => {
@@ -112,6 +115,59 @@ test('mobile storefront feed does not truncate active categories needed by the h
   assert.equal(response.status, 200);
   assert.ok(response.data.categories.length >= 14);
   assert.ok(response.data.categories.some((category) => category.name === 'Sarees'));
+});
+
+test('compact home feed preserves card data, ordering and legacy compatibility with a smaller payload', async t => {
+  for (let index = 0; index < 12; index += 1) {
+    await createProduct({ name: `Jewellery Set ${index}`, isFeatured: true, showInTrending: true,
+      isNewArrival: true, isBestSeller: true, rating: 4.8, images: [{ url: `/uploads/product-${index}.webp` }] });
+  }
+  const legacy = await request('/api/storefront/home');
+  const compact = await request('/api/storefront/home?format=compact');
+  assert.equal(legacy.status, 200);
+  assert.equal(compact.status, 200);
+  assert.equal(compact.data.format, 'compact-v1');
+  assert.equal(legacy.data.format, undefined);
+  assert.deepEqual(compact.data.products, legacy.data.products);
+  assert.deepEqual(compact.data.warnings, []);
+  const byId = new Map(compact.data.products.map(product => [product._id, product]));
+  for (const [key, ids] of Object.entries(compact.data.collections)) {
+    assert.deepEqual(ids.map(id => byId.get(id)), legacy.data.collections[key]);
+  }
+  const legacyBytes = Buffer.byteLength(JSON.stringify(legacy.data));
+  const compactBytes = Buffer.byteLength(JSON.stringify(compact.data));
+  assert.ok(compactBytes < legacyBytes * 0.5, `${compactBytes} vs ${legacyBytes}`);
+  assert.match(compact.headers.get('server-timing'), /home;dur=\d+/);
+  t.diagnostic(`Home fixture JSON: legacy=${legacyBytes} bytes compact=${compactBytes} bytes (${Math.round((1 - compactBytes / legacyBytes) * 100)}% smaller; not a live latency measurement)`);
+});
+
+test('compact home data stays store-scoped, respects publication and configured selections, and retains live pricing', async () => {
+  const Store = require('../models/Store');
+  const Product = require('../models/Product');
+  const [first, second] = await Promise.all([
+    Store.create({ name: 'First Boutique', slug: 'first-boutique', status: 'PUBLISHED' }),
+    Store.create({ name: 'Second Boutique', slug: 'second-boutique', status: 'PUBLISHED' }),
+  ]);
+  const selected = await createProduct({ storeId: first._id, isFeatured: true, price: 1000, salePrice: 750,
+    saleStartAt: new Date(Date.now() - 60000), saleEndAt: new Date(Date.now() + 60000) });
+  const another = await createProduct({ storeId: first._id, isFeatured: true });
+  const foreign = await createProduct({ storeId: second._id, isFeatured: true });
+  const hidden = await createProduct({ storeId: first._id, isFeatured: true, publishAt: new Date(Date.now() + 60000) });
+  first.storefrontDesign = { publishedConfig: { homepage: { sectionProductIds: { featured: [String(selected._id), String(another._id), String(foreign._id), String(hidden._id)] } } } };
+  await first.save();
+  const response = await request(`/api/storefront/home?format=compact&store=first-boutique&recent=${foreign._id},${selected._id}`);
+  assert.equal(response.status, 200);
+  assert.deepEqual(response.data.collections.featured, [String(selected._id), String(another._id)]);
+  assert.deepEqual(response.data.collections.recentlyViewed, [String(selected._id)]);
+  assert.equal(response.data.products.length, 2);
+  assert.equal(response.data.products.find(row => row._id === String(selected._id)).price, 750);
+  assert.equal(response.data.products[0].category.name.startsWith('Category'), true);
+  // No server-side stale-stock cache was introduced by the optimization.
+  await Product.updateOne({ _id: selected._id }, { stock: 0, saleEndAt: new Date(Date.now() - 1000) });
+  const refreshed = await request('/api/storefront/home?format=compact&store=first-boutique');
+  const item = refreshed.data.products.find(row => row._id === String(selected._id));
+  assert.equal(item.stock, 0);
+  assert.equal(item.price, 1000);
 });
 
 test('theme history can restore a version to draft without silently changing the live store', async () => {

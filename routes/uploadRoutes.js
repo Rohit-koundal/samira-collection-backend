@@ -9,6 +9,11 @@ const { isR2Configured, uploadFileToR2, uploadImageToR2 } = require('../services
 const { isCloudinaryConfigured, uploadImage, uploadVideo } = require('../services/cloudinaryUpload');
 const { isLocalRequest } = require('../utils/imageUtils');
 const { badRequest } = require('../utils/apiError');
+const background = require('../services/imageBackgroundService');
+const { uploadMedia } = require('../services/mediaUploadService');
+const { rateLimit } = require('express-rate-limit');
+const backgroundUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 3 * 1024 * 1024, files: 1, fields: 0 } });
+const backgroundLimit = rateLimit({ windowMs: 60000, limit: 10, standardHeaders: true, legacyHeaders: false });
 
 const uploadDir = path.join(__dirname, '..', 'uploads');
 const videoUpload = multer({
@@ -18,7 +23,7 @@ const videoUpload = multer({
     },
     filename(req, file, cb) {
       const safeName = file.originalname.replace(/[^a-z0-9.]+/gi, '-').toLowerCase();
-      cb(null, `${Date.now()}-${safeName}`);
+      cb(null, `${require('crypto').randomUUID()}-${safeName}`);
     },
   }),
   fileFilter(req, file, cb) {
@@ -48,22 +53,6 @@ function isReelImportFolder(folder = '') {
   return String(folder || '').toLowerCase().startsWith('reel-imports');
 }
 
-function localFilePayload(file) {
-  const fileName = path.basename(file.filename || file.path || '');
-  return {
-    url: `/uploads/${fileName}`,
-    publicId: fileName,
-    originalName: file.originalname,
-    mimeType: file.mimetype,
-    sizeBytes: file.size,
-    provider: 'local',
-  };
-}
-
-function withProvider(files, provider) {
-  return (files || []).map((file) => ({ ...file, provider: file.provider || provider }));
-}
-
 function storageUnavailable(res, kind) {
   return res.status(503).json({
     message: kind === 'reel'
@@ -74,26 +63,31 @@ function storageUnavailable(res, kind) {
 }
 
 async function persistUploads(req, { folder, toR2, toCloudinary }) {
-  const uploadFolder = folder || req.query.folder;
-  if (isR2Configured()) {
-    const files = await Promise.all(req.files.map((file) => toR2(file, { folder: uploadFolder })));
-    await cleanupTempFiles(req.files);
-    return withProvider(files, 'r2');
-  }
-  if (isCloudinaryConfigured()) {
-    const files = await Promise.all(req.files.map((file) => toCloudinary(file, { folder: uploadFolder })));
-    await cleanupTempFiles(req.files);
-    return withProvider(files.filter(Boolean), 'cloudinary');
-  }
-  return withProvider(req.files.map(localFilePayload), 'local');
+  return uploadMedia(req, { folder: folder || req.query.folder, fileUpload: toR2 === uploadFileToR2 });
 }
+
+router.get('/background', protect, adminOnlyUpload, (req, res) => res.set('Cache-Control', 'no-store').json({ available: background.isConfigured() }));
+router.post('/background/stored', protect, adminOnlyUpload, backgroundLimit, async (req, res, next) => {
+  try {
+    if (typeof req.body.url !== 'string' || req.body.url.length > 4096) throw badRequest('Choose a valid product photo.');
+    res.set('Cache-Control', 'no-store');
+    res.json(await background.removeStoredBackground(req.body.url));
+  } catch (error) { next(error); }
+});
+router.post('/background', protect, adminOnlyUpload, backgroundLimit, backgroundUpload.single('image'), async (req, res, next) => {
+  try {
+    if (!req.file) throw badRequest('Choose a product image.');
+    res.set('Cache-Control', 'no-store');
+    res.json(await background.removeBackground(req.file.buffer));
+  } catch (error) { next(error); }
+});
 
 router.post('/', protect, adminOnlyUpload, (req, res, next) => {
   upload.array('images', 8)(req, res, async (error) => {
     if (error) return next(error);
 
     try {
-      if (!req.files?.length) {
+      if (!req.files?.length && req.body?.resumeUpload !== true) {
         return res.status(400).json({ message: 'No images were uploaded. Please select at least one image file.' });
       }
       if (!isR2Configured() && !isCloudinaryConfigured() && requiresPersistentStorage(req)) {
@@ -115,7 +109,7 @@ router.post('/videos', protect, adminOnlyUpload, (req, res, next) => {
     if (error) return next(error);
 
     try {
-      if (!req.files?.length) {
+      if (!req.files?.length && req.body?.resumeUpload !== true) {
         return res.status(400).json({ message: 'No videos were uploaded. Please select at least one video file.' });
       }
       const folder = req.query.folder || 'product-videos';

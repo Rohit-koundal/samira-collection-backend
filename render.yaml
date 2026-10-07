@@ -22,6 +22,8 @@ services:
         sync: false
       - key: JWT_EXPIRES_IN
         value: 15m
+      - key: JWT_ADMIN_EXPIRES_IN
+        value: 24h
       - key: JWT_REFRESH_EXPIRES_IN
         value: 30d
       - key: ALLOW_REFRESH_TOKEN_BODY
@@ -55,6 +57,7 @@ services:
         value: "60"
       - key: SMS_PROVIDER
         value: twilio
+      # MSG91 and 2Factor setup: see SMS.md; add selected provider keys in Environment.
       - key: SMS_ACCOUNT_SID
         sync: false
       - key: SMS_AUTH_TOKEN

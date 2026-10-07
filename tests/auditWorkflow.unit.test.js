@@ -56,6 +56,7 @@ test('order status changes are logged only after an atomic valid transition', as
   const events = capture(t);
   const order = doc({ _id: ID, storeId: STORE, orderStatus: 'Pending', paymentMethod: 'COD', paymentStatus: 'Pending', revision: 0, statusTimeline: [] });
   const confirmed = doc({ ...order, orderStatus: 'Confirmed', codConfirmationStatus: 'CONFIRMED', revision: 1 });
+  t.mock.method(require('../services/deliveryService'), 'withOrderLock', async (_id, action) => action(order));
   t.mock.method(Order, 'findOne', async () => order);
   t.mock.method(Shipment, 'findOne', async () => null);
   t.mock.method(Order, 'findOneAndUpdate', async (_filter, _update, options) => {
@@ -100,6 +101,8 @@ test('only the winning cancellation claim produces an audit event, after commit'
   const pending = { _id: ID, storeId: STORE, orderStatus: 'Pending', paymentMethod: 'COD', paymentStatus: 'Pending', finalAmount: 450 };
   const cancelled = { ...pending, orderStatus: 'Cancelled' };
   bypassCourier(t, pending);
+  t.mock.method(Shipment, 'findOne', async () => null);
+  t.mock.method(require('../services/shippingService'), 'closeManualShipmentForOrder', async () => ({}));
   let alreadyClaimed = false;
   t.mock.method(Order, 'findOneAndUpdate', async (filter) => {
     if (filter.couponConsumed) return null;
@@ -115,6 +118,7 @@ test('only the winning cancellation claim produces an audit event, after commit'
 test('failed cancellation does not claim a completed audit event', async (t) => {
   const pending = { _id: ID, orderStatus: 'Pending' };
   const events = capture(t); bypassCourier(t, pending);
+  t.mock.method(Shipment, 'findOne', async () => null);
   t.mock.method(inventory, 'claimInventoryRestore', async () => { throw new Error('stock write failed'); });
   await assert.rejects(require('../controllers/orderController').cancelOrderInternal(pending, { req: req(), actor: req().user }), /stock write failed/);
   assert.equal(events.length, 0);

@@ -86,7 +86,8 @@ test('an invalid signature does not mark the order paid or move stock', async ()
   assert.equal((await Product.findById(product._id)).stock, 5);
 });
 
-test('a valid signature finalises the stored order and deducts stock once', async () => {
+test('a valid signature finalises the stored order and deducts stock once', async t => {
+  const queued = t.mock.method(require('../services/orderAlertService'), 'queueLater', () => {});
   const { user, token } = await createCustomer();
   const product = await createProduct({ stock: 5, price: 1000 });
   const pending = await seedPendingOrder(user, product);
@@ -104,6 +105,8 @@ test('a valid signature finalises the stored order and deducts stock once', asyn
 
   assert.equal(status, 200);
   assert.equal(data.order.paymentStatus, 'Paid');
+  assert.equal(queued.mock.callCount(), 1);
+  assert.equal(String(queued.mock.calls[0].arguments[0]), String(pending._id));
   assert.equal(data.order.paymentState, 'PAID');
   assert.equal(data.order.orderStatus, 'Confirmed');
   assert.equal((await Product.findById(product._id)).stock, 4);

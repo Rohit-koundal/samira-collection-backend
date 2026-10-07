@@ -19,8 +19,13 @@ function tokenPayload(user) {
 }
 
 function generateToken(user) {
+  // Use the server-owned account role, not the selected UI mode. An admin
+  // visiting the storefront must keep the same full working-day session.
+  const expiresIn = user.role === 'admin'
+    ? (String(process.env.JWT_ADMIN_EXPIRES_IN || '').trim() || '24h')
+    : (process.env.JWT_EXPIRES_IN || '15m');
   return jwt.sign(tokenPayload(user), getJwtSecret(), {
-    expiresIn: process.env.JWT_EXPIRES_IN || '15m',
+    expiresIn,
   });
 }
 

@@ -20,6 +20,7 @@ const business = require('../controllers/businessController');
 const settings = require('../controllers/settingsController');
 const delivery = require('../controllers/deliveryController');
 const inventory = require('../controllers/inventoryController');
+const fraudProtection = require('../controllers/fraudProtectionController');
 const customization = require('../controllers/websiteCustomizationController');
 const notifications = require('../controllers/notificationController');
 const subscription = require('../controllers/subscriptionController');
@@ -32,7 +33,11 @@ const { requireActiveStoreLicenseForWrites, requireAnyStorePermission, requirePr
 router.get('/subscription', requireStorePermission('settings.read'), subscription.status);
 router.post('/subscription/checkout', requireStorePermission('settings.write'), subscription.checkout);
 router.post('/subscription/verify', requireStorePermission('settings.write'), subscription.verify);
+// Returning existing rentals must remain possible when new writes are paused.
+router.use('/rentals', require('./rentalRoutes').staffRouter());
 router.use(requireActiveStoreLicenseForWrites);
+router.use('/settings/traffic', require('./trafficSettingsRoutes'));
+router.use('/smart-fill', require('./workflowSmartFillRoutes'));
 
 router.get('/products', requireStorePermission('catalog.read'), product.getProducts);
 router.get('/products/smart-fill/status', requireStorePermission('catalog.read'), smartFill.status);
@@ -46,6 +51,8 @@ router.get('/products/:id', requireStorePermission('catalog.read'), product.getP
 router.post('/products', requireStorePermission('catalog.write'), requireProductCapacity, stripClientStoreId, product.createProduct);
 router.put('/products/:id', requireStorePermission('catalog.write'), stripClientStoreId, product.updateProduct);
 router.delete('/products/:id', requireStorePermission('catalog.write'), product.deleteProduct);
+router.get('/products/:id/deletion-preview', requireStorePermission('catalog.write'), product.productDeletionPreview);
+router.delete('/products/:id/permanent', requireStorePermission('catalog.write'), product.permanentlyDeleteProduct);
 router.post('/products/:id/duplicate', requireStorePermission('catalog.write'), requireProductCapacity, product.duplicateProduct);
 router.patch('/products/:id/restore', requireStorePermission('catalog.write'), requireProductCapacity, product.restoreProduct);
 router.patch('/products/:id/status', requireStorePermission('catalog.write'), product.updateStatus);
@@ -95,6 +102,11 @@ router.get('/orders', requireStorePermission('orders.read'), order.adminOrders);
 router.get('/orders/workspace-summary', requireStorePermission('orders.read'), order.orderWorkspaceSummary);
 router.get('/orders/:id', requireStorePermission('orders.read'), order.getOrder);
 router.get('/orders/:id/receipt', requireStorePermission('orders.read'), order.receipt);
+router.post('/orders/evidence/uploads', requireStorePermission('orders.write'), fraudProtection.evidenceUploadMiddleware, fraudProtection.uploadEvidence);
+router.get('/orders/item-verification/:uniqueItemId', requireStorePermission('orders.read'), fraudProtection.verifyItemIdentity);
+router.post('/orders/:id/item-identities/generate', requireStorePermission('orders.write'), fraudProtection.generateItemIdentities);
+router.post('/orders/:id/packing/verify', requireStorePermission('orders.write'), fraudProtection.verifyPacking);
+router.get('/orders/:id/verification-evidence', requireStorePermission('orders.read'), fraudProtection.getEvidence);
 router.get('/orders/:id/delivery', requireStorePermission('orders.read'), delivery.details);
 router.get('/orders/:id/delivery/label', requireStorePermission('orders.write'), requireStoreFeature('shippingAutomation'), delivery.label);
 router.post('/orders/:id/delivery/:action', requireStorePermission('orders.write'), requireStoreFeature('shippingAutomation'), delivery.action);
@@ -172,6 +184,9 @@ router.get('/reviews', requireStorePermission('reviews.read'), review.adminRevie
 router.get('/returns', requireStorePermission('returns.read'), returns.adminReturns);
 router.get('/returns/stats', requireStorePermission('returns.read'), returns.adminReturnStats);
 router.get('/returns/:id', requireStorePermission('returns.read'), returns.getReturnDetail);
+router.post('/returns/evidence/uploads', requireStorePermission('returns.write'), fraudProtection.evidenceUploadMiddleware, fraudProtection.uploadEvidence);
+router.post('/returns/:id/inspect', requireStorePermission('returns.qc'), fraudProtection.inspectReturn);
+router.post('/returns/:id/decision', requireStorePermission('returns.refund'), fraudProtection.decideReturn);
 router.put('/returns/:id/status', requireStorePermission('returns.write'), returns.updateReturnStatus);
 router.patch('/returns/:id/meta', requireStorePermission('returns.write'), returns.updateReturnMeta);
 router.post('/returns/:id/refund/retry', requireStorePermission('returns.refund'), returns.retryReturnRefund);
@@ -227,6 +242,7 @@ router.post('/business/assistant', requireStorePermission('orders.read'), busine
 router.post('/business/customer-offers', requireStorePermission('marketing.write'), business.customerOffer);
 router.put('/business/festival', requireStorePermission('marketing.write'), business.updateFestival);
 router.get('/settings', requireStorePermission('settings.read'), settings.getSettings);
+router.use('/settings/order-alerts', requireStorePermission('settings.write'), require('./orderAlertRoutes'));
 router.put('/settings', requireStorePermission('settings.write'), stripClientStoreId, settings.updateSettings);
 router.get('/settings/payment-readiness', requireStorePermission('settings.read'), settings.getPaymentReadiness);
 router.get('/settings/shipping-readiness', requireStorePermission('settings.read'), delivery.readiness);

@@ -11,11 +11,18 @@ const { andFilter } = require('../services/storeService');
 const SECTION_LIMIT = 12;
 const CATEGORY_LIMIT = 100;
 const BANNER_LIMIT = 100;
+const HOME_QUERY_TIMEOUT_MS = 4000;
+const HOME_SETTINGS_FIELDS = [
+  'acceptingOrders', 'orderPauseMessage', 'shippingPricingMode', 'shippingFreeAboveEnabled',
+  'freeShippingMinAmount', 'deliveryCharge', 'returnsEnabled', 'returnWindowDays', 'codEnabled',
+  'razorpayEnabled', 'upiEnabled', 'cardPaymentEnabled', 'netBankingEnabled', 'walletEnabled', 'socialLinks',
+  'occasionShoppingEnabled', 'recentlyViewedEnabled', 'completeLookEnabled',
+].join(' ');
 const HOME_PRODUCT_FIELDS = [
   '_id', 'slug', 'name', 'category', 'subCategory', 'price', 'originalPrice', 'discountPercentage',
   'salePrice', 'saleStartAt', 'saleEndAt', 'stock', 'lowStockAlert', 'sizes', 'colors', 'variants',
   'sizingMode', 'images', 'primaryImage', 'rating', 'numReviews', 'isFeatured', 'isNewArrival',
-  'isBestSeller', 'showOnHomepage', 'showInTrending', 'tags', 'createdAt', 'updatedAt',
+  'isBestSeller', 'showOnHomepage', 'showInTrending', 'tags', 'commerceMode', 'createdAt', 'updatedAt',
 ].join(' ');
 
 function publicProductFilter(req, extra = {}) {
@@ -64,7 +71,7 @@ function homeProduct(product, req) {
   return Object.fromEntries([
     '_id', 'id', 'slug', 'name', 'category', 'subCategory', 'price', 'originalPrice', 'discountPercentage',
     'stock', 'lowStockAlert', 'sizes', 'colors', 'variants', 'sizingMode', 'images', 'primaryImage',
-    'rating', 'numReviews', 'isFeatured', 'isNewArrival', 'isBestSeller', 'showOnHomepage', 'showInTrending',
+    'rating', 'numReviews', 'isFeatured', 'isNewArrival', 'isBestSeller', 'showOnHomepage', 'showInTrending', 'commerceMode',
   ].map((key) => {
     const field = key === 'images' && Array.isArray(value.images)
       ? value.images.slice(0, 1).map(publicImage)
@@ -127,6 +134,9 @@ function publicSettings(settings = {}) {
     netBankingEnabled: value.netBankingEnabled !== false,
     walletEnabled: value.walletEnabled !== false,
     socialLinks: value.socialLinks || {},
+    occasionShoppingEnabled: value.occasionShoppingEnabled !== false,
+    recentlyViewedEnabled: value.recentlyViewedEnabled !== false,
+    completeLookEnabled: value.completeLookEnabled !== false,
   };
 }
 
@@ -140,25 +150,40 @@ async function settled(label, work, fallback, warnings) {
 }
 
 exports.getMobileHome = asyncHandler(async (req, res) => {
+  const started = process.hrtime.bigint();
   const warnings = [];
-  const [activeTheme, settings] = await Promise.all([
-    settled('configuration', () => WebsiteTheme.findOne({ isActive: true, publishedConfig: { $exists: true, $ne: null } }).select('publishedConfig').lean(), null, warnings),
-    settled('settings', () => Settings.findOne(req.tenantFilter || {}).lean(), {}, warnings),
-  ]);
-  const configured = configuredIds(req, activeTheme);
+  // Start independent work together. A policy/theme lookup must not postpone
+  // every catalog, category and banner query behind another network roundtrip.
+  const themePromise = settled('configuration', () => WebsiteTheme.findOne({ isActive: true, publishedConfig: { $exists: true, $ne: null } })
+    .select('publishedConfig').maxTimeMS(HOME_QUERY_TIMEOUT_MS).lean(), null, warnings);
+  const settingsPromise = settled('settings', () => Settings.findOne(req.tenantFilter || {})
+    .select(HOME_SETTINGS_FIELDS).maxTimeMS(HOME_QUERY_TIMEOUT_MS).lean(), {}, warnings);
+  const categoriesPromise = settled('categories', () => Category.find(andFilter({ isActive: true, isArchived: { $ne: true } }, req.tenantFilter))
+    .select('_id name slug image parent level displayOrder').sort('level displayOrder name').limit(CATEGORY_LIMIT)
+    .maxTimeMS(HOME_QUERY_TIMEOUT_MS).lean(), [], warnings);
+  const bannersPromise = settled('banners', async () => {
+    const now = new Date();
+    const live = andFilter({
+      isActive: true, isArchived: { $ne: true },
+      $and: [
+        { $or: [{ startsAt: { $exists: false } }, { startsAt: null }, { startsAt: { $lte: now } }] },
+        { $or: [{ endsAt: { $exists: false } }, { endsAt: null }, { endsAt: { $gte: now } }] },
+      ],
+    }, req.tenantFilter);
+    return (await Banner.find(live).sort({ position: 1, displayOrder: 1, createdAt: -1 })
+      .limit(BANNER_LIMIT).maxTimeMS(HOME_QUERY_TIMEOUT_MS).lean()).map(publicBanner);
+  }, [], warnings);
   const recentIds = cleanObjectIds(String(req.query.recent || '').split(','), SECTION_LIMIT);
-  const allSelectedIds = cleanObjectIds([...Object.values(configured.sectionIds).flat(), ...configured.blockProductIds, ...recentIds], 100);
   const textFilter = (terms) => ({ $or: [
     { name: { $regex: terms, $options: 'i' } },
     { subCategory: { $regex: terms, $options: 'i' } },
     { tags: { $elemMatch: { $regex: terms, $options: 'i' } } },
   ] });
   const loadProducts = (extra, sort = '-createdAt', limit = SECTION_LIMIT) => Product.find(publicProductFilter(req, extra))
-    .select(HOME_PRODUCT_FIELDS).populate('category', 'name slug').sort(sort).limit(limit).lean();
+    .select(HOME_PRODUCT_FIELDS).sort(sort).limit(limit).maxTimeMS(HOME_QUERY_TIMEOUT_MS).lean();
 
   const productJobs = {
     latest: () => loadProducts({}, '-createdAt'),
-    selected: () => allSelectedIds.length ? loadProducts({ _id: { $in: allSelectedIds } }, '-updatedAt', 100) : Promise.resolve([]),
     featured: () => loadProducts({ $or: [{ isFeatured: true }, { showOnHomepage: true }] }, '-updatedAt'),
     trending: () => loadProducts({ showInTrending: true }, '-updatedAt'),
     newArrivals: () => loadProducts({ isNewArrival: true }, '-createdAt'),
@@ -168,12 +193,31 @@ exports.getMobileHome = asyncHandler(async (req, res) => {
     instagram: () => loadProducts({ 'images.0': { $exists: true } }, '-createdAt'),
     recommended: () => loadProducts({ rating: { $gt: 0 } }, '-rating -numReviews -updatedAt'),
   };
-  const productResults = await Promise.all(Object.entries(productJobs).map(async ([key, job]) => [
+  const productsPromise = Promise.all(Object.entries(productJobs).map(async ([key, job]) => [
     key, await settled(`products.${key}`, job, [], warnings),
   ]));
+  const configured = configuredIds(req, await themePromise);
+  const allSelectedIds = cleanObjectIds([...Object.values(configured.sectionIds).flat(), ...configured.blockProductIds, ...recentIds], 100);
+  const [productResults, selectedProducts, settings, baseCategories, selectedCategories, banners] = await Promise.all([
+    productsPromise,
+    settled('products.selected', () => allSelectedIds.length ? loadProducts({ _id: { $in: allSelectedIds } }, '-updatedAt', 100) : [], [], warnings),
+    settingsPromise,
+    categoriesPromise,
+    settled('categories', () => configured.categoryIds.length ? Category.find(andFilter({
+      _id: { $in: configured.categoryIds }, isActive: true, isArchived: { $ne: true },
+    }, req.tenantFilter)).select('_id name slug image parent level displayOrder').maxTimeMS(HOME_QUERY_TIMEOUT_MS).lean() : [], [], warnings),
+    bannersPromise,
+  ]);
   const rawCollections = Object.fromEntries(productResults);
-  const byId = new Map(uniqueProducts(rawCollections).map((product) => [productKey(product), product]));
-  rawCollections.recentlyViewed = recentIds.map((id) => byId.get(String(id))).filter(Boolean);
+  rawCollections.selected = selectedProducts;
+  const uniqueRows = uniqueProducts(rawCollections);
+  // One category population for unique products, instead of repeating it for
+  // each rail. Use the same pricing/sizing serializer as product detail.
+  const populated = await settled('products.categories', () => Product.populate(uniqueRows, {
+    path: 'category', select: 'name slug', options: { lean: true, maxTimeMS: HOME_QUERY_TIMEOUT_MS },
+  }), uniqueRows, warnings);
+  const byId = new Map(populated.map(product => [productKey(product), homeProduct(product, req)]));
+  rawCollections.recentlyViewed = settings?.recentlyViewedEnabled === false ? [] : recentIds.map((id) => byId.get(String(id))).filter(Boolean);
   for (const [section, ids] of Object.entries(configured.sectionIds)) {
     if (!ids.length) continue;
     const resolved = ids.map((id) => byId.get(String(id))).filter(Boolean);
@@ -181,39 +225,23 @@ exports.getMobileHome = asyncHandler(async (req, res) => {
     if (resolved.length) rawCollections[section] = resolved;
   }
   const serializedCollections = Object.fromEntries(Object.entries(rawCollections).map(([key, products]) => [
-    key, products.map((product) => homeProduct(product, req)),
+    key, products.map(product => byId.get(productKey(product))).filter(Boolean),
   ]));
   const products = uniqueProducts(serializedCollections);
+  const categories = uniqueById([...selectedCategories, ...baseCategories]).slice(0, CATEGORY_LIMIT).map(publicCategory);
+  const compact = req.query.format === 'compact';
 
-  const [categories, banners] = await Promise.all([
-    settled('categories', async () => {
-      const base = await Category.find(andFilter({ isActive: true, isArchived: { $ne: true } }, req.tenantFilter))
-        .sort('level displayOrder name').limit(CATEGORY_LIMIT).lean();
-      if (!configured.categoryIds.length) return base.map(publicCategory);
-      const selected = await Category.find(andFilter({ _id: { $in: configured.categoryIds }, isActive: true, isArchived: { $ne: true } }, req.tenantFilter)).lean();
-      return uniqueById([...selected, ...base]).slice(0, CATEGORY_LIMIT).map(publicCategory);
-    }, [], warnings),
-    settled('banners', async () => {
-      const now = new Date();
-      const live = andFilter({
-        isActive: true, isArchived: { $ne: true },
-        $and: [
-          { $or: [{ startsAt: { $exists: false } }, { startsAt: null }, { startsAt: { $lte: now } }] },
-          { $or: [{ endsAt: { $exists: false } }, { endsAt: null }, { endsAt: { $gte: now } }] },
-        ],
-      }, req.tenantFilter);
-      return (await Banner.find(live).sort({ position: 1, displayOrder: 1, createdAt: -1 }).limit(BANNER_LIMIT).lean()).map(publicBanner);
-    }, [], warnings),
-  ]);
-
-  res.setHeader('Cache-Control', 'public, max-age=30, stale-while-revalidate=120');
+  // A failed section must be retryable immediately, not pinned in an HTTP cache.
+  res.setHeader('Cache-Control', recentIds.length ? 'private, no-store' : warnings.length ? 'no-store' : 'public, max-age=30, stale-while-revalidate=120');
+  res.setHeader('Server-Timing', `home;dur=${(Number(process.hrtime.bigint() - started) / 1e6).toFixed(1)}`);
   res.vary('X-Store-Slug');
   res.json({
     products,
-    collections: serializedCollections,
+    ...(compact ? { format: 'compact-v1' } : {}),
+    collections: compact ? Object.fromEntries(Object.entries(serializedCollections).map(([key, rows]) => [key, rows.map(productKey)])) : serializedCollections,
     categories,
     banners,
-    settings: { ...publicSettings(settings), available: !warnings.includes('settings') },
+    settings: { ...publicSettings(settings), commerceMode: req.store?.catalogStructure?.commerce?.mode || 'SALE_ONLY', available: !warnings.includes('settings') },
     warnings: [...new Set(warnings)],
     generatedAt: new Date().toISOString(),
   });
@@ -230,3 +258,4 @@ function uniqueById(items) {
 }
 
 exports.publicSettings = publicSettings;
+exports.homeProduct = homeProduct;

@@ -10,20 +10,21 @@ const TRACKABLE_NAMES = EVENT_NAMES.concat(Object.keys(EVENT_ALIASES));
 
 exports.track = asyncHandler(async (req, res) => {
   const name = requireEnum(req.body?.name, TRACKABLE_NAMES, 'name');
+  if (require('../services/trafficAlgorithms').RESERVED_EVENTS.has(name)) return res.status(202).json({ success: true, ignored: true, reason: 'server_only_event' });
+  const config = await require('../services/trafficConfigurationService').configuration(req.store);
+  if (!config.enabled || config.consentRequired && req.body?.consent !== true) return res.status(202).json({ success: true, ignored: true, reason: 'privacy_settings' });
   const attribution = readAttribution(req.body);
   const event = await recordEvent({
     name,
     storeId: req.store?._id,
     sessionId: optionalString(req.body?.sessionId, 'sessionId', { max: 80 }),
-    userId: req.user?._id,
     productId: req.body?.productId,
-    orderId: req.body?.orderId,
-    path: optionalString(req.body?.path, 'path', { max: 300 }),
-    searchQuery: optionalString(req.body?.searchQuery || req.body?.query, 'searchQuery', { max: 120 }),
-    source: attribution?.source,
-    campaign: attribution?.campaign,
+    path: require('../services/trafficAlgorithms').cleanPath(req.body?.path),
+    searchQuery: name === 'SEARCH' ? await require('../services/trafficSearchPrivacyService').searchTopic(req.body?.searchQuery || req.body?.query, req.store) : undefined,
+    source: require('../services/trafficAlgorithms').cleanText(attribution?.source),
+    campaign: require('../services/trafficAlgorithms').cleanText(attribution?.campaign),
     reelId: attribution?.reelId,
-    metadata: req.body?.metadata,
+    metadata: Object.fromEntries(['surface', 'sectionId', 'action', 'milestone', 'categoryId', 'categoryName', 'bannerId'].filter(key => req.body?.metadata?.[key] !== undefined).map(key => [key, require('../services/trafficAlgorithms').cleanText(req.body.metadata[key], 100)])),
   });
   res.status(202).json({ success: true, id: event?._id });
 });

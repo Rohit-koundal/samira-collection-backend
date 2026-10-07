@@ -10,6 +10,9 @@ const RETURN_STATUSES = [
   'Picked Up',
   'In Transit',
   'Received',
+  'Inspection Pending',
+  'Verified',
+  'Mismatch Found',
   'QC Passed',
   'QC Failed',
   'Refund Initiated',
@@ -39,6 +42,12 @@ const returnExchangeSchema = new mongoose.Schema({
   reason: String,
   comment: String,
   photos: [String],
+  customerEvidence: [{
+    type: { type: String, enum: ['CUSTOMER_PHOTO', 'CUSTOMER_VIDEO'] },
+    fileUrl: String,
+    mimeType: String,
+    sizeBytes: Number,
+  }],
   pickupAddress: Object,
   productSnapshot: {
     name: String,
@@ -109,6 +118,32 @@ const returnExchangeSchema = new mongoose.Schema({
     inspectedAt: Date,
     inspectedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   },
+  inspection: {
+    status: { type: String, enum: ['NOT_STARTED', 'PENDING', 'VERIFIED', 'MISMATCH_FOUND', 'MANUAL_REVIEW'], default: 'NOT_STARTED' },
+    expectedUniqueItemIds: { type: [String], default: [] },
+    returnedUniqueItemIds: { type: [String], default: [] },
+    dispatchWeightGrams: Number,
+    returnWeightGrams: Number,
+    weightDifferenceGrams: Number,
+    sealCondition: { type: String, enum: ['NOT_CHECKED', 'INTACT', 'BROKEN', 'MISSING', 'MISMATCH'], default: 'NOT_CHECKED' },
+    returnedSealId: String,
+    tagCondition: { type: String, enum: ['NOT_CHECKED', 'PRESENT', 'REMOVED', 'MISSING', 'MISMATCH'], default: 'NOT_CHECKED' },
+    returnedTagId: String,
+    condition: { type: String, enum: ['UNOPENED', 'GOOD', 'USED', 'DAMAGED', 'DIFFERENT_ITEM', 'MISSING_ITEM'] },
+    flags: { type: [String], default: [] },
+    result: { type: String, enum: ['NOT_CHECKED', 'VERIFIED', 'POSSIBLE_PRODUCT_SWAP', 'SECURITY_TAG_ISSUE', 'WEIGHT_DIFFERENCE', 'MANUAL_REVIEW_REQUIRED'], default: 'NOT_CHECKED' },
+    notes: String,
+    evidenceCount: { type: Number, default: 0, min: 0 },
+    inspectedAt: Date,
+    inspectedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  },
+  refundDecision: {
+    decision: { type: String, enum: ['PENDING', 'APPROVED', 'PARTIAL', 'REJECTED', 'MORE_INFORMATION_REQUIRED'], default: 'PENDING' },
+    reason: String,
+    customerMessage: String,
+    decidedAt: Date,
+    decidedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  },
   statusTimeline: [{
     status: String,
     note: String,
@@ -154,7 +189,10 @@ returnExchangeSchema.index({ storeId: 1, 'qc.status': 1, 'financial.refundStatus
 returnExchangeSchema.index({ storeId: 1, slaDueAt: 1, status: 1 });
 returnExchangeSchema.index({ storeId: 1, priority: 1, assignee: 1, updatedAt: -1 });
 returnExchangeSchema.index({ storeId: 1, 'financial.nextRefundCheckAt': 1, 'financial.refundStatus': 1 });
-returnExchangeSchema.index({ storeId: 1, caseNumber: 1 }, { unique: true, sparse: true });
+returnExchangeSchema.index(
+  { storeId: 1, caseNumber: 1 },
+  { unique: true, partialFilterExpression: { caseNumber: { $type: 'string' } } },
+);
 returnExchangeSchema.index({ storeId: 1, order: 1, orderItemId: 1, active: 1 }, { unique: true, partialFilterExpression: { active: true }, name: 'one_active_return_per_order_item' });
 
 module.exports = mongoose.model('ReturnExchange', returnExchangeSchema);

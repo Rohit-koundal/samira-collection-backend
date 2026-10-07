@@ -88,6 +88,24 @@ async function startServer() {
     cleanupTasks.push(require('./services/deliveryService').startDeliveryWorker());
     cleanupTasks.push(require('./services/refundReconciliationService').startRefundReconciliationWorker());
     cleanupTasks.push(require('./services/reportScheduleService').startReportScheduleWorker());
+    // Analytics is optional infrastructure: an index failure must not stop
+    // payment/order workers. Collection fails closed until dedup indexes exist.
+    app.locals.trafficIndexesReady = false;
+    const startTraffic = async () => {
+      try {
+        await require('./services/trafficWorker').ensureIndexes();
+        app.locals.trafficIndexesReady = true;
+        cleanupTasks.push(require('./services/trafficWorker').startWorker());
+        cleanupTasks.push(require('./services/trafficDigestService').startWorker());
+      } catch (error) { console.error(`Traffic analytics initialization unavailable: ${error.message}`); }
+    };
+    await startTraffic();
+    if (!app.locals.trafficIndexesReady) {
+      const retryTraffic = setInterval(async () => { await startTraffic(); if (app.locals.trafficIndexesReady) clearInterval(retryTraffic); }, 60000);
+      retryTraffic.unref(); cleanupTasks.push(() => clearInterval(retryTraffic));
+    }
+    cleanupTasks.push(require('./services/orderAlertService').startWorker());
+    cleanupTasks.push(require('./services/rentalWorker').startWorker());
     cleanupTasks.push(require('./services/storeContentService').startContentReleaseWorker());
     cleanupTasks.push(require('./services/subscriptionLifecycleService').startSubscriptionLifecycleWorker());
     const paymentController = require('./controllers/paymentController');

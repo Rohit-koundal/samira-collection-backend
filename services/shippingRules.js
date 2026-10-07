@@ -1,7 +1,7 @@
 const { ApiError } = require('../utils/apiError');
 
 const DEFAULTS = {
-  shippingProvider: 'manual', shippingPricingMode: 'fixed', shippingFreeAboveEnabled: true,
+  shippingProvider: 'manual', manualDeliveryMode: 'COURIER', shippingPricingMode: 'fixed', shippingFreeAboveEnabled: true,
   shippingDefaultWeightKg: 0.5, shippingLengthCm: 30, shippingWidthCm: 25, shippingHeightCm: 5,
   shippingVolumetricDivisor: 5000, shippingWeightStepKg: 0.5, shippingAdditionalStepCharge: 0,
   shippingRateZones: [], shippingPickup: {},
@@ -65,6 +65,11 @@ function pickupSlot(date, time, closeTime, now = new Date()) {
 function normalizeShippingSettings(updates, current) {
   const next = { ...DEFAULTS, ...current, ...updates };
   if (!['manual', 'bluedart', 'shiprocket', 'delhivery', 'xpressbees'].includes(next.shippingProvider)) throw error('Choose a supported delivery provider.');
+  // Older stores had only manual courier. An omitted/empty preference keeps that
+  // behaviour; changing store defaults never rewrites an existing shipment.
+  const manualMode = next.manualDeliveryMode ?? 'COURIER';
+  if (!['COURIER', 'SELF', ''].includes(manualMode)) throw error('Choose manual courier or self delivery.');
+  if (updates.manualDeliveryMode !== undefined) updates.manualDeliveryMode = manualMode || 'COURIER';
   if (!['fixed', 'weight', 'carrier'].includes(next.shippingPricingMode)) throw error('Choose fixed, weight-based or live carrier delivery pricing.');
   if (next.shippingPricingMode === 'carrier' && !['shiprocket', 'delhivery', 'xpressbees'].includes(next.shippingProvider)) throw error('Live carrier pricing is available with Shiprocket, Delhivery or Xpressbees.');
   if (typeof next.shippingFreeAboveEnabled !== 'boolean') throw error('Free delivery must be enabled or disabled.');

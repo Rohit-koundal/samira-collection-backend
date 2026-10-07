@@ -38,11 +38,11 @@ function assertStorageConfigured() {
   return provider;
 }
 
-async function uploadOriginalVideo(file) {
+async function uploadOriginalVideo(file, options = {}) {
   const provider = assertStorageConfigured();
   const uploaded = provider === 'r2'
-    ? await uploadFileToR2(file, { folder: 'reel-imports/original' })
-    : await uploadVideo(file, { folder: 'reel-imports/original' });
+    ? await uploadFileToR2(file, { ...options, folder: options.folder || 'reel-imports/original' })
+    : await uploadVideo(file, { ...options, folder: options.folder || 'reel-imports/original' });
   return {
     provider,
     storageKey: uploaded.publicId,
@@ -50,11 +50,11 @@ async function uploadOriginalVideo(file) {
   };
 }
 
-async function uploadGeneratedImage(file) {
+async function uploadGeneratedImage(file, options = {}) {
   const provider = assertStorageConfigured();
   const uploaded = provider === 'r2'
-    ? await uploadFileToR2(file, { folder: 'reel-imports/candidates' })
-    : await uploadImage(file, { folder: 'reel-imports/candidates' });
+    ? await uploadFileToR2(file, { ...options, folder: options.folder || 'reel-imports/candidates' })
+    : await uploadImage(file, { ...options, folder: options.folder || 'reel-imports/candidates' });
   return { provider, storageKey: uploaded.publicId, url: uploaded.url };
 }
 
@@ -191,6 +191,7 @@ async function deleteObject({ provider, storageKey }) {
   if (!storageKey) return false;
   if (provider === 'r2') {
     await getR2Client().send(new DeleteObjectCommand({ Bucket: process.env.R2_BUCKET_NAME, Key: storageKey }));
+    await require('./uploadRetryService').invalidateStoredUpload('r2', storageKey);
     return true;
   }
   if (provider === 'cloudinary' && isCloudinaryConfigured()) {

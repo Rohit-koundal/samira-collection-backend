@@ -33,7 +33,9 @@ test('invalid and expired credentials remain unauthorized, while missing account
 
 function configureSmsTest(t) {
   const values = {
-    NODE_ENV: 'production', OTP_MODE: 'production', SMS_PROVIDER: 'twilio',
+    // This unit fixture uses environment credentials and has no configuration
+    // database. Do not buffer a real settings lookup when emulating readyState.
+    NODE_ENV: 'production', OTP_MODE: 'production', SMS_PROVIDER: 'twilio', SMS_CONFIG_SOURCE: 'environment',
     SMS_ACCOUNT_SID: 'AC-unit-account', SMS_AUTH_TOKEN: 'unit-token', SMS_SENDER_ID: '+15005550006',
     JWT_SECRET: 'isolated-auth-test-secret', JWT_REFRESH_SECRET: 'isolated-refresh-test-secret',
   };

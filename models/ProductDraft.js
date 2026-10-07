@@ -4,6 +4,7 @@ const storeIdPlugin = require('./plugins/storeId');
 const imageSchema = new mongoose.Schema({
   url: String,
   publicId: String,
+  background: { type: require('./imageBackgroundSchema'), default: undefined },
   primary: { type: Boolean, default: false },
   sourceFrame: { type: new mongoose.Schema({ timestampSeconds: Number, qualityScore: Number, viewType: String, width: Number, height: Number, selectionVersion: String }, { _id: false }), default: undefined },
 }, { _id: false });
@@ -75,6 +76,7 @@ const productDraftSchema = new mongoose.Schema({
   colors: [String],
   fabric: String,
   occasion: String,
+  completeLookProductIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Product' }],
   tags: [String],
   attributeValues: { type: Map, of: String, default: {} },
   description: String,
@@ -103,6 +105,8 @@ const productDraftSchema = new mongoose.Schema({
   lastPublishError: { type: String, maxlength: 500, default: '' },
   createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   publishedProductId: { type: mongoose.Schema.Types.ObjectId, ref: 'Product' },
+  publishingToken: { type: String, select: false },
+  uploadOperationId: { type: String, select: false },
   sourceType: { type: String, enum: ['manual', 'reel-import', 'social-import'], default: undefined },
   autosaveKey: { type: String, trim: true, maxlength: 80, default: undefined },
   sourceSocialImportId: { type: mongoose.Schema.Types.ObjectId, ref: 'SocialProductImport', unique: true, sparse: true, default: undefined },

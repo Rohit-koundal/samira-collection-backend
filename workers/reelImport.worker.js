@@ -8,14 +8,14 @@ dotenv.config();
 const connectDB = require('../config/db');
 const { getReelImportConfig, isReelImportEnabled } = require('../config/reelImport');
 const { QUEUE_NAME, getRedisConnection } = require('../queues/reelImport.queue');
-const { processReelImportJob } = require('./reelImport.processor');
+const { processQueuedReelImport } = require('./reelImport.processor');
 
 async function start() {
   if (!isReelImportEnabled()) throw new Error('Reel import worker is disabled.');
   const connection = getRedisConnection();
   if (!connection) throw new Error('REDIS_URL is required for the production reel worker.');
   await connectDB();
-  const worker = new Worker(QUEUE_NAME, (bullJob) => processReelImportJob(bullJob.data), {
+  const worker = new Worker(QUEUE_NAME, processQueuedReelImport, {
     connection,
     concurrency: getReelImportConfig().workerConcurrency,
   });

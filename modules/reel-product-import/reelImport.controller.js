@@ -4,6 +4,7 @@ const path = require('path');
 const { asyncHandler } = require('../../middleware/validate');
 const Category = require('../../models/Category');
 const ProductDraft = require('../../models/ProductDraft');
+const DeletedProductDraft = require('../../models/DeletedProductDraft');
 const ReelCandidate = require('../../models/ReelCandidate');
 const ReelImport = require('../../models/ReelImport');
 const { getReelImportConfig } = require('../../config/reelImport');
@@ -11,6 +12,10 @@ const { enqueueReelImport, removeQueuedReelImport } = require('../../queues/reel
 const { deleteObject, getStorageProvider, objectExists, uploadOriginalVideo } = require('../../services/mediaStorage.service');
 const { analyzeStoredCandidate, isVisionEnabled } = require('../../services/reelCandidateVision.service');
 const { inspectVideo } = require('../../services/videoMetadata.service');
+const { runUploadRequest } = require('../../services/uploadRetryService');
+const UploadOperation = require('../../models/UploadOperation');
+const { andFilter } = require('../../services/storeService');
+const { ApiError } = require('../../utils/apiError');
 const { isLocalReelProcessorAvailable } = require('../../services/localReelProcessor.service');
 const {
   failStalledJob,
@@ -32,29 +37,30 @@ async function createImport(req, res, next) {
     return createImportFromStoredVideo(req, res, next);
   }
   try {
-    const fileError = validateVideoFile(file);
-    if (fileError) throw fileError;
+    const resume = req.body?.resumeUpload === true && !file;
+    if (!resume) {
+      const fileError = validateVideoFile(file);
+      if (fileError) throw fileError;
+    }
     const config = getReelImportConfig();
     if (!config.enabled) throw serviceUnavailable('REEL_IMPORT_DISABLED', 'Reel Product Import is currently disabled.');
-    const metadata = await inspectVideo(file.path);
-    if (metadata.durationSeconds > config.maxDurationSeconds) {
-      throw validationError('VIDEO_TOO_LONG', `Video duration must be ${config.maxDurationSeconds} seconds or less.`);
-    }
-
-    const stored = await uploadOriginalVideo(file);
-    const retentionExpiresAt = new Date(Date.now() + config.originalRetentionDays * 86400000);
-    let reelImport;
-    try {
-      reelImport = await ReelImport.create({
+    req.files = file ? [file] : [];
+    const ownedJob = id => ReelImport.findOne({ _id: id, createdBy: req.user._id, ...(req.store?._id ? { storeId: req.store._id } : {}) });
+    const result = await runUploadRequest(req, async context => {
+      const stored = context.resume ? context.storedFiles[0] : await context.upload(file, 0, async options => {
+        const metadata = await inspectVideo(file.path);
+        if (metadata.durationSeconds > config.maxDurationSeconds) throw validationError('VIDEO_TOO_LONG', `Video duration must be ${config.maxDurationSeconds} seconds or less.`);
+        const uploaded = await uploadOriginalVideo(file, options);
+        return { ...uploaded, publicId: uploaded.storageKey, originalFilename: safeOriginalFilename(file.originalname), mimeType: file.mimetype, sizeBytes: file.size, ...metadata };
+      });
+      const id = context.managed ? new mongoose.Types.ObjectId(context.id.slice(0, 24)) : new mongoose.Types.ObjectId();
+      if (context.managed) await UploadOperation.updateOne({ _id: context.id, status: 'RUNNING' }, { $set: { recordId: String(id) } });
+      let reelImport = context.managed ? await ownedJob(id) : null;
+      if (!reelImport) reelImport = await ReelImport.create({
+        _id: id,
         createdBy: req.user._id,
         storeId: req.store?._id,
-        sourceVideo: {
-          ...stored,
-          originalFilename: safeOriginalFilename(file.originalname),
-          mimeType: file.mimetype,
-          sizeBytes: file.size,
-          ...metadata,
-        },
+        sourceVideo: stored,
         status: 'uploaded',
         progress: {
           percentage: 5,
@@ -70,43 +76,40 @@ async function createImport(req, res, next) {
           duplicateThreshold: config.exactDuplicateSimilarity,
           clusteringThreshold: config.sameProductSimilarity,
         },
-        retentionExpiresAt,
+        retentionExpiresAt: new Date(Date.now() + config.originalRetentionDays * 86400000),
       });
+      // A record recovered after receipt-save failure must not enqueue again.
+      if (reelImport.status !== 'uploaded' && !(reelImport.status === 'queued' && !reelImport.queueJobId && !reelImport.attemptCount)) return { jobId: String(reelImport._id) };
       reelImport.status = 'queued';
-      await saveProgress(reelImport, {
-        stage: 'queued',
-        percentage: 8,
-        currentStep: 'Queued',
-        message: 'The reel is waiting for the processing worker.',
-      });
-      const queued = await enqueueReelImport({
-        jobId: reelImport._id,
-        storageKey: stored.storageKey,
-        attemptNumber: 1,
-      });
-      if (queued.queueJobId) {
-        reelImport.queueJobId = queued.queueJobId;
-        await ReelImport.updateOne({ _id: reelImport._id }, { $set: { queueJobId: queued.queueJobId } });
-      }
-    } catch (error) {
-      if (reelImport) {
-        reelImport.status = 'failed';
-        reelImport.activeRunId = null;
-        reelImport.queueJobId = null;
-        reelImport.error = { code: error.code || 'REEL_QUEUE_UNAVAILABLE', safeMessage: error.message };
-        await saveProgress(reelImport, {
+      await saveProgress(reelImport, { stage: 'queued', percentage: 8, currentStep: 'Queued', message: 'The reel is waiting for the processing worker.' });
+      try {
+        const queued = await enqueueReelImport({ jobId: reelImport._id, storageKey: stored.storageKey, attemptNumber: 1 });
+        if (queued.queueJobId) {
+          reelImport.queueJobId = queued.queueJobId;
+          await ReelImport.updateOne({ _id: reelImport._id }, { $set: { queueJobId: queued.queueJobId } });
+        }
+      } catch (error) {
+        // Upload and job creation succeeded. Return the recoverable job, with
+        // its existing Retry action, instead of making the UI upload again.
+        if (!reelImport.queueJobId) {
+          reelImport.status = 'failed';
+          reelImport.activeRunId = null;
+          reelImport.queueJobId = null;
+          reelImport.error = { code: error.code || 'REEL_QUEUE_UNAVAILABLE', safeMessage: error.message };
+          await saveProgress(reelImport, {
           stage: reelImport.progress?.stage || 'queued',
           percentage: reelImport.progress?.percentage || 5,
           currentStep: 'Processing unavailable',
           message: error.message,
           stageStatus: 'failed',
           errorCode: error.code || 'REEL_QUEUE_UNAVAILABLE',
-        }).catch(() => null);
-      } else {
-        await deleteObject(stored).catch(() => null);
+          });
+        } else throw error;
       }
-      throw error;
-    }
+      return { jobId: String(reelImport._id) };
+    }, { resume });
+    const reelImport = await ownedJob(result.jobId);
+    if (!reelImport) throw new ApiError('UPLOAD_RETRY_CONFLICT', 'This import was removed. Start a new import.', { statusCode: 409 });
     return res.status(202).json({ success: true, data: formatJob(reelImport) });
   } catch (error) {
     if (error.statusCode) res.status(error.statusCode);
@@ -149,13 +152,18 @@ async function createImportFromStoredVideo(req, res, next) {
     if (!await objectExists(storedVideo)) {
       throw validationError('STORED_VIDEO_NOT_FOUND', 'The uploaded video could not be found in cloud storage.');
     }
-    const existing = await ReelImport.findOne({
+    const existing = await ReelImport.findOne(andFilter({
       createdBy: req.user._id,
+      'sourceVideo.provider': provider,
       'sourceVideo.storageKey': storedVideo.storageKey,
-    });
+    }, req.tenantFilter));
     if (existing) return res.status(200).json({ success: true, data: formatJob(existing) });
 
-    const reelImport = await ReelImport.create({
+    const recordId = new mongoose.Types.ObjectId(require('node:crypto').createHash('sha256').update(JSON.stringify([String(req.store?._id || ''), String(req.user._id), provider, storedVideo.storageKey])).digest('hex').slice(0, 24));
+    let reelImport;
+    try { reelImport = await ReelImport.create({
+      _id: recordId,
+      storeId: req.store?._id,
       createdBy: req.user._id,
       sourceVideo: {
         ...storedVideo,
@@ -180,7 +188,12 @@ async function createImportFromStoredVideo(req, res, next) {
         clusteringThreshold: config.sameProductSimilarity,
       },
       retentionExpiresAt: new Date(Date.now() + config.originalRetentionDays * 86400000),
-    });
+    }); } catch (error) {
+      if (error.code !== 11000) throw error;
+      const recovered = await ReelImport.findOne({ _id: recordId, createdBy: req.user._id });
+      if (!recovered) throw error;
+      return res.status(200).json({ success: true, data: formatJob(recovered) });
+    }
     try {
       reelImport.status = 'queued';
       await saveProgress(reelImport, {
@@ -319,6 +332,12 @@ async function listCandidates(req, res) {
   if (!job) return res.status(404).json({ success: false, message: 'Reel import not found.' });
   const candidates = await ReelCandidate.find({ job: job._id }).sort({ groupNumber: 1 });
   const drafts = await ProductDraft.find({ sourceCandidateId: { $in: candidates.map((item) => item._id) } }).lean();
+  const receipts = await DeletedProductDraft.find({ sourceCandidateId: { $in: candidates.map((item) => item._id) } }).lean();
+  const productIds = [...drafts.map(item => item.publishedProductId), ...receipts.map(item => item.productId)].filter(Boolean);
+  const products = productIds.length ? await require('../../models/Product').find({ _id: { $in: productIds } }).select('name').lean() : [];
+  const productMap = new Map(products.map(item => [String(item._id), item]));
+  for (const draft of drafts) if (draft.publishedProductId) draft.publishedProductDeleted = !productMap.has(String(draft.publishedProductId));
+  drafts.push(...receipts.map(item => ({ _id: item.draftId, name: productMap.get(String(item.productId))?.name || 'Deleted product', sourceCandidateId: item.sourceCandidateId, status: 'published', publishedProductId: item.productId, publishedProductDeleted: !productMap.has(String(item.productId)), draftRemoved: true })));
   res.json({ success: true, data: candidates.map((candidate) => ({ ...formatCandidate(candidate), savedDraft: drafts.find((draft) => String(draft.sourceCandidateId) === String(candidate._id)) })) });
 }
 
@@ -407,6 +426,7 @@ async function deleteImport(req, res, next) {
     await deleteObject(job.sourceVideo).catch(() => false);
     await ReelCandidate.deleteMany({ job: job._id });
     await job.deleteOne();
+    await require('../../services/recordCreationService').invalidateRecordCreation(job._id);
     res.json({ success: true, message: 'Reel import deleted.' });
   } catch (error) {
     next(error);
@@ -418,7 +438,7 @@ async function updateCandidate(req, res) {
   if (!context) return res.status(404).json({ success: false, message: 'Candidate not found.' });
   const { candidate } = context;
   const body = req.body || {};
-  if (candidate.productDraft && await ProductDraft.exists({ _id: candidate.productDraft, status: 'published' })) return res.status(409).json({ success: false, message: 'This product is published. Use Edit product to change its catalog details.' });
+  if (candidate.productDraft && (await ProductDraft.exists({ _id: candidate.productDraft, status: 'published' }) || await DeletedProductDraft.exists({ draftId: candidate.productDraft }))) return res.status(409).json({ success: false, message: 'This product is published. Use Edit product to change its catalog details.' });
   if (body.status && ['suggested', 'approved', 'ignored'].includes(body.status)) candidate.status = body.status;
   if (body.suggestions && typeof body.suggestions === 'object') {
     candidate.suggestions = { ...candidate.suggestions?.toObject?.() || candidate.suggestions || {}, ...pickSuggestions(body.suggestions) };
@@ -472,7 +492,7 @@ async function analyzeCandidate(req, res, next) {
     if (!context) return res.status(404).json({ success: false, message: 'Candidate not found.' });
     const { candidate, job } = context;
     const linkedDraft = candidate.productDraft ? await ProductDraft.findById(candidate.productDraft) : null;
-    if (candidate.status === 'merged' || linkedDraft?.status === 'published') {
+    if (candidate.status === 'merged' || linkedDraft?.status === 'published' || await DeletedProductDraft.exists({ sourceCandidateId: candidate._id })) {
       return res.status(409).json({ success: false, message: 'This candidate can no longer be analyzed.' });
     }
     if (Array.isArray(req.body?.selectedFrameIds)) {
@@ -686,6 +706,7 @@ async function createDraftForCandidate(job, candidate, userId) {
     await candidate.save();
     return duplicate;
   }
+  if (await DeletedProductDraft.exists({ sourceCandidateId: candidate._id })) throw validationError('ALREADY_PUBLISHED', 'This candidate was already published and its draft removed. Manage the existing product from Products.');
   const overrides = candidate.adminOverrides || {};
   const suggestions = candidate.suggestions || {};
   const name = String(overrides.name || suggestions.name || `Reel product ${candidate.groupNumber}`).trim();

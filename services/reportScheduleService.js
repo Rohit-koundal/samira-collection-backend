@@ -5,6 +5,8 @@ const User = require('../models/User');
 const { roleAllows } = require('../models/StoreMember');
 const { hasStoreFeature } = require('../config/storePlans');
 const { isOwnerAccount } = require('../config/masterOwner');
+const { isMasterOwner } = require('../config/masterOwner');
+const { escapeHtml } = require('./orderAlertProviders');
 const { defaultStoreFilter } = require('./storeService');
 const { createReportContext } = require('./reportingService');
 const { buildReportCsv, generateBundle } = require('./reportExportService');
@@ -38,10 +40,11 @@ async function assertViewAccess(view, store) {
     if (!(user.role === 'admin' && user.activeMode === 'admin' && user.systemRole === 'MASTER_OWNER' && isOwnerAccount(user))) throw new Error('All-store report permission is no longer active.');
     return;
   }
-  if (user.role === 'admin' && user.activeMode === 'admin') return;
+  if (user.role === 'admin' && user.activeMode === 'admin' && (store.isDefault || isMasterOwner(user))) return;
   const membership = await StoreMember.findOne({ store: store._id, user: user._id, status: 'ACTIVE' }).lean();
   if (!membership || !roleAllows(membership.role, 'reports.manage') || !roleAllows(membership.role, 'reports.export')) throw new Error('The report owner no longer has permission to email reports.');
   if (!hasStoreFeature(store, 'analytics')) throw new Error('Analytics is not active for this store.');
+  if (store.catalogStructure?.clientPermissions?.reports === false) throw new Error('Reports are disabled for this store.');
 }
 
 async function runScheduledView(view) {
@@ -51,11 +54,14 @@ async function runScheduledView(view) {
   const context = await createReportContext({ query: view.filters || {}, tenantFilter, store });
   const bundle = await generateBundle(context, view.sections);
   const csv = buildReportCsv(bundle);
+  const primary = bundle.sections.summary || Object.values(bundle.sections)[0];
+  const period = primary?.range || context.range;
+  const timezone = primary?.timezone || context.timezone;
   await sendTransactionalEmail({
     to: view.schedule.recipient,
     subject: `${store?.name || 'Managed stores'} report: ${view.name}`,
-    htmlContent: `<div style="font-family:Arial,sans-serif;color:#1f2937"><h2>${view.name}</h2><p>Your scheduled commerce report is attached.</p><p>Period: ${context.range.fromDate} to ${context.range.toDate} (${context.timezone}).</p></div>`,
-    attachments: [{ name: `report-${context.range.fromDate}-${context.range.toDate}.csv`, content: csv }],
+    htmlContent: `<div style="font-family:Arial,sans-serif;color:#1f2937"><h2>${escapeHtml(view.name)}</h2><p>Your scheduled report is attached.</p><p>Period: ${period.fromDate} to ${period.toDate} (${escapeHtml(timezone)}).</p></div>`,
+    attachments: [{ name: `report-${period.fromDate}-${period.toDate}.csv`, content: csv }],
   });
   await logAudit({ action: 'REPORT_SCHEDULE_SENT', entityType: 'ReportView', entityId: view._id, storeId: view.storeId, source: 'SYSTEM', after: { name: view.name, recipient: view.schedule.recipient, frequency: view.schedule.frequency } });
 }

@@ -18,6 +18,7 @@ function reportRows(bundle) {
     ['Store', bundle.storeName || 'All managed stores'],
     ['Period', `${first.range?.fromDate || ''} to ${first.range?.toDate || ''}`],
     ['Timezone', first.timezone || 'Asia/Kolkata'],
+    ['Filters', JSON.stringify(first.filters || {})],
     ['Currency', first.currency || 'INR'],
     ['Generated at', bundle.generatedAt || ''],
   ];
@@ -50,6 +51,17 @@ function reportRows(bundle) {
     rows.push(...objectRows('Banner performance', marketing.banners, [['Banner', 'bannerId'], ['Campaign', 'campaign'], ['Impressions', 'impressions'], ['Clicks', 'clicks'], ['CTR %', 'ctr']]));
   }
   const fulfillment = bundle.sections?.fulfillment?.data;
+  const traffic = bundle.sections?.traffic?.data;
+  if (traffic) {
+    rows.push([], ['Traffic & visitors (estimated browser identities)'], ['Metric', 'Current', 'Previous', 'Change %']);
+    Object.entries(traffic.metrics || {}).forEach(([key, value]) => rows.push([key, value.value, value.previous, value.delta ?? '']));
+    rows.push(['Active visitors (last 5 minutes)', traffic.activeVisitors], ['Collection state', traffic.health?.state], ['Traffic timezone', traffic.timezone], ['Details available from', traffic.retention?.rawAvailableFrom], ['Conversion definition', traffic.funnel?.note]);
+    rows.push(...objectRows('Traffic trend', traffic.series, [['Period', 'key'], ['Visitors', 'visitors'], ['Visits', 'sessions'], ['Page views', 'pageViews']]));
+    for (const key of ['sources', 'firstSources', 'campaigns', 'devices', 'browsers', 'operatingSystems']) rows.push(...objectRows(key, traffic[key], [['Label', 'label'], ['Visitors', 'visitors'], ['Visits', 'sessions'], ['Page views', 'pageViews']]));
+    rows.push(...objectRows('Verified traffic funnel', traffic.funnel?.steps, [['Step', 'label'], ['Visits', 'value'], ['Rate from previous %', 'rate']]));
+    for (const [key, items] of Object.entries(traffic.details || {})) rows.push(...objectRows(key, items, [['Label', 'label'], ['Count', 'value']]));
+    rows.push(...objectRows('All-store order cohort (not limited to tracked visitors)', [traffic.commerce], [['Orders placed', 'ordersPlaced'], ['COD placed', 'codPlaced'], ['Online paid', 'onlinePaid'], ['COD collected', 'codCollected'], ['Cancelled', 'cancelled'], ['Refunds', 'refunds']]));
+  }
   if (fulfillment) {
     rows.push(...objectRows('Shipping and returns summary', [fulfillment.summary], [['Orders', 'orders'], ['Shipments', 'shipments'], ['Waiting for shipment', 'waitingForShipment'], ['Delayed', 'delayed'], ['Delivered', 'delivered'], ['RTO', 'rto'], ['Exceptions', 'exceptions'], ['Average delivery hours', 'averageDeliveryHours'], ['Shipping collected', 'shippingCollected'], ['Carrier cost', 'carrierCost'], ['COD outstanding orders', 'codOutstandingOrders'], ['COD outstanding amount', 'codOutstandingAmount'], ['Return requests', 'returnRequests'], ['Returns', 'returns'], ['Exchanges', 'exchanges'], ['Refunded', 'refunded'], ['Refunds pending', 'refundPending'], ['Overdue returns', 'overdueReturns'], ['Average resolution hours', 'averageResolutionHours']]));
     rows.push(...objectRows('Courier performance', fulfillment.providers, [['Provider', 'provider'], ['Shipments', 'shipments'], ['Delivered', 'delivered'], ['Delivery rate %', 'deliveryRate'], ['RTO', 'rto'], ['RTO rate %', 'rtoRate'], ['Exceptions', 'exceptions'], ['Carrier charge', 'charge']]));

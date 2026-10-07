@@ -43,6 +43,9 @@ async function createRazorpayOrder({ amountInPaise, receipt, notes = {} }) {
   } catch (error) {
     const message = error?.error?.description || error?.message || 'Razorpay order creation failed';
     const wrapped = new Error(message);
+    // Preserve a provider's explicit rejection separately from an ambiguous
+    // network/server failure, without changing legacy callers' error shape.
+    wrapped.razorpayDefinitiveRejection = [400, 401, 403, 422].includes(Number(error?.statusCode)) && Boolean(error?.error);
     if (Number(error?.statusCode) === 401) {
       wrapped.statusCode = 401;
       wrapped.razorpayAuthError = true;

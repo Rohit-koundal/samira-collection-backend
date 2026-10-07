@@ -44,11 +44,15 @@ const analyticsEventSchema = new mongoose.Schema({
   campaign: { type: String, maxlength: 80 },
   reelId: { type: String, maxlength: 80 },
   metadata: mongoose.Schema.Types.Mixed,
+  trafficEventId: String,
+  expiresAt: Date,
 }, { timestamps: true });
 
 analyticsEventSchema.index({ storeId: 1, name: 1, createdAt: -1 });
 analyticsEventSchema.index({ storeId: 1, source: 1, createdAt: -1 });
 analyticsEventSchema.index({ createdAt: -1 });
+analyticsEventSchema.index({ storeId: 1, trafficEventId: 1 }, { unique: true, partialFilterExpression: { trafficEventId: { $type: 'string' } } });
+analyticsEventSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
 
 module.exports = mongoose.model('AnalyticsEvent', analyticsEventSchema);
 module.exports.EVENT_ALIASES = EVENT_ALIASES;

@@ -263,6 +263,7 @@ test('analytics rejects payment secrets and records a store view', async () => {
     method: 'POST',
     body: {
       name: 'STORE_VIEW',
+      consent: true,
       source: 'instagram',
       campaign: 'reel-drop',
       metadata: { razorpay_secret: 'should-not-store', path: '/#/' },
@@ -333,7 +334,7 @@ test('seller product create assigns the store and ignores client storeId', async
 test('BEGIN_CHECKOUT is accepted as an analytics event', async () => {
   const tracked = await request('/api/analytics/events', {
     method: 'POST',
-    body: { name: 'BEGIN_CHECKOUT', source: 'instagram', campaign: 'summer-drop' },
+    body: { name: 'BEGIN_CHECKOUT', consent: true, source: 'instagram', campaign: 'summer-drop' },
   });
   assert.equal(tracked.status, 202);
   const AnalyticsEvent = require('../models/AnalyticsEvent');

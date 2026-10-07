@@ -43,6 +43,7 @@ app.get('/api/social/oauth/instagram/start', socialOAuth.wrap(socialOAuth.naviga
 app.get('/api/social/oauth/instagram/callback', socialOAuth.wrap(socialOAuth.callbackInstagram));
 app.post(['/api/social/deauthorize', '/api/social/data-deletion'], express.urlencoded({ extended: false, limit: '16kb' }), socialOAuth.wrap(socialOAuth.deauthorize));
 app.get('/api/social/deletion-status/:code', socialOAuth.wrap(socialOAuth.deletionStatus));
+app.use('/api/analytics', express.json({ limit: '32kb' }));
 app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || '1mb' }));
 app.use(require('./middleware/auditMiddleware').auditAdminRequests);
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
@@ -79,6 +80,7 @@ app.get('/health', async (req, res) => {
       mediaStorage: { required: mediaStorageRequired, ready: persistentImageStorageConfigured },
       redis: { required: redisRequired, ready: redis === 'connected' },
       tenantIndexes: { required: databaseRequired, ready: tenantIndexesReady },
+      trafficIndexes: { required: false, ready: app.locals.trafficIndexesReady !== false },
     },
     ...(process.env.NODE_ENV === 'production' ? {} : { allowedOrigins: getAllowedOrigins() }),
   });
@@ -89,7 +91,7 @@ const apiLimiter = rateLimit({
   limit: Math.max(100, Number(process.env.API_RATE_LIMIT_MAX || 1200)),
   standardHeaders: 'draft-7',
   legacyHeaders: false,
-  skip: () => process.env.NODE_ENV === 'test',
+  skip: req => process.env.NODE_ENV === 'test' || /^\/analytics\/(collect|config|forget)(\/|$)/.test(req.path),
   message: { success: false, code: 'RATE_LIMITED', message: 'Too many requests. Please wait a moment and try again.' },
 });
 app.use('/api', apiLimiter);
@@ -106,6 +108,7 @@ app.use('/api/admin/customers', protect, adminOnly, require('./routes/customerAd
 app.use('/api/admin/users', protect, adminOnly, require('./routes/customerAdminRoutes'));
 app.use('/api/admin/customer-crm', protect, adminOnly, optionalResolveStore, requireAdminCustomerStoreAccess, require('./routes/customerCrmRoutes'));
 app.use('/api/admin', require('./routes/adminAuthRoutes'));
+app.use('/api/admin/smart-fill', protect, adminOnly, optionalResolveStore, requireAdminCustomerStoreAccess, require('./routes/workflowSmartFillRoutes'));
 app.use('/api/admin/products', protect, adminOnly, require('./routes/adminProductRoutes'));
 app.use('/api/admin/categories', protect, adminOnly, require('./routes/categoryRoutes'));
 app.use('/api/admin/orders', protect, adminOnly, require('./routes/orderRoutes'));
@@ -115,6 +118,7 @@ app.use('/api/admin/campaigns', protect, adminOnly, optionalResolveStore, requir
 app.use('/api/admin/reviews', protect, adminOnly, optionalResolveStore, requireAdminCustomerStoreAccess, require('./routes/reviewRoutes'));
 app.use('/api/admin/returns', protect, adminOnly, optionalResolveStore, requireAdminCustomerStoreAccess, require('./routes/returnRoutes'));
 app.use('/api/admin/settings', protect, adminOnly, optionalResolveStore, require('./routes/settingsRoutes'));
+app.use('/api/admin/rentals', protect, adminOnly, optionalResolveStore, requireAdminCustomerStoreAccess, require('./routes/rentalRoutes').staffRouter());
 app.use('/api/admin/business', protect, adminOnly, optionalResolveStore, requireAdminCustomerStoreAccess, require('./routes/businessRoutes'));
 app.use('/api/admin/store-content', protect, adminOnly, require('./routes/storeContentRoutes'));
 app.use('/api/admin/customization', protect, adminOnly, require('./routes/websiteCustomizationRoutes'));
@@ -131,6 +135,7 @@ app.get('/api/instagram/oauth/callback', instagram.oauthCallback);
 app.use('/api/analytics', require('./routes/analyticsRoutes'));
 app.use('/api/storefront/home', optionalResolveStore, require('./routes/storefrontHomeRoutes'));
 app.use('/api/products', optionalResolveStore, require('./routes/publicProductRoutes'));
+app.use('/api/rentals', optionalResolveStore, require('./routes/rentalRoutes').customerRouter());
 app.use('/api/variant-groups', optionalResolveStore, require('./routes/variantGroupRoutes'));
 app.use('/api/categories', optionalResolveStore, require('./routes/categoryRoutes'));
 app.use('/api/cart', optionalResolveStore, require('./routes/cartRoutes'));

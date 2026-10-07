@@ -1,15 +1,10 @@
 const fs = require('fs/promises');
-const path = require('path');
 const upload = require('../middleware/uploadMiddleware');
-const { isR2Configured, uploadImageToR2 } = require('../services/r2Upload');
-const { isCloudinaryConfigured, uploadImage } = require('../services/cloudinaryUpload');
+const { isR2Configured } = require('../services/r2Upload');
+const { isCloudinaryConfigured } = require('../services/cloudinaryUpload');
 const { isLocalRequest } = require('../utils/imageUtils');
 const { ApiError } = require('../utils/apiError');
-
-function localFile(file) {
-  const name = path.basename(file.filename || file.path || '');
-  return { url: `/uploads/${name}`, publicId: name, provider: 'local' };
-}
+const { uploadMedia } = require('../services/mediaUploadService');
 
 async function cleanup(files = []) {
   await Promise.all(files.map((file) => fs.unlink(file.path).catch(() => null)));
@@ -29,16 +24,12 @@ exports.middleware = (req, res, next) => upload.array('images', 5)(req, res, nex
 
 exports.uploadReturnEvidence = async function uploadReturnEvidence(req, res, next) {
   try {
-    if (!req.files?.length) throw new ApiError('VALIDATION_ERROR', 'Choose at least one return photo.');
-    await assertRealImages(req.files);
+    if (!req.files?.length && req.body?.resumeUpload !== true) throw new ApiError('VALIDATION_ERROR', 'Choose at least one return photo.');
+    await assertRealImages(req.files || []);
     if (!isR2Configured() && !isCloudinaryConfigured() && process.env.NODE_ENV === 'production' && !isLocalRequest(req)) {
       throw new ApiError('PERSISTENT_UPLOAD_STORAGE_REQUIRED', 'Return evidence needs Cloudflare R2 or Cloudinary in production.', { statusCode: 503 });
     }
-    let files;
-    if (isR2Configured()) files = await Promise.all(req.files.map((file) => uploadImageToR2(file, { folder: 'returns' })));
-    else if (isCloudinaryConfigured()) files = (await Promise.all(req.files.map((file) => uploadImage(file, { folder: 'returns' })))).filter(Boolean);
-    else files = req.files.map(localFile);
-    if (isR2Configured() || isCloudinaryConfigured()) await cleanup(req.files);
+    const files = await uploadMedia(req, { folder: 'returns' });
     res.status(201).json({ files: files.map((file) => ({ url: file.url, publicId: file.publicId, provider: file.provider || (isR2Configured() ? 'r2' : isCloudinaryConfigured() ? 'cloudinary' : 'local') })) });
   } catch (error) {
     await cleanup(req.files || []);

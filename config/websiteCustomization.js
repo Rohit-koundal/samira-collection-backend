@@ -143,6 +143,7 @@ const DEFAULT_WEBSITE_CONFIG = {
   },
   mobile: {
     enabled: false,
+    inheritThemeColors: true,
     headerBackground: '#ffffff', headerText: '#334155',
     pageBackground: '#fcfaf7', gridGap: 12, cardRadius: 14, imageRatio: 'original',
     columns: 2, useDesktopCatalog: false,

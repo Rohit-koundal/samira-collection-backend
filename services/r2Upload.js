@@ -2,7 +2,7 @@ const crypto = require('crypto');
 const fs = require('fs/promises');
 const fsSync = require('fs');
 const path = require('path');
-const { DeleteObjectCommand, S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
+const { DeleteObjectCommand, HeadObjectCommand, S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
 
 let r2Client;
 
@@ -17,6 +17,8 @@ const allowedFolders = new Set([
   'reel-imports/candidates',
   'reviews',
   'returns',
+  'verification',
+  'social-studio',
 ]);
 
 function isR2Configured() {
@@ -58,7 +60,7 @@ function resolveUploadFolder(folder = '') {
   return getR2Folder();
 }
 
-function buildObjectKey(file, { folder = 'products', extension = 'webp' } = {}) {
+function buildObjectKey(file, { folder = 'products', extension = 'webp', uploadId } = {}) {
   const safeFolder = resolveUploadFolder(folder);
   const safeBaseName = String(file.originalname || 'image')
     .replace(/\.[^.]+$/, '')
@@ -67,20 +69,33 @@ function buildObjectKey(file, { folder = 'products', extension = 'webp' } = {}) 
     .toLowerCase() || 'image';
   const suffix = crypto.randomBytes(5).toString('hex');
   const safeExtension = String(extension || 'webp').replace(/[^a-z0-9]/gi, '').toLowerCase() || 'webp';
+  if (/^[a-f0-9]{64}$/.test(uploadId || '')) return `${safeFolder}/retry-${uploadId}.${safeExtension}`;
   return `${safeFolder}/${Date.now()}-${suffix}-${safeBaseName}.${safeExtension}`;
+}
+
+async function alreadyStored(objectKey, options) {
+  if (!options.uploadId || !options.recovering) return false;
+  try {
+    await getR2Client().send(new HeadObjectCommand({ Bucket: process.env.R2_BUCKET_NAME, Key: objectKey }), { abortSignal: AbortSignal.timeout(30000) });
+    return true;
+  } catch (error) {
+    if (error.$metadata?.httpStatusCode === 404 || ['NotFound', 'NoSuchKey'].includes(error.name)) return false;
+    throw error;
+  }
 }
 
 async function uploadImageToR2(file, options = {}) {
   const objectKey = buildObjectKey(file, { ...options, extension: 'webp' });
-  const buffer = await fs.readFile(file.path);
-
-  await getR2Client().send(new PutObjectCommand({
-    Bucket: process.env.R2_BUCKET_NAME,
-    Key: objectKey,
-    Body: buffer,
-    ContentType: file.mimetype || 'image/webp',
-    CacheControl: 'public, max-age=31536000, immutable',
-  }));
+  if (!await alreadyStored(objectKey, options)) {
+    const buffer = await fs.readFile(file.path);
+    await getR2Client().send(new PutObjectCommand({
+      Bucket: process.env.R2_BUCKET_NAME,
+      Key: objectKey,
+      Body: buffer,
+      ContentType: file.mimetype || 'image/webp',
+      CacheControl: 'public, max-age=31536000, immutable',
+    }), { abortSignal: AbortSignal.timeout(2 * 60 * 1000) });
+  }
 
   return {
     url: buildPublicUrl(objectKey),
@@ -94,6 +109,8 @@ async function uploadImageToR2(file, options = {}) {
 async function uploadFileToR2(file, options = {}) {
   const extension = resolveFileExtension(file);
   const objectKey = buildObjectKey(file, { ...options, extension });
+  if (await alreadyStored(objectKey, options)) return { url: buildPublicUrl(objectKey), publicId: objectKey, originalName: file.originalname };
+  const sizeBytes = Number(file.size || 0) || (await fs.stat(file.path)).size;
   const stream = fsSync.createReadStream(file.path);
   const controller = new AbortController();
   const isVideo = String(file.mimetype || '').toLowerCase().startsWith('video/');
@@ -104,7 +121,7 @@ async function uploadFileToR2(file, options = {}) {
       Bucket: process.env.R2_BUCKET_NAME,
       Key: objectKey,
       Body: stream,
-      ContentLength: Number(file.size || 0) || undefined,
+      ContentLength: sizeBytes,
       ContentType: file.mimetype || 'application/octet-stream',
       CacheControl: 'public, max-age=31536000, immutable',
     }), { abortSignal: controller.signal });
@@ -135,6 +152,7 @@ async function deleteImageFromR2(identifier) {
     Bucket: process.env.R2_BUCKET_NAME,
     Key: objectKey,
   }));
+  await require('./uploadRetryService').invalidateStoredUpload('r2', objectKey);
   return true;
 }
 
@@ -163,6 +181,7 @@ function resolveObjectKey(identifier) {
 
 function resolveFileExtension(file = {}) {
   const mime = String(file.mimetype || '').toLowerCase();
+  if (mime.startsWith('image/')) return mime.includes('png') ? 'png' : mime.includes('webp') ? 'webp' : 'jpg';
   if (mime.includes('webm')) return 'webm';
   if (mime.includes('quicktime') || mime.includes('mov')) return 'mov';
   if (mime.includes('mp4')) return 'mp4';

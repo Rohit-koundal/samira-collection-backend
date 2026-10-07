@@ -54,6 +54,9 @@ function checkoutCartItems(body = {}) {
 }
 
 async function findCheckoutReplay({ userId, attemptId, fingerprint }) {
+  // The API can receive requests before Mongoose's background index build
+  // finishes. Deduplication is only safe once the unique attempt index exists.
+  await Order.init();
   const order = await Order.findOne({ user: userId, checkoutAttemptId: attemptId }).select('+checkoutFingerprint +checkoutCartItems');
   if (!order) return null;
   if (order.checkoutFingerprint && order.checkoutFingerprint !== fingerprint) {
@@ -63,6 +66,7 @@ async function findCheckoutReplay({ userId, attemptId, fingerprint }) {
 }
 
 async function beginPaymentAttempt({ userId, storeId, attemptId, fingerprint }) {
+  await CheckoutAttempt.init();
   try {
     const attempt = await CheckoutAttempt.create({ user: userId, storeId: storeId || undefined, attemptId, fingerprint, status: 'PROCESSING' });
     return { owned: true, attempt };

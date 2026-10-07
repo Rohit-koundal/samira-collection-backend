@@ -9,6 +9,8 @@ const { verifyEnvelope } = require('../services/licenseSignatureService');
 const InstallationPayment = require('../models/InstallationPayment');
 const ClientInstallation = require('../models/ClientInstallation');
 const ClientInstallationOperation = require('../models/ClientInstallationOperation');
+const { createAdmin, createCustomer } = require('./factories');
+const { nextPeriodEnd } = require('../config/storePlans');
 
 process.env.RAZORPAY_KEY_ID = 'rzp_test_client_platform';
 process.env.RAZORPAY_KEY_SECRET = 'client_platform_test_secret';
@@ -257,6 +259,70 @@ test('manual access grants are reasoned and idempotent', async () => {
   assert.equal(repeated.status, 200);
   assert.equal(repeated.data.duplicate, true);
   assert.equal(repeated.data.installation.endsAt, firstEnd);
+  assert.equal(await ClientInstallationOperation.countDocuments({ installation: client.installation._id, type: 'ACCESS_GRANT' }), 1);
+});
+
+test('expired trial, monthly and yearly clients expose a private lightweight notice and can be renewed only by master', async () => {
+  const admin = await createAdmin(); const buyer = await createCustomer();
+  for (const cycle of ['TRIAL', 'MONTHLY', 'YEARLY']) {
+    const client = await provision(`Expired ${cycle}`, `expired-${cycle.toLowerCase()}`);
+    const other = await provision(`Unchanged ${cycle}`, `unchanged-${cycle.toLowerCase()}`);
+    await ClientInstallation.updateOne({ _id: client.installation._id }, { $set: { status: cycle === 'TRIAL' ? 'TRIAL' : 'ACTIVE', billingCycle: cycle, trialEndsAt: new Date(Date.now() - 86400000), endsAt: new Date(Date.now() - 86400000), renewalMessage: 'Contact your account manager for renewal.' } });
+    Object.assign(process.env, {
+      CONTROL_PLANE_URL: getBaseUrl(), CLIENT_INSTALLATION_ID: client.credentials.installationId,
+      CLIENT_LICENSE_KEY: client.credentials.licenseKey, LICENSE_SIGNING_PUBLIC_KEY: client.credentials.signingPublicKey,
+    });
+    try {
+      const expired = await request('/api/system/license/refresh?summary=1', { method: 'POST', token: admin.token, body: {} });
+      assert.equal(expired.status, 200); assert.equal(expired.data.status, 'EXPIRED');
+      assert.equal(expired.data.billingCycle, cycle);
+      assert.equal(expired.data.companyName, `Expired ${cycle}`);
+      assert.equal(expired.data.renewalMessage, 'Contact your account manager for renewal.');
+      assert.ok(Number.isFinite(Date.parse(expired.data.serverNow)));
+      for (const field of ['usage', 'plans', 'pricing', 'signature', 'licenseKey', 'contact']) assert.equal(field in expired.data, false, field);
+      assert.doesNotMatch(JSON.stringify(expired.data), new RegExp(client.credentials.licenseKey));
+      const cached = await request('/api/system/license?summary=1', { token: admin.token });
+      assert.equal(cached.data.status, 'EXPIRED');
+      const deniedRead = await request('/api/system/license?summary=1', { token: buyer.token });
+      assert.equal(deniedRead.status, 403);
+      const blockedWrite = await request('/api/admin/products', { method: 'POST', token: admin.token, body: { name: 'License bypass' } });
+      assert.equal(blockedWrite.data.code, 'SUBSCRIPTION_REQUIRED');
+      const body = { baseRevision: expiredRevision(await ClientInstallation.findById(client.installation._id)), plan: 'PROFESSIONAL', billingCycle: cycle, source: 'MANUAL_PAYMENT', reference: `bank-${cycle}`, reason: 'Renewal approved by the platform owner', idempotencyKey: `grant:expired:${cycle}:001` };
+      const deniedGrant = await request(`/api/master/installations/${client.installation._id}/subscription/grants`, { method: 'POST', token: admin.token, body });
+      assert.equal(deniedGrant.status, 403);
+      const before = Date.now();
+      const renewed = await request(`/api/master/installations/${client.installation._id}/subscription/grants`, { method: 'POST', token: client.master.token, body });
+      assert.equal(renewed.status, 200);
+      assert.equal(renewed.data.installation.status, cycle === 'TRIAL' ? 'TRIAL' : 'ACTIVE');
+      const end = Date.parse(renewed.data.installation.endsAt);
+      const expectedEnd = (now) => cycle === 'TRIAL' ? now + 30 * 86400000 : nextPeriodEnd(cycle, new Date(now)).getTime();
+      assert.ok(end >= expectedEnd(before) && end <= expectedEnd(Date.now()));
+      const replay = await request(`/api/master/installations/${client.installation._id}/subscription/grants`, { method: 'POST', token: client.master.token, body });
+      assert.equal(replay.data.duplicate, true); assert.equal(replay.data.installation.endsAt, renewed.data.installation.endsAt);
+      const visible = await request('/api/system/license/refresh?summary=1', { method: 'POST', token: admin.token, body: {} });
+      assert.equal(visible.data.status, cycle === 'TRIAL' ? 'TRIAL' : 'ACTIVE');
+      const record = await ClientInstallationOperation.findOne({ installation: client.installation._id, type: 'ACCESS_GRANT' }).lean();
+      assert.equal(record.reason, body.reason); assert.equal(record.metadata.reference, body.reference);
+      assert.equal(String(record.actor), String(client.master.user._id));
+      assert.equal((await ClientInstallation.findById(other.installation._id)).billingCycle, 'TRIAL');
+    } finally {
+      for (const key of ['CONTROL_PLANE_URL', 'CLIENT_INSTALLATION_ID', 'CLIENT_LICENSE_KEY', 'LICENSE_SIGNING_PUBLIC_KEY']) delete process.env[key];
+    }
+  }
+});
+
+function expiredRevision(installation) { return Number(installation.revision || 0); }
+
+test('renewing an active paid plan preserves prepaid remaining days and rejects stale revisions', async () => {
+  const client = await provision('Prepaid Client', 'prepaid-client');
+  const end = new Date(Date.now() + 10 * 86400000);
+  await ClientInstallation.updateOne({ _id: client.installation._id }, { $set: { status: 'ACTIVE', billingCycle: 'MONTHLY', endsAt: end } });
+  const body = { baseRevision: 0, plan: 'PROFESSIONAL', billingCycle: 'YEARLY', source: 'MANUAL_PAYMENT', reason: 'Annual renewal before existing access ends', idempotencyKey: 'grant:prepaid:annual:001' };
+  const renewed = await request(`/api/master/installations/${client.installation._id}/subscription/grants`, { method: 'POST', token: client.master.token, body });
+  assert.equal(renewed.status, 200);
+  assert.equal(Date.parse(renewed.data.installation.endsAt), nextPeriodEnd('YEARLY', end).getTime());
+  const stale = await request(`/api/master/installations/${client.installation._id}/subscription/grants`, { method: 'POST', token: client.master.token, body: { ...body, idempotencyKey: 'grant:prepaid:stale:002' } });
+  assert.equal(stale.status, 409);
   assert.equal(await ClientInstallationOperation.countDocuments({ installation: client.installation._id, type: 'ACCESS_GRANT' }), 1);
 });
 

@@ -9,15 +9,21 @@ const slugify = require('../utils/slugify');
 const Product = require('../models/Product');
 const ProductDraft = require('../models/ProductDraft');
 const Category = require('../models/Category');
-const { deleteImageFromR2, isR2Configured, uploadImageToR2 } = require('../services/r2Upload');
-const { deleteFile: deleteCloudinaryFile, isCloudinaryConfigured, uploadImage: uploadImageToCloudinary } = require('../services/cloudinaryUpload');
-const { buildUploadFileResponse, isLocalRequest, normalizeProductImages, normalizeProductPayload, sanitizeProductImages } = require('../utils/imageUtils');
+const { deleteImageFromR2, isR2Configured } = require('../services/r2Upload');
+const { deleteFile: deleteCloudinaryFile, isCloudinaryConfigured } = require('../services/cloudinaryUpload');
+const { isLocalRequest, normalizeProductImages, normalizeProductPayload, sanitizeProductImages } = require('../utils/imageUtils');
 const { normalizeProductSizing, validateProductSizing } = require('../services/productSizingService');
 const { validateVariantPayload } = require('../services/variantService');
 const { andFilter } = require('../services/storeService');
 const { logAudit } = require('../services/auditService');
 const { auditSnapshot } = require('../utils/auditData');
 const { recordOpeningInventory } = require('../services/inventoryService');
+const DeletedProductDraft = require('../models/DeletedProductDraft');
+const { ApiError } = require('../utils/apiError');
+const { supportsTransactions, runInTransaction } = require('../utils/transaction');
+const { runUploadRequest } = require('../services/uploadRetryService');
+const { storeFiles } = require('../services/mediaUploadService');
+const { createRecordOnce } = require('../services/recordCreationService');
 
 const DRAFT_AUDIT_FIELDS = [
   'name', 'sku', 'category', 'sellingPrice', 'originalPrice', 'stock', 'status',
@@ -43,7 +49,7 @@ exports.bulkUploadMiddleware = multer({
     },
     filename(req, file, cb) {
       const safeName = file.originalname.replace(/[^a-z0-9.]+/gi, '-').toLowerCase();
-      cb(null, `${Date.now()}-${safeName}`);
+      cb(null, `${require('crypto').randomUUID()}-${safeName}`);
     },
   }),
   fileFilter(req, file, cb) {
@@ -56,48 +62,67 @@ exports.bulkUploadMiddleware = multer({
 
 exports.bulkUpload = async (req, res, next) => {
   try {
-    const uploaded = await uploadDraftImages(req, req.files || []);
-    if (!uploaded.length) return res.status(400).json({ success: false, message: 'Please upload at least one image' });
-    const groupMode = req.body?.groupMode === 'single' ? 'single' : 'separate';
-    const groups = groupMode === 'single' ? [uploaded] : uploaded.map((file) => [file]);
-    const drafts = await ProductDraft.insertMany(groups.map((files, index) => withDraftStore(req, {
-      name: '',
-      slug: uniqueDraftSlug(files[0]?.originalName || `draft-${index + 1}`),
-      sku: `DRAFT-${Date.now()}-${String(index + 1).padStart(2, '0')}`,
-      image: files[0]?.url,
-      images: files.map((file, fileIndex) => ({ url: file.url, publicId: file.publicId, primary: fileIndex === 0 })),
-      videos: [],
-      category: undefined,
-      subCategory: '',
-      price: 0,
-      originalPrice: 0,
-      sellingPrice: 0,
-      stock: 0,
-      sizes: [],
-      sizingMode: 'auto',
-      sizeChartProfile: 'auto',
-      sizeChart: { unit: 'in', columns: [], rows: [] },
-      sizeFitNotes: '',
-      colors: [],
-      fabric: '',
-      occasion: '',
-      tags: [],
-      description: '',
-      highlights: [],
-      status: 'draft',
-      sourceType: 'manual',
-      createdBy: req.user?._id,
-    })));
+    const resume = req.body?.resumeUpload === true && !req.files?.length;
+    if (!resume && !req.files?.length) return res.status(400).json({ success: false, message: 'Please upload at least one image' });
+    if (!isR2Configured() && !isCloudinaryConfigured() && process.env.NODE_ENV === 'production' && !isLocalRequest(req)) {
+      throw new ApiError('PERSISTENT_UPLOAD_STORAGE_REQUIRED', 'Draft images need Cloudflare R2 or Cloudinary in production.', { statusCode: 503 });
+    }
+    const result = await runUploadRequest(req, async context => {
+      const uploaded = context.resume ? context.storedFiles : await storeFiles(req, context, { folder: 'products' });
+      const groupMode = (context.fields || req.body)?.groupMode === 'single' ? 'single' : 'separate';
+      const groups = groupMode === 'single' ? [uploaded] : uploaded.map((file) => [file]);
+      const payloads = groups.map((files, index) => withDraftStore(req, {
+        ...(context.managed ? { _id: new mongoose.Types.ObjectId(require('crypto').createHash('sha256').update(`${context.id}:draft:${index}`).digest('hex').slice(0, 24)), uploadOperationId: context.id } : {}),
+        name: '',
+        slug: uniqueDraftSlug(files[0]?.originalName || `draft-${index + 1}`),
+        sku: `DRAFT-${Date.now()}-${String(index + 1).padStart(2, '0')}`,
+        image: files[0]?.url,
+        images: files.map((file, fileIndex) => ({ url: file.url, publicId: file.publicId, primary: fileIndex === 0 })),
+        videos: [],
+        category: undefined,
+        subCategory: '',
+        price: 0,
+        originalPrice: 0,
+        sellingPrice: 0,
+        stock: 0,
+        sizes: [],
+        sizingMode: 'auto',
+        sizeChartProfile: 'auto',
+        sizeChart: { unit: 'in', columns: [], rows: [] },
+        sizeFitNotes: '',
+        colors: [],
+        fabric: '',
+        occasion: '',
+        tags: [],
+        description: '',
+        highlights: [],
+        status: 'draft',
+        sourceType: 'manual',
+        createdBy: req.user?._id,
+      }));
+      const drafts = await runInTransaction(async session => {
+        const rows = [];
+        for (const payload of payloads) {
+          const existing = context.managed ? await ProductDraft.findById(payload._id).session(session || null) : null;
+          rows.push(existing || (await ProductDraft.create([payload], { session }))[0]);
+        }
+        return rows;
+      });
 
-    // With local storage the uploaded file is the draft's durable image.
-    // Only cloud-backed uploads leave a disposable local staging copy.
-    if (isR2Configured() || isCloudinaryConfigured()) await cleanupTempFiles(req.files);
-    await Promise.all(drafts.map((draft) => logAudit({
-      req, action: 'PRODUCT_DRAFT_CREATED', entityType: 'ProductDraft', entityId: draft._id,
-      after: auditSnapshot(draft, DRAFT_AUDIT_FIELDS),
-      summary: groupMode === 'single' ? `Created one draft from ${uploaded.length} photos` : 'Created product draft from bulk upload',
-    })));
-    res.status(201).json({ success: true, message: 'Drafts created successfully', data: { drafts: drafts.map(formatDraft) } });
+      await Promise.all(drafts.map((draft) => logAudit({
+        req, action: 'PRODUCT_DRAFT_CREATED', entityType: 'ProductDraft', entityId: draft._id,
+        after: auditSnapshot(draft, DRAFT_AUDIT_FIELDS),
+        summary: groupMode === 'single' ? `Created one draft from ${uploaded.length} photos` : 'Created product draft from bulk upload',
+      })));
+      return { success: true, message: 'Drafts created successfully', data: { drafts: drafts.map(formatDraft) } };
+    }, { resume, replay: async saved => {
+      const drafts = await ProductDraft.find(draftQuery(req, { _id: { $in: saved.data.drafts.map(draft => draft._id) } }));
+      if (drafts.length !== saved.data.drafts.length) throw new ApiError('UPLOAD_RETRY_CONFLICT', 'One or more drafts from this upload were removed. Start a new upload.', { statusCode: 409 });
+      const byId = new Map(drafts.map(draft => [String(draft._id), draft]));
+      return { ...saved, data: { drafts: saved.data.drafts.map(draft => formatDraft(byId.get(String(draft._id)))) } };
+    } });
+    if (isR2Configured() || isCloudinaryConfigured() || req.get?.('Idempotency-Key')) await cleanupTempFiles(req.files);
+    res.status(201).json(result);
   } catch (error) {
     await cleanupTempFiles(req.files);
     next(error);
@@ -113,7 +138,7 @@ exports.listDrafts = asyncHandler(async (req, res) => {
   const escapedSearch = escapeRegex(String(req.query.q || '').trim().slice(0, 100));
   const category = mongoose.isValidObjectId(req.query.category) ? req.query.category : '';
   const filter = { autosaveKey: { $exists: false } };
-  if (status === 'active') filter.status = { $ne: 'archived' };
+  if (status === 'active') filter.status = 'draft';
   else if (status !== 'all') filter.status = status;
   if (sourceType) filter.sourceType = sourceType;
   if (category) filter.category = category;
@@ -141,6 +166,12 @@ exports.listDrafts = asyncHandler(async (req, res) => {
     ]);
     formatted = drafts.map(formatDraft);
     total = count;
+  }
+  const publishedIds = formatted.filter(item => item.publishedProductId).map(item => item.publishedProductId);
+  if (publishedIds.length) {
+    const products = await Product.find({ _id: { $in: publishedIds } }).select('_id').lean();
+    const existingIds = new Set(products.map(item => String(item._id)));
+    formatted = formatted.map(item => item.publishedProductId ? { ...item, publishedProductDeleted: !existingIds.has(String(item.publishedProductId)) } : item);
   }
   const summaryBase = draftQuery(req, { autosaveKey: { $exists: false } });
   const [draftCount, publishedCount, archivedCount, attentionDocuments] = await Promise.all([
@@ -171,6 +202,7 @@ exports.getAutosave = asyncHandler(async (req, res) => {
 });
 
 exports.saveAutosave = asyncHandler(async (req, res) => {
+  await require('../services/storefrontDiscoveryService').validateComplements(req, req.body || {});
   const autosaveKey = readAutosaveKey(req.body?.autosaveKey);
   const payload = normalizeDraftPayload(req.body);
   for (const key of ['_id', 'id', '__v', 'createdAt', 'updatedAt', 'storeId', 'status', 'publishedProductId', 'createdBy', 'sourceType', 'autosaveKey']) delete payload[key];
@@ -202,6 +234,7 @@ exports.saveAutosave = asyncHandler(async (req, res) => {
 });
 
 exports.createDraft = asyncHandler(async (req, res) => {
+  await require('../services/storefrontDiscoveryService').validateComplements(req, req.body || {});
   const payload = normalizeDraftPayload(req.body);
   for (const key of ['_id', 'id', '__v', 'createdAt', 'updatedAt', 'storeId', 'status', 'publishedProductId', 'createdBy', 'autosaveKey']) delete payload[key];
   const payloadError = validateDraftPayload(payload);
@@ -209,9 +242,12 @@ exports.createDraft = asyncHandler(async (req, res) => {
   payload.slug = payload.slug || uniqueDraftSlug(payload.name || 'manual-product');
   const categoryError = await validateDraftCategory(req, payload.category);
   if (categoryError) return res.status(400).json({ success: false, message: categoryError });
-  const draft = await ProductDraft.create(withDraftStore(req, { ...payload, status: 'draft', sourceType: 'manual', createdBy: req.user?._id }));
+  const draft = await createRecordOnce(req, { Model: ProductDraft, filter: draftQuery(req), create: async identity => {
+    const record = await ProductDraft.create(withDraftStore(req, { ...payload, ...identity, status: 'draft', sourceType: 'manual', createdBy: req.user?._id }));
+    await logAudit({ req, action: 'PRODUCT_DRAFT_CREATED', entityType: 'ProductDraft', entityId: record._id, after: auditSnapshot(record, DRAFT_AUDIT_FIELDS), summary: 'Created product draft' });
+    return record;
+  } });
   await draft.populate('category');
-  await logAudit({ req, action: 'PRODUCT_DRAFT_CREATED', entityType: 'ProductDraft', entityId: draft._id, after: auditSnapshot(draft, DRAFT_AUDIT_FIELDS), summary: 'Created product draft' });
   res.status(201).json({ success: true, message: 'Product draft saved', data: formatDraft(draft) });
 });
 
@@ -226,6 +262,7 @@ exports.updateDraft = asyncHandler(async (req, res) => {
   requireObjectId(req.params.id, 'draft id');
   const draft = await ProductDraft.findOne(draftQuery(req, { _id: req.params.id }));
   if (!draft) return res.status(404).json({ success: false, message: 'Draft not found' });
+  await require('../services/storefrontDiscoveryService').validateComplements(req, req.body || {}, null, draft.storeId);
   if (draft.status === 'published') return res.status(409).json({ success: false, message: 'This draft is already published. Open the published product to edit its details.' });
   if (draft.status === 'archived') return res.status(409).json({ success: false, message: 'Restore this draft before editing it.' });
   const saveMode = req.body?.saveMode === 'auto' ? 'auto' : 'manual';
@@ -247,7 +284,7 @@ exports.updateDraft = asyncHandler(async (req, res) => {
     : { revision: Number(baseRevision) };
   const before = auditSnapshot(draft, DRAFT_AUDIT_FIELDS);
   const updated = await ProductDraft.findOneAndUpdate(
-    draftQuery(req, { _id: draft._id, status: 'draft', ...revisionFilter }),
+    draftQuery(req, { _id: draft._id, status: 'draft', publishingToken: { $exists: false }, ...revisionFilter }),
     { $set: { ...payload, lastSavedBy: req.user?._id }, $inc: { revision: 1 } },
     { new: true, runValidators: true },
   ).populate('category');
@@ -266,20 +303,39 @@ exports.updateDraft = asyncHandler(async (req, res) => {
 
 exports.deleteDraft = asyncHandler(async (req, res) => {
   requireObjectId(req.params.id, 'draft id');
-  const draft = await ProductDraft.findOne(draftQuery(req, { _id: req.params.id }));
+  const draft = await ProductDraft.findOne(draftQuery(req, { _id: req.params.id })).select('+uploadOperationId');
   if (!draft) return res.status(404).json({ success: false, message: 'Draft not found' });
   // Add-product autosaves are disposable working state. Ordinary drafts must
   // pass through archive so accidental deletion is reversible.
   if (!draft.autosaveKey) {
-    if (draft.status !== 'archived') return res.status(409).json({ success: false, message: 'Archive this draft before deleting it permanently.' });
-    if (draft.publishedProductId) return res.status(409).json({ success: false, message: 'Published draft history is retained for product traceability.' });
+    if (req.query.baseRevision !== undefined && Number(req.query.baseRevision) !== Number(draft.revision || 0)) throw new ApiError('DRAFT_STALE', 'This draft changed. Refresh before deleting it.', { statusCode: 409 });
+    if (!['archived', 'published'].includes(draft.status)) return res.status(409).json({ success: false, message: 'Archive this draft before deleting it permanently.' });
     const expected = String(draft.name || draft._id).trim();
     if (String(req.query.confirm || '').trim() !== expected) return res.status(400).json({ success: false, message: `Type "${expected}" to permanently delete this draft.` });
   }
-  await draft.deleteOne();
-  if (draft.sourceType === 'manual') await cleanupUnreferencedDraftMedia(draft);
-  await logAudit({ req, action: 'PRODUCT_DRAFT_DELETED', entityType: 'ProductDraft', entityId: draft._id, before: auditSnapshot(draft, DRAFT_AUDIT_FIELDS), summary: draft.autosaveKey ? 'Deleted product form autosave' : 'Permanently deleted archived product draft' });
-  res.json({ success: true, message: 'Draft deleted permanently' });
+  const filter = draftQuery(req, { _id: draft._id, status: draft.status, updatedAt: draft.updatedAt, publishingToken: { $exists: false } });
+  if (draft.publishedProductId) {
+    if (!await supportsTransactions()) throw new ApiError('SERVICE_UNAVAILABLE', 'Safe published-draft removal requires a transaction-capable MongoDB deployment.');
+    await runInTransaction(async session => {
+      if (!session) throw new ApiError('SERVICE_UNAVAILABLE', 'Safe published-draft removal is unavailable.');
+      const removed = await ProductDraft.findOneAndDelete(filter, { session });
+      if (!removed) throw new ApiError('DRAFT_STALE', 'This draft changed or is being published. Refresh before deleting.', { statusCode: 409 });
+      await DeletedProductDraft.create([{
+        draftId: draft._id, productId: draft.publishedProductId, storeId: draft.storeId,
+        sourceSocialImportId: draft.sourceSocialImportId, sourceCandidateId: draft.sourceCandidateId, deletedBy: req.user?._id,
+      }], { session });
+      await logAudit({ req, action: 'PRODUCT_DRAFT_DELETED', entityType: 'ProductDraft', entityId: draft._id, storeId: draft.storeId,
+        before: auditSnapshot(draft, DRAFT_AUDIT_FIELDS), after: { publishedProductUnchanged: true }, summary: 'Removed published draft; publication receipt retained', session, strict: true });
+    });
+  } else {
+    const removed = await ProductDraft.findOneAndDelete(filter);
+    if (!removed) throw new ApiError('DRAFT_STALE', 'This draft changed or is being published. Refresh before deleting.', { statusCode: 409 });
+  }
+  // Never remove published media: it may still be used by the live product.
+  if (draft.uploadOperationId) await require('../models/UploadOperation').updateOne({ _id: draft.uploadOperationId }, { $set: { status: 'REMOVED' } });
+  if (draft.sourceType === 'manual' && !draft.publishedProductId) await cleanupUnreferencedDraftMedia(draft);
+  if (!draft.publishedProductId) await logAudit({ req, action: 'PRODUCT_DRAFT_DELETED', entityType: 'ProductDraft', entityId: draft._id, before: auditSnapshot(draft, DRAFT_AUDIT_FIELDS), summary: draft.autosaveKey ? 'Deleted product form autosave' : 'Permanently deleted archived product draft' });
+  res.json({ success: true, message: draft.publishedProductId ? 'Published draft removed. Its product is unchanged.' : 'Draft deleted permanently' });
 });
 
 exports.archiveDraft = asyncHandler(async (req, res) => {
@@ -288,11 +344,10 @@ exports.archiveDraft = asyncHandler(async (req, res) => {
   if (!draft) return res.status(404).json({ success: false, message: 'Draft not found' });
   if (draft.status === 'archived') return res.json({ success: true, message: 'Draft is already archived', data: formatDraft(draft) });
   const before = auditSnapshot(draft, DRAFT_AUDIT_FIELDS);
-  draft.status = 'archived';
-  draft.archivedAt = new Date();
-  draft.lastSavedBy = req.user?._id;
-  draft.revision = Number(draft.revision || 0) + 1;
-  await draft.save();
+  const updated = await ProductDraft.findOneAndUpdate(draftQuery(req, { _id: draft._id, updatedAt: draft.updatedAt, publishingToken: { $exists: false } }),
+    { $set: { status: 'archived', archivedAt: new Date(), lastSavedBy: req.user?._id }, $inc: { revision: 1 } }, { new: true });
+  if (!updated) throw new ApiError('DRAFT_STALE', 'This draft changed or is being published. Refresh before archiving.', { statusCode: 409 });
+  draft.set(updated.toObject());
   await draft.populate('category');
   await logAudit({ req, action: 'PRODUCT_DRAFT_ARCHIVED', entityType: 'ProductDraft', entityId: draft._id, before, after: auditSnapshot(draft, DRAFT_AUDIT_FIELDS), summary: 'Archived product draft' });
   res.json({ success: true, message: 'Draft archived', data: formatDraft(draft) });
@@ -304,11 +359,10 @@ exports.restoreDraft = asyncHandler(async (req, res) => {
   if (!draft) return res.status(404).json({ success: false, message: 'Draft not found' });
   if (draft.status !== 'archived') return res.json({ success: true, message: 'Draft is already active', data: formatDraft(draft) });
   const before = auditSnapshot(draft, DRAFT_AUDIT_FIELDS);
-  draft.status = draft.publishedProductId ? 'published' : 'draft';
-  draft.archivedAt = null;
-  draft.lastSavedBy = req.user?._id;
-  draft.revision = Number(draft.revision || 0) + 1;
-  await draft.save();
+  const updated = await ProductDraft.findOneAndUpdate(draftQuery(req, { _id: draft._id, updatedAt: draft.updatedAt, publishingToken: { $exists: false } }),
+    { $set: { status: draft.publishedProductId ? 'published' : 'draft', archivedAt: null, lastSavedBy: req.user?._id }, $inc: { revision: 1 } }, { new: true });
+  if (!updated) throw new ApiError('DRAFT_STALE', 'This draft changed. Refresh before restoring.', { statusCode: 409 });
+  draft.set(updated.toObject());
   await draft.populate('category');
   await logAudit({ req, action: 'PRODUCT_DRAFT_RESTORED', entityType: 'ProductDraft', entityId: draft._id, before, after: auditSnapshot(draft, DRAFT_AUDIT_FIELDS), summary: 'Restored product draft' });
   res.json({ success: true, message: 'Draft restored', data: formatDraft(draft) });
@@ -332,11 +386,17 @@ exports.publishSelected = asyncHandler(async (req, res) => {
     }
     if (draft.status === 'published' && draft.publishedProductId) {
       const product = await Product.findById(draft.publishedProductId);
+      if (!product) {
+        results.push({ id, name: draft.name || '', status: 'failed', message: 'The published product was permanently removed. This draft cannot recreate it.' });
+        continue;
+      }
       if (product) published.push(product);
       results.push({ id, name: draft.name || '', status: 'already-published', productId: draft.publishedProductId });
       continue;
     }
     const prepared = await applyProductStructure(buildProductPayloadFromDraft(draft));
+    try { await require('../services/storefrontDiscoveryService').validateComplements(req, { completeLookProductIds: (draft.completeLookProductIds || []).map(String) }, null, draft.storeId); }
+    catch (error) { results.push({ id, name: draft.name || '', status: 'failed', message: error.message }); continue; }
     payloads.set(id, prepared);
     const validationMessage = validatePublishDraft(draft, prepared) || await validateCommercialDuplicates(draft, prepared);
     if (validationMessage) {
@@ -367,34 +427,67 @@ exports.publishSelected = asyncHandler(async (req, res) => {
 });
 
 async function publishPreparedDraft(draft, prepared, { userId } = {}) {
-    if (draft.status === 'published' && draft.publishedProductId) {
-      return Product.findById(draft.publishedProductId);
+    const token = require('node:crypto').randomUUID();
+    const baseRevision = Number(draft.revision || 0);
+    // On replica sets the claim, product, inventory and publication state
+    // commit together. A crashed process cannot leave a stuck publish claim.
+    return runInTransaction(async session => {
+    let claimed;
+    // Coordinate publication with archive/delete without requiring transactions
+    // in existing standalone publishing deployments. Concurrent retries wait
+    // briefly for the winning request and converge on its product.
+    for (let attempt = 0; attempt < 60; attempt += 1) {
+      const current = await ProductDraft.findById(draft._id).select('+publishingToken').session(session || null);
+      if (!current) throw new ApiError('NOT_FOUND', 'This draft was removed. Refresh the list.');
+      if (current.status === 'published' && current.publishedProductId) {
+        const product = await Product.findById(current.publishedProductId).session(session || null);
+        if (!product) throw new ApiError('NOT_FOUND', 'The published product was deleted. This draft cannot recreate it.');
+        return product;
+      }
+      if (current.status !== 'draft') throw new ApiError('DRAFT_STALE', 'This draft is archived. Restore it before publishing.', { statusCode: 409 });
+      if (!current.publishingToken) {
+        if (Number(current.revision || 0) !== baseRevision) throw new ApiError('DRAFT_STALE', 'This draft changed. Reload before publishing.', { statusCode: 409 });
+        claimed = await ProductDraft.findOneAndUpdate({ _id: draft._id, status: 'draft', updatedAt: current.updatedAt, publishingToken: { $exists: false } },
+          { $set: { publishingToken: token }, $inc: { revision: 1 } }, { new: true, session: session || undefined }).select('+publishingToken');
+        if (claimed) break;
+      }
+      await new Promise(resolve => setTimeout(resolve, 50));
     }
+    if (!claimed) throw new ApiError('DRAFT_STALE', 'This draft is already being published. Refresh shortly.', { statusCode: 409 });
+    draft.revision = claimed.revision;
+    try {
     const productPayload = prepared || await prepareImportedDraft(draft);
+    await require('../services/storefrontDiscoveryService').validateComplements({}, { completeLookProductIds: (productPayload.completeLookProductIds || []).map(String) }, null, draft.storeId);
     if (draft.sourceType && !productPayload.sku) productPayload.sku = `IMPORT-${String(draft._id).slice(-10).toUpperCase()}`;
     productPayload.slug = await ensureUniqueProductSlug(productPayload.slug || productPayload.name, draft._id, draft.storeId);
     if (productPayload.sku && !prepared) productPayload.sku = await ensureUniqueSku(productPayload.sku, draft._id, draft.storeId);
     // The unique sourceDraftId index makes retries and concurrent publication
     // converge on one product for ordinary uploads as well as imported drafts.
-    let product = await Product.findOne({ sourceDraftId: draft._id });
+    let product = await Product.findOne({ sourceDraftId: draft._id }).session(session || null);
     if (!product) {
       const productData = { ...normalizeProductPayload(productPayload), sourceDraftId: draft._id };
       if (Number(productData.stock || 0) > 0) {
         productData.lastInventoryChangeAt = new Date();
         productData.lastInventoryChangedBy = userId;
       }
-      try { product = await Product.create(productData); }
-      catch (error) { if (error.code !== 11000) throw error; product = await Product.findOne({ sourceDraftId: draft._id }); if (!product) throw error; }
+      try { product = session ? (await Product.create([productData], { session }))[0] : await Product.create(productData); }
+      catch (error) { if (session || error.code !== 11000) throw error; product = await Product.findOne({ sourceDraftId: draft._id }); if (!product) throw error; }
     }
-    await recordOpeningInventory(product, { userId, reference: `Draft ${draft._id}`, reason: 'Draft opening inventory' });
+    await recordOpeningInventory(product, { userId, reference: `Draft ${draft._id}`, reason: 'Draft opening inventory' }, session);
+    if (session) await ProductDraft.updateOne({ _id: draft._id, publishingToken: token }, { $unset: { publishingToken: 1 } }, { session });
     draft.status = 'published';
     draft.publishedProductId = product._id;
     draft.archivedAt = null;
     draft.lastPublishAttemptAt = new Date();
     draft.lastPublishError = '';
     draft.revision = Number(draft.revision || 0) + 1;
-    await draft.save();
+    for (const field of ['status', 'publishedProductId', 'archivedAt', 'lastPublishAttemptAt', 'lastPublishError', 'revision']) draft.markModified(field);
+    await draft.save(session ? { session } : undefined);
     return product;
+    } finally {
+      if (!session) await ProductDraft.updateOne({ _id: draft._id, publishingToken: token }, { $unset: { publishingToken: 1 } });
+    }
+    });
 }
 
 async function prepareImportedDraft(draft) {
@@ -410,6 +503,7 @@ exports.publishPreparedDraft = publishPreparedDraft;
 
 function formatDraft(draft) {
   const data = typeof draft.toObject === 'function' ? draft.toObject() : { ...draft };
+  delete data.uploadOperationId;
   data.id = String(data._id || data.id);
   if (data.attributeValues instanceof Map) data.attributeValues = Object.fromEntries(data.attributeValues);
   data.readiness = draftReadiness(data);
@@ -479,6 +573,8 @@ function escapeRegex(value) {
 
 function normalizeDraftPayload(body = {}) {
   const payload = { ...body };
+  delete payload.publishingToken;
+  delete payload.uploadOperationId;
   if (typeof payload.images === 'string') {
     try {
       payload.images = JSON.parse(payload.images);
@@ -587,6 +683,7 @@ function buildProductPayloadFromDraft(draft) {
     colors: data.colors || [],
     fabric: data.fabric || '',
     occasion: data.occasion || '',
+    completeLookProductIds: data.completeLookProductIds || [],
     stock: Number(data.stock || 0),
     lowStockAlert: Number(data.lowStockAlert ?? 5),
     reorderQuantity: Number(data.reorderQuantity || 0),
@@ -691,32 +788,21 @@ function normalizeSizeChart(value = {}) {
   return { unit: value?.unit === 'cm' ? 'cm' : 'in', columns, rows };
 }
 
-async function uploadDraftImages(req, files) {
-  if (!Array.isArray(files) || !files.length) return [];
-  const responses = [];
-  if (isR2Configured()) {
-    for (const file of files) responses.push(await uploadImageToR2(file, { folder: 'products' }));
-  } else if (isCloudinaryConfigured()) {
-    for (const file of files) responses.push(await uploadImageToCloudinary(file));
-  } else {
-    for (const file of files) responses.push(buildUploadFileResponse(file, req));
-  }
-  return responses;
-}
-
 async function cleanupTempFiles(files = []) {
   await Promise.all(files.map((file) => fs.unlink(file.path).catch(() => null)));
 }
 
 async function cleanupUnreferencedDraftMedia(draft) {
   const entries = [
-    ...(Array.isArray(draft.images) ? draft.images.map((item) => ({ ...item, resourceType: 'image' })) : []),
+    ...(Array.isArray(draft.images) ? draft.images.flatMap(item => [item, item.background?.original, item.background?.edited].filter(Boolean)).map((item) => ({ ...item, resourceType: 'image' })) : []),
     ...(Array.isArray(draft.videos) ? draft.videos.map((item) => ({ ...item, resourceType: 'video' })) : []),
   ].filter((item) => item?.url || item?.publicId);
   await Promise.allSettled(entries.map(async (entry) => {
     const referenceFilter = { $or: [
       ...(entry.url ? [{ 'images.url': entry.url }, { 'videos.url': entry.url }] : []),
       ...(entry.publicId ? [{ 'images.publicId': entry.publicId }, { 'videos.publicId': entry.publicId }] : []),
+      ...(entry.url ? [{ 'images.background.original.url': entry.url }, { 'images.background.edited.url': entry.url }] : []),
+      ...(entry.publicId ? [{ 'images.background.original.publicId': entry.publicId }, { 'images.background.edited.publicId': entry.publicId }] : []),
     ] };
     if (!referenceFilter.$or.length) return;
     const [draftReference, productReference] = await Promise.all([

@@ -10,6 +10,7 @@ const { analyzeCandidateFiles, isVisionEnabled, toContextCandidateAnalysis } = r
 const { analyzeProductContext } = require('./productImportContext.service');
 const { updateActiveRunProgress } = require('./reelImportProgress.service');
 const { selectProductFrames } = require('./productFrameSelection.service');
+const { generatedUploadId, fileDigest } = require('./generatedMediaService');
 
 const MAX_PRODUCTS = 8;
 const FRAMES_PER_PRODUCT = 3;
@@ -87,7 +88,7 @@ function chunkFrames(frames) {
   return groups;
 }
 
-async function uploadFrame(frame, jobId, groupNumber) {
+async function uploadFrame(frame, jobId, groupNumber, storeId) {
   if (!getStorageProvider()) {
     throw Object.assign(new Error('Cloud storage is required to save product frames.'), { code: 'STORAGE_FAILURE' });
   }
@@ -95,7 +96,7 @@ async function uploadFrame(frame, jobId, groupNumber) {
     path: frame.path,
     originalname: `${jobId}-${String(groupNumber).padStart(3, '0')}-${String(Math.round(frame.timestampSeconds * 1000)).padStart(10, '0')}.jpg`,
     mimetype: 'image/jpeg',
-  });
+  }, { uploadId: generatedUploadId({ namespace: 'reel-frame', ownerId: jobId, storeId, slot: Math.round(frame.timestampSeconds * 1000), recipe: ['frame-v2', frame.selectionVersion || '', await fileDigest({ path: frame.path })] }), recovering: true });
   return {
     provider: stored.provider,
     storageKey: stored.storageKey,
@@ -206,7 +207,7 @@ async function processReelLocally(job, { runId } = {}) {
       );
       const persisted = [];
       for (const frame of group) {
-        const uploaded = await uploadFrame(frame, String(job._id), groupNumber);
+        const uploaded = await uploadFrame(frame, String(job._id), groupNumber, job.storeId);
         persisted.push({ ...uploaded, selected: frame.recommended !== false && persisted.length < (singleProduct ? 6 : 4) });
       }
       candidates.push({

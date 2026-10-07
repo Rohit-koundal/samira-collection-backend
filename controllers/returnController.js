@@ -23,6 +23,9 @@ const { decryptSecret, encryptSecret } = require('../utils/secretBox');
 const { createRazorpayPaymentLink, refundRazorpayPayment, fetchRazorpayRefund, isRazorpayConfigured } = require('../services/razorpayService');
 const { recordProviderRefund } = require('../services/paymentRefundService');
 const { settleExchangeAdjustment } = require('../services/exchangeAdjustmentService');
+const InventoryItem = require('../models/InventoryItem');
+const VerificationEvidence = require('../models/VerificationEvidence');
+const { refreshCustomerRisk } = require('../services/fraudProtectionService');
 
 const RETURN_STATUSES = ReturnExchange.RETURN_STATUSES;
 const REFUND_METHODS = ReturnExchange.REFUND_METHODS;
@@ -49,9 +52,17 @@ function findOrderItem(order, { productId, variantId: selectedVariantId, size, c
 
 function managedPhoto(url) {
   const value = String(url || '').trim();
-  if (value.startsWith('/uploads/')) return value;
+  if (/^\/uploads\/[\w./%-]+$/.test(value) && !value.includes('..')) return value;
   return [process.env.R2_PUBLIC_URL, process.env.CLOUDINARY_CLOUD_NAME && `https://res.cloudinary.com/${process.env.CLOUDINARY_CLOUD_NAME}/`]
-    .filter(Boolean).some((base) => value.startsWith(String(base).replace(/\/$/, '')))
+    .filter(Boolean).some((base) => {
+      try {
+        const candidate = new URL(value);
+        const allowed = new URL(String(base));
+        const allowedPath = allowed.pathname.replace(/\/$/, '');
+        return candidate.protocol === 'https:' && candidate.origin === allowed.origin
+          && (!allowedPath || candidate.pathname === allowedPath || candidate.pathname.startsWith(`${allowedPath}/`));
+      } catch { return false; }
+    })
     ? value : '';
 }
 
@@ -59,9 +70,17 @@ function readPhotos(value) {
   return [...new Set((Array.isArray(value) ? value : []).map(managedPhoto).filter(Boolean))].slice(0, 5);
 }
 
+function readCustomerEvidence(value, photos = []) {
+  const records = (Array.isArray(value) ? value : []).slice(0, 8).map(item => ({
+    type: String(item?.type || '').toUpperCase(), fileUrl: managedPhoto(item?.fileUrl), mimeType: String(item?.mimeType || '').slice(0, 100), sizeBytes: Math.max(0, Number(item?.sizeBytes || 0)),
+  })).filter(item => ['CUSTOMER_PHOTO', 'CUSTOMER_VIDEO'].includes(item.type) && item.fileUrl);
+  for (const fileUrl of photos) if (!records.some(item => item.fileUrl === fileUrl)) records.push({ type: 'CUSTOMER_PHOTO', fileUrl });
+  return records.slice(0, 8);
+}
+
 function returnQuery(query, detail = false) {
   const orderFields = detail
-    ? 'invoiceNumber createdAt deliveredAt orderStatus paymentMethod paymentProvider paymentStatus paymentState finalAmount refundedAmount refunds couponDiscount prepaidDiscount shippingAddress orderItems revision'
+    ? 'invoiceNumber createdAt deliveredAt orderStatus paymentMethod paymentProvider paymentStatus paymentState finalAmount refundedAmount refunds couponDiscount prepaidDiscount shippingAddress orderItems revision packageVerification fraudProtectionSnapshot deliveryProof'
     : 'invoiceNumber createdAt orderStatus paymentStatus paymentMethod finalAmount';
   return query
     .populate('user', 'name phone email')
@@ -93,6 +112,11 @@ function publicReturn(row, req, { detail = false, revealPii = false } = {}) {
   if (data.user && !canViewPii(req)) {
     data.user.phone = maskPhone(data.user.phone);
     delete data.user.email;
+  }
+  if (!canViewPii(req)) {
+    if (data.inspection) data.inspection = { status: data.inspection.status, result: data.inspection.status === 'VERIFIED' ? 'VERIFIED' : data.inspection.status === 'NOT_STARTED' ? 'NOT_CHECKED' : 'UNDER_REVIEW', inspectedAt: data.inspection.inspectedAt };
+    if (data.refundDecision) data.refundDecision = { decision: data.refundDecision.decision, customerMessage: data.refundDecision.customerMessage, decidedAt: data.refundDecision.decidedAt };
+    delete data.customerEvidence;
   }
   if (!detail) {
     delete data.pickupAddress;
@@ -149,7 +173,7 @@ function requireSideEffectPermission(req, status) {
   if (!req.storeMember) return;
   const permission = ['Approved', 'Rejected', 'Cancelled'].includes(status) ? 'returns.review'
     : ['Pickup Scheduled', 'Picked Up', 'In Transit'].includes(status) ? 'returns.ship'
-      : ['Received', 'QC Passed', 'QC Failed'].includes(status) ? 'returns.qc'
+      : ['Received', 'Inspection Pending', 'Verified', 'Mismatch Found', 'QC Passed', 'QC Failed'].includes(status) ? 'returns.qc'
         : ['Refund Initiated', 'Refunded'].includes(status) ? 'returns.refund'
           : ['Exchange Allocated', 'Replacement Shipped', 'Replacement Delivered', 'Exchanged'].includes(status) ? 'returns.fulfil' : 'returns.write';
   if (!roleAllows(req.storeMember.role, permission)) throw forbidden(`You do not have permission to complete the ${status.toLowerCase()} step.`);
@@ -167,6 +191,7 @@ exports.createReturn = asyncHandler(async (req, res) => {
   const comment = optionalString(req.body?.comment, 'comment', { max: 2000 });
   const quantity = requireQuantity(req.body?.quantity ?? 1, 'quantity', { min: 1, max: 20 });
   const photos = readPhotos(req.body?.photos);
+  const customerEvidence = readCustomerEvidence(req.body?.customerEvidence, photos);
 
   let created;
   let orderForNotice;
@@ -185,6 +210,8 @@ exports.createReturn = asyncHandler(async (req, res) => {
     if (EVIDENCE_REASONS.test(reason) && !photos.length) throw new ApiError('VALIDATION_ERROR', 'Add at least one clear photo for this return reason.');
 
     const currentSettings = await getStoreSettings(req.tenantFilter || (order.storeId ? { storeId: order.storeId } : {}));
+    if (currentSettings.requireReturnPhotos && !customerEvidence.some(item => item.type === 'CUSTOMER_PHOTO')) throw new ApiError('VALIDATION_ERROR', 'Add the required return photos.');
+    if (currentSettings.requireReturnVideo && !customerEvidence.some(item => item.type === 'CUSTOMER_VIDEO')) throw new ApiError('VALIDATION_ERROR', 'Add the required return video.');
     const settings = returnPolicySettings(order, currentSettings);
     const prior = await withSession(ReturnExchange.find({ order: orderId, user: req.user._id }), session);
     const eligibility = returnEligibility(order, prior, settings);
@@ -224,7 +251,7 @@ exports.createReturn = asyncHandler(async (req, res) => {
       caseNumber: `RET-${Date.now().toString(36).toUpperCase()}-${String(req.user._id).slice(-4).toUpperCase()}`,
       order: orderId, product: productId, user: req.user._id,
       orderItemId: String(orderedItem._id || ''), variantId: orderedItem.variantId || '', size: orderedItem.size || '', color: orderedItem.color || '', sku: orderedItem.sku || '',
-      quantity, type, reason, comment, photos, refundMethod,
+      quantity, type, reason, comment, photos, customerEvidence, refundMethod,
       refundDestinationEncrypted: refundDestination.encrypted || undefined,
       refundDestinationSummary: refundDestination.summary,
       pickupAddress: validatePickupAddress(req.body?.pickupAddress, order.shippingAddress),
@@ -236,6 +263,8 @@ exports.createReturn = asyncHandler(async (req, res) => {
       slaDueAt: new Date(Date.now() + Math.max(1, Number(settings.returnSlaHours || 24)) * 60 * 60 * 1000),
     };
     created = session ? (await ReturnExchange.create([payload], { session }))[0] : await ReturnExchange.create(payload);
+    if (customerEvidence.length) await VerificationEvidence.insertMany(customerEvidence.map(item => ({ ...item, fileUrl: item.fileUrl, order: orderId, returnRequest: created._id, orderItemId: String(orderedItem._id || ''), phase: 'RETURN_REQUEST', uploadedBy: req.user._id, storeId: order.storeId })), session ? { session } : {});
+    if (orderedItem.uniqueItemIds?.length) await InventoryItem.updateMany(andFilter({ uniqueItemId: { $in: orderedItem.uniqueItemIds } }, order.storeId ? { storeId: order.storeId } : req.tenantFilter), { $set: { status: 'RETURN_REQUESTED' } }, session ? { session } : {});
     try {
       order.orderStatus = type === 'exchange' ? 'Exchange Requested' : 'Return Requested';
       order.statusTimeline.push({ status: order.orderStatus, date: new Date(), note: `${type} requested for ${orderedItem.name || 'item'}` });
@@ -286,7 +315,7 @@ function adminFilter(req, { attentionShipmentIds = [] } = {}) {
   if (req.query.refundStatus) extra['financial.refundStatus'] = requireEnum(req.query.refundStatus, ['NOT_REQUIRED', 'PENDING', 'INITIATED', 'PROCESSED', 'FAILED'], 'refund status');
   if (req.query.sla === 'overdue') { extra.slaDueAt = { $lt: new Date() }; if (!req.query.status) extra.status = { $nin: [...TERMINAL] }; }
   if (req.query.attention === '1') extra.$or = [
-    { status: 'QC Failed' }, { 'financial.refundStatus': 'FAILED' },
+    { status: { $in: ['QC Failed', 'Mismatch Found'] } }, { 'financial.refundStatus': 'FAILED' },
     { type: 'exchange', exchangeDeducted: true, exchangeReservationReleased: { $ne: true }, exchangeReservationExpiresAt: { $lt: new Date() } },
     ...(attentionShipmentIds.length ? [{ shipment: { $in: attentionShipmentIds } }, { replacementShipment: { $in: attentionShipmentIds } }] : []),
   ];
@@ -336,19 +365,23 @@ exports.adminReturnStats = asyncHandler(async (req, res) => {
       ReverseShipment.distinct('returnRequest', andFilter({ status: { $in: ['EXCEPTION', 'FAILED'] } }, req.tenantFilter)),
       ReplacementShipment.distinct('returnRequest', andFilter({ status: { $in: ['EXCEPTION', 'FAILED', 'RTO_IN_TRANSIT', 'RETURNED'] } }, req.tenantFilter)),
     ]).then(values => [...new Set(values.flat().map(String))]),
-    ReturnExchange.distinct('_id', andFilter({ status: 'QC Failed' }, filter)),
+    ReturnExchange.distinct('_id', andFilter({ status: { $in: ['QC Failed', 'Mismatch Found'] } }, filter)),
   ]);
   const byStatus = Object.fromEntries(rows.map(row => [row._id, row.count]));
   const openStatuses = RETURN_STATUSES.filter(status => !TERMINAL.has(status));
   const exceptions = new Set([...qcFailedIds, ...refundFailed, ...reservationExpired, ...courierExceptions].map(String)).size;
-  res.json({ total: rows.reduce((sum, row) => sum + row.count, 0), awaitingReview: byStatus.Requested || 0, pickupDue: (byStatus.Approved || 0) + (byStatus['Pickup Scheduled'] || 0), inTransit: (byStatus['Picked Up'] || 0) + (byStatus['In Transit'] || 0), qcPending: byStatus.Received || 0, refundPending, refundFailed: refundFailed.length, reservationExpired: reservationExpired.length, courierExceptions: courierExceptions.length, exceptions, overdue, open: openStatuses.reduce((sum, status) => sum + Number(byStatus[status] || 0), 0), financial: money[0] || { estimated: 0, approved: 0, refunded: 0 }, byStatus });
+  res.json({ total: rows.reduce((sum, row) => sum + row.count, 0), awaitingReview: byStatus.Requested || 0, pickupDue: (byStatus.Approved || 0) + (byStatus['Pickup Scheduled'] || 0), inTransit: (byStatus['Picked Up'] || 0) + (byStatus['In Transit'] || 0), qcPending: (byStatus.Received || 0) + (byStatus['Inspection Pending'] || 0) + (byStatus['Mismatch Found'] || 0), refundPending, refundFailed: refundFailed.length, reservationExpired: reservationExpired.length, courierExceptions: courierExceptions.length, exceptions, overdue, open: openStatuses.reduce((sum, status) => sum + Number(byStatus[status] || 0), 0), financial: money[0] || { estimated: 0, approved: 0, refunded: 0 }, byStatus });
 });
 
 exports.getReturnDetail = asyncHandler(async (req, res) => {
   requireObjectId(req.params.id, 'return id');
   const request = await returnQuery(selectQuery(ReturnExchange.findOne(andFilter({ _id: req.params.id }, req.tenantFilter)), '+refundDestinationEncrypted'), true);
   if (!request) throw notFound('Return request not found');
-  res.set('Cache-Control', 'private, no-store').json(publicReturn(request, req, { detail: true }));
+  const [evidence, risk] = await Promise.all([
+    VerificationEvidence.find(andFilter({ order: request.order?._id || request.order, $or: [{ returnRequest: request._id }, { phase: 'PACKING' }] }, req.tenantFilter)).sort('uploadedAt').lean(),
+    refreshCustomerRisk({ storeId: request.storeId, userId: request.user?._id || request.user }),
+  ]);
+  res.set('Cache-Control', 'private, no-store').json({ ...publicReturn(request, req, { detail: true }), verificationEvidence: evidence, customerRisk: risk });
 });
 
 async function restoreOriginalIfSellable(request, req, session) {
@@ -520,6 +553,19 @@ async function applyReturnStatus(req, id, body) {
       ? null
       : await getStoreSettings(request.storeId ? { storeId: request.storeId } : req.tenantFilter || {});
 
+    const protectedReturn = Boolean(order.fraudProtectionSnapshot?.capturedAt && order.packageVerification?.status !== 'NOT_REQUIRED');
+    if (protectedReturn && ['Verified', 'Mismatch Found'].includes(status)) {
+      const requiredInspectionStatus = status === 'Verified' ? 'VERIFIED' : 'MISMATCH_FOUND';
+      if (request.inspection?.status !== requiredInspectionStatus) throw new ApiError('RETURN_INSPECTION_REQUIRED', 'Use the item comparison inspection before recording this verification result.', { statusCode: 409 });
+    }
+    if (protectedReturn && status === 'QC Passed' && request.inspection?.status !== 'VERIFIED') {
+      throw new ApiError('RETURN_INSPECTION_REQUIRED', 'The returned item must pass identity and evidence verification before quality control can pass.', { statusCode: 409 });
+    }
+    if (['Refund Initiated', 'Refunded'].includes(status) && protectedReturn) {
+      if (!['APPROVED', 'PARTIAL'].includes(request.refundDecision?.decision)) throw new ApiError('REFUND_VERIFICATION_REQUIRED', 'Record an approved refund decision after return inspection before initiating payment.', { statusCode: 409 });
+      if (request.inspection?.status === 'MISMATCH_FOUND' && !request.refundDecision?.reason) throw new ApiError('MANUAL_REVIEW_REQUIRED', 'A flagged mismatch needs a documented manual override before refund.', { statusCode: 409 });
+    }
+
     if (status === 'Cancelled') {
       const [reverseBooking, replacementBooking] = await Promise.all([
         withSession(ReverseShipment.findOne({ returnRequest: request._id }), session),
@@ -577,6 +623,15 @@ async function applyReturnStatus(req, id, body) {
     if (status === 'Picked Up') request.pickedUpAt = request.pickedUpAt || new Date();
     if (status === 'Received') request.receivedAt = request.receivedAt || new Date();
     if (status === 'Cancelled') request.cancelledAt = request.cancelledAt || new Date();
+    const trackedItemIds = order.orderItems.id?.(request.orderItemId)?.uniqueItemIds
+      || order.orderItems.find(item => String(item._id) === String(request.orderItemId))?.uniqueItemIds
+      || [];
+    if (trackedItemIds.length && status === 'Received') {
+      await InventoryItem.updateMany(andFilter({ uniqueItemId: { $in: trackedItemIds } }, req.tenantFilter), { $set: { status: 'RETURNED', returnedAt: new Date() } }, session ? { session } : {});
+    }
+    if (trackedItemIds.length && ['Rejected', 'Cancelled'].includes(status) && !request.receivedAt) {
+      await InventoryItem.updateMany(andFilter({ uniqueItemId: { $in: trackedItemIds } }, req.tenantFilter), { $set: { status: 'DELIVERED' }, $unset: { returnedAt: 1 } }, session ? { session } : {});
+    }
     if (['Refunded', 'Exchanged'].includes(request.status)) request.resolutionStatus = request.status;
     request.status = status;
     if (['Refunded', 'Exchanged'].includes(status)) request.resolutionStatus = status;
